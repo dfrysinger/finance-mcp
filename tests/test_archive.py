@@ -1,5 +1,8 @@
 import json
+import sqlite3
 from pathlib import Path
+
+import pytest
 
 from finance_mcp import archive
 
@@ -134,3 +137,115 @@ def test_concurrent_first_connect_does_not_lock(tmp_path):
     finally:
         conn.close()
     assert mode.lower() == "wal"
+
+
+# --- Transfer reconciliation storage foundation -------------------------------
+
+
+def test_transfer_link_insert_and_load(tmp_path):
+    conn = archive.connect(tmp_path / "a.db")
+    link_id = archive.insert_transfer_link(
+        conn, debit_txn_id="d1", credit_txn_id="c1", amount_cents=-10000,
+        status="inferred", method="mutual-unique", confidence="inferred-structurally-forced",
+        date_rule="same-day", explanation="sole candidate each way",
+        candidates_before=1, candidates_after=1, reconcile_run_id="run-1",
+    )
+    rows = archive.load_transfer_links(conn)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["link_id"] == link_id
+    assert (r["debit_txn_id"], r["credit_txn_id"]) == ("d1", "c1")
+    assert r["amount_cents"] == -10000
+    assert r["status"] == "inferred"
+    assert r["method"] == "mutual-unique"
+    assert r["created_at"] and r["updated_at"]
+
+
+def test_transfer_link_debit_leg_is_unique(tmp_path):
+    conn = archive.connect(tmp_path / "a.db")
+    archive.insert_transfer_link(conn, debit_txn_id="d1", credit_txn_id="c1", status="inferred")
+    # A second link must not be able to claim the same debit leg.
+    with pytest.raises(sqlite3.IntegrityError):
+        archive.insert_transfer_link(conn, debit_txn_id="d1", credit_txn_id="c2", status="inferred")
+
+
+def test_transfer_link_credit_leg_is_unique(tmp_path):
+    conn = archive.connect(tmp_path / "a.db")
+    archive.insert_transfer_link(conn, debit_txn_id="d1", credit_txn_id="c1", status="inferred")
+    with pytest.raises(sqlite3.IntegrityError):
+        archive.insert_transfer_link(conn, debit_txn_id="d2", credit_txn_id="c1", status="inferred")
+
+
+def test_unmatched_legs_with_null_partner_coexist(tmp_path):
+    # Several still-unmatched debits (credit_txn_id NULL) must not collide on the
+    # UNIQUE(credit_txn_id) index -- SQLite exempts NULLs.
+    conn = archive.connect(tmp_path / "a.db")
+    archive.insert_transfer_link(conn, debit_txn_id="d1", status="unmatched")
+    archive.insert_transfer_link(conn, debit_txn_id="d2", status="unmatched")
+    archive.insert_transfer_link(conn, credit_txn_id="c1", status="unmatched")
+    archive.insert_transfer_link(conn, credit_txn_id="c2", status="unmatched")
+    assert len(archive.load_transfer_links(conn)) == 4
+
+
+def test_account_type_upsert_and_load(tmp_path):
+    conn = archive.connect(tmp_path / "a.db")
+    archive.set_account_type(conn, "acct-617", "Investor Checking", source="inferred")
+    archive.set_account_type(conn, "acct-307", "Investor Savings", source="heuristic")
+    types = archive.load_account_types(conn)
+    assert types["acct-617"]["product_type"] == "Investor Checking"
+    assert types["acct-617"]["source"] == "inferred"
+    assert types["acct-307"]["product_type"] == "Investor Savings"
+
+    # Upsert overwrites in place (no duplicate row), e.g. a later user confirmation.
+    archive.set_account_type(conn, "acct-617", "Investor Checking", source="confirmed")
+    types = archive.load_account_types(conn)
+    assert len(types) == 2
+    assert types["acct-617"]["source"] == "confirmed"
+
+
+def test_transfer_schema_added_to_existing_archive(tmp_path):
+    # The new tables must appear via the IF NOT EXISTS migration on reconnect to a
+    # pre-existing archive, not only on fresh creation.
+    db = tmp_path / "a.db"
+    conn = archive.connect(db)
+    archive.upsert(conn, _normalized())
+    conn.close()
+    conn2 = archive.connect(db)
+    names = {
+        r[0] for r in conn2.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert {"transfer_links", "account_types"}.issubset(names)
+
+
+def test_transfer_link_requires_at_least_one_leg(tmp_path):
+    # A link that references neither a debit nor a credit leg is meaningless and
+    # must be rejected by the CHECK constraint.
+    conn = archive.connect(tmp_path / "a.db")
+    with pytest.raises(sqlite3.IntegrityError):
+        archive.insert_transfer_link(conn, status="unmatched")
+
+
+def test_account_type_rejects_null_account_id(tmp_path):
+    # A NULL account_id in a TEXT PRIMARY KEY would silently allow duplicate rows
+    # that collapse to one key on load; NOT NULL forbids it.
+    conn = archive.connect(tmp_path / "a.db")
+    with pytest.raises(sqlite3.IntegrityError):
+        archive.set_account_type(conn, None, "Investor Checking")
+
+
+def test_transfer_link_txn_cannot_be_claimed_in_both_roles(tmp_path):
+    # The per-column UNIQUE indexes alone would let the same txn be a debit in
+    # one link and a credit in another; the cross-claim trigger forbids it.
+    conn = archive.connect(tmp_path / "a.db")
+    archive.insert_transfer_link(conn, debit_txn_id="txn-1", credit_txn_id="c1", status="inferred")
+    with pytest.raises(sqlite3.IntegrityError):
+        archive.insert_transfer_link(conn, debit_txn_id="d2", credit_txn_id="txn-1", status="inferred")
+
+
+def test_transfer_link_rejects_self_link(tmp_path):
+    # A transaction is money out or money in, never both legs of one link.
+    conn = archive.connect(tmp_path / "a.db")
+    with pytest.raises(sqlite3.IntegrityError):
+        archive.insert_transfer_link(conn, debit_txn_id="x", credit_txn_id="x", status="inferred")

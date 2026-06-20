@@ -8,7 +8,7 @@ timestamps alongside the raw Unix seconds.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Context, Decimal, Inexact, InvalidOperation, localcontext
 from typing import Any
 
 
@@ -29,6 +29,38 @@ def _amount_float(amount: Any) -> float | None:
     try:
         return float(Decimal(str(amount)))
     except (InvalidOperation, ValueError):
+        return None
+
+
+def amount_to_cents(amount: Any) -> int | None:
+    """Parse a SimpleFIN decimal-string amount into signed integer cents.
+
+    Transfer matching pairs a debit with a credit of equal magnitude, and that
+    equality must be exact. Comparing ``amount_float`` risks binary-float drift
+    (two ``70.00`` legs differing in the 15th decimal would fail to match), so we
+    parse the authoritative decimal *string* into integer cents instead. Returns
+    ``None`` when the amount is missing, unparseable, non-finite (NaN/Infinity),
+    or carries sub-cent precision that does not represent a whole number of cents
+    (rounding such a value would invent an amount the account never saw).
+    """
+    if amount is None:
+        return None
+    try:
+        d = Decimal(str(amount).strip().replace(",", ""))
+        if not d.is_finite():
+            return None
+        # Scale to cents inside a *fresh* context (not the ambient one) that
+        # traps only Inexact, so the exactness test depends on nothing outside
+        # this function: a sub-cent value raises (-> None) instead of being
+        # silently rounded, an over-large value raises (-> None) instead of
+        # crashing the caller, and a normal exact amount like "10.00" is never
+        # rejected just because some caller happened to enable a Rounded trap.
+        # `to_integral_exact` is what signals Inexact (plain `to_integral_value`
+        # does not).
+        with localcontext(Context(prec=34, traps=[Inexact])):
+            cents = (d * 100).to_integral_exact()
+        return int(cents)
+    except (ArithmeticError, ValueError):
         return None
 
 

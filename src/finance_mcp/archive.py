@@ -94,6 +94,85 @@ CREATE TABLE IF NOT EXISTS transaction_categories (
 );
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+-- Reconstructed internal-transfer pairings. Schwab's feed names only the
+-- product *type* a transfer went to ("...to Investor Checking"), never which of
+-- the user's ~19 named envelope accounts received it. A row here links one
+-- outgoing leg (`debit_txn_id`) to the incoming leg (`credit_txn_id`) that
+-- received the same money on a different account, recovering the hidden
+-- counterparty by amount+date matching. Exactly one leg may be NULL while a
+-- transfer is still unmatched. The explanation columns record WHY a link was
+-- drawn so "Main -> Groceries?" stays auditable.
+CREATE TABLE IF NOT EXISTS transfer_links (
+    link_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    debit_txn_id      TEXT,
+    credit_txn_id     TEXT,
+    amount_cents      INTEGER,
+    status            TEXT NOT NULL,   -- confirmed | inferred | unconfirmed | unmatched
+    method            TEXT,            -- mutual-unique | forced-perfect | envelope-set | keyword-type | manual ...
+    confidence        TEXT,            -- taxonomy label (see transfer-tracking design)
+    date_rule         TEXT,            -- same-day | plus-minus-1-day
+    keyword           TEXT,            -- destination product-type keyword used, if any
+    type_source       TEXT,            -- confirmed | inferred | heuristic | none
+    candidates_before INTEGER,         -- audit: candidate legs before narrowing
+    candidates_after  INTEGER,         -- audit: candidate legs after narrowing
+    explanation       TEXT,            -- human-readable "why"
+    reconcile_run_id  TEXT,            -- the reconcile pass that last wrote this inferred row
+    created_at        TEXT,
+    updated_at        TEXT,
+    -- A link must reference at least one real leg; a row pointing at nothing is
+    -- meaningless. (The UNIQUE indexes below cannot catch all-NULL rows because
+    -- SQLite treats each NULL as distinct.) A debit can never equal its own
+    -- credit: a transaction is money out or money in, never both.
+    CHECK (debit_txn_id IS NOT NULL OR credit_txn_id IS NOT NULL),
+    CHECK (debit_txn_id IS NULL OR credit_txn_id IS NULL
+           OR debit_txn_id <> credit_txn_id)
+);
+-- A transaction may belong to at most one link, in exactly one role. The UNIQUE
+-- indexes enforce same-role uniqueness (a txn used twice as a debit, or twice as
+-- a credit). NULLs are exempt (SQLite treats each NULL as distinct), so any
+-- number of still-unmatched legs can coexist.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_link_debit  ON transfer_links(debit_txn_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_link_credit ON transfer_links(credit_txn_id);
+-- The UNIQUE indexes only constrain each column independently, so a transaction
+-- could still be claimed as a debit in one link and a credit in another. These
+-- triggers close that cross-role gap atomically (an app-level check-then-insert
+-- would race), so a transaction id appears at most once across BOTH columns.
+CREATE TRIGGER IF NOT EXISTS trg_link_no_cross_claim_ins
+BEFORE INSERT ON transfer_links
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'transfer leg already linked in the opposite role')
+    WHERE EXISTS (
+        SELECT 1 FROM transfer_links
+        WHERE (NEW.debit_txn_id  IS NOT NULL AND credit_txn_id = NEW.debit_txn_id)
+           OR (NEW.credit_txn_id IS NOT NULL AND debit_txn_id  = NEW.credit_txn_id)
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS trg_link_no_cross_claim_upd
+BEFORE UPDATE ON transfer_links
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'transfer leg already linked in the opposite role')
+    WHERE EXISTS (
+        SELECT 1 FROM transfer_links
+        WHERE link_id <> NEW.link_id
+          AND ((NEW.debit_txn_id  IS NOT NULL AND credit_txn_id = NEW.debit_txn_id)
+            OR (NEW.credit_txn_id IS NOT NULL AND debit_txn_id  = NEW.credit_txn_id))
+    );
+END;
+
+-- Static, user-authoritative map of an account to its Schwab product type
+-- (e.g. "Investor Checking" vs "Investor Savings"). The product type is
+-- permanent per account number, so it is confirmed once and used only as a
+-- tie-breaker / guard during matching -- never re-learned from the matches it
+-- helps produce (which would be circular).
+CREATE TABLE IF NOT EXISTS account_types (
+    account_id   TEXT NOT NULL PRIMARY KEY,
+    product_type TEXT NOT NULL,
+    source       TEXT NOT NULL DEFAULT 'inferred',  -- confirmed | inferred | heuristic
+    updated_at   TEXT
+);
 """
 
 _TXN_COLUMNS = [
@@ -279,3 +358,97 @@ def stats(conn: sqlite3.Connection) -> dict:
 
 def is_empty(conn: sqlite3.Connection) -> bool:
     return _count(conn, "transactions") == 0
+
+
+# --- Transfer reconciliation: storage foundation -------------------------------
+#
+# These are low-level accessors over `transfer_links` and `account_types`. They
+# enforce only the schema's at-most-one-link-per-leg UNIQUE constraints. The
+# matching logic (which legs to pair), the static type-map seeding/guard, and the
+# idempotent reconcile policy (confirmed preserved, inferred recomputed,
+# promote/downgrade) are layered on top in later pieces.
+
+_LINK_COLUMNS = [
+    "debit_txn_id", "credit_txn_id", "amount_cents", "status", "method",
+    "confidence", "date_rule", "keyword", "type_source", "candidates_before",
+    "candidates_after", "explanation", "reconcile_run_id",
+]
+
+
+def insert_transfer_link(
+    conn: sqlite3.Connection,
+    *,
+    status: str,
+    debit_txn_id: str | None = None,
+    credit_txn_id: str | None = None,
+    amount_cents: int | None = None,
+    method: str | None = None,
+    confidence: str | None = None,
+    date_rule: str | None = None,
+    keyword: str | None = None,
+    type_source: str | None = None,
+    candidates_before: int | None = None,
+    candidates_after: int | None = None,
+    explanation: str | None = None,
+    reconcile_run_id: str | None = None,
+) -> int:
+    """Insert one transfer-link row and return its ``link_id``.
+
+    Raises ``sqlite3.IntegrityError`` if either leg is already claimed by another
+    link (the UNIQUE indexes on ``debit_txn_id`` / ``credit_txn_id``). A leg left
+    ``None`` represents a still-unmatched transfer.
+    """
+    now = _now()
+    values = {
+        "debit_txn_id": debit_txn_id, "credit_txn_id": credit_txn_id,
+        "amount_cents": amount_cents, "status": status, "method": method,
+        "confidence": confidence, "date_rule": date_rule, "keyword": keyword,
+        "type_source": type_source, "candidates_before": candidates_before,
+        "candidates_after": candidates_after, "explanation": explanation,
+        "reconcile_run_id": reconcile_run_id,
+    }
+    placeholders = ", ".join(["?"] * (len(_LINK_COLUMNS) + 2))
+    cur = conn.execute(
+        f"INSERT INTO transfer_links ({', '.join(_LINK_COLUMNS)}, created_at, updated_at) "
+        f"VALUES ({placeholders})",
+        tuple(values[c] for c in _LINK_COLUMNS) + (now, now),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def load_transfer_links(conn: sqlite3.Connection) -> list[dict]:
+    """Return all transfer links (insertion order) as plain dicts."""
+    rows = conn.execute("SELECT * FROM transfer_links ORDER BY link_id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_account_type(
+    conn: sqlite3.Connection,
+    account_id: str,
+    product_type: str,
+    *,
+    source: str = "inferred",
+) -> None:
+    """Upsert one account's product type.
+
+    ``source`` is one of ``confirmed`` (user-authoritative), ``inferred``
+    (derived from certain matches), or ``heuristic`` (name hint). This primitive
+    overwrites unconditionally; the confirmed-wins seeding policy lives in the
+    type-map piece that calls it.
+    """
+    conn.execute(
+        "INSERT INTO account_types (account_id, product_type, source, updated_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(account_id) DO UPDATE SET "
+        "product_type=excluded.product_type, source=excluded.source, "
+        "updated_at=excluded.updated_at",
+        (account_id, product_type, source, _now()),
+    )
+    conn.commit()
+
+
+def load_account_types(conn: sqlite3.Connection) -> dict[str, dict]:
+    """Return the product-type map keyed by ``account_id``."""
+    rows = conn.execute("SELECT * FROM account_types").fetchall()
+    return {r["account_id"]: dict(r) for r in rows}

@@ -88,3 +88,73 @@ def test_bad_amount_and_timestamp_are_tolerated():
     assert norm["accounts"][0]["balance_date"] is None
     assert norm["transactions"][0]["amount_float"] is None
     assert norm["transactions"][0]["posted"] is None
+
+
+def test_amount_to_cents_exact_for_decimal_strings():
+    assert normalize.amount_to_cents("-70.00") == -7000
+    assert normalize.amount_to_cents("100.00") == 10000
+    assert normalize.amount_to_cents("0.01") == 1
+    assert normalize.amount_to_cents("1,234.56") == 123456  # thousands separator
+    assert normalize.amount_to_cents("  -5.5 ") == -550      # whitespace + 1 decimal
+    assert normalize.amount_to_cents("200") == 20000         # no decimal point
+
+
+def test_amount_to_cents_no_float_drift():
+    # 70.00 + 0.10 style sums that bite naive floats must still pair exactly.
+    assert normalize.amount_to_cents("0.10") == 10
+    assert normalize.amount_to_cents("0.20") == 20
+    assert normalize.amount_to_cents("0.30") == 30
+    # equal magnitudes parse to identical ints regardless of sign.
+    assert normalize.amount_to_cents("-12.34") == -1234
+    assert abs(normalize.amount_to_cents("-12.34")) == normalize.amount_to_cents("12.34")
+
+
+def test_amount_to_cents_handles_missing_and_garbage():
+    assert normalize.amount_to_cents(None) is None
+    assert normalize.amount_to_cents("") is None
+    assert normalize.amount_to_cents("oops") is None
+
+
+def test_amount_to_cents_rejects_non_finite():
+    # NaN/Infinity are valid Decimal() inputs, so they must be caught explicitly
+    # rather than crashing the later int() conversion.
+    for bad in ("NaN", "nan", "Infinity", "inf", "-inf", "sNaN"):
+        assert normalize.amount_to_cents(bad) is None
+
+
+def test_amount_to_cents_rejects_subcent_precision():
+    # Rounding a sub-cent amount would invent a magnitude the account never saw,
+    # which could mis-pair a transfer. Reject instead.
+    assert normalize.amount_to_cents("10.005") is None
+    assert normalize.amount_to_cents("10.004") is None
+    assert normalize.amount_to_cents("0.001") is None
+    # Exact cents still parse.
+    assert normalize.amount_to_cents("10.00") == 1000
+
+
+def test_amount_to_cents_rejects_overflow_and_high_precision():
+    # Finite-but-huge inputs must not crash (decimal.Overflow is not
+    # InvalidOperation), and sub-cent precision must be rejected regardless of
+    # the ambient Decimal context, not silently rounded.
+    assert normalize.amount_to_cents("1e999999") is None
+    assert normalize.amount_to_cents("9e999999999") is None
+    assert normalize.amount_to_cents("123456789012345678901234567890.001") is None
+    # Large but exact cents amounts still parse.
+    assert normalize.amount_to_cents("12345678901234.56") == 1234567890123456
+
+
+def test_amount_to_cents_immune_to_ambient_decimal_traps():
+    # The helper must not depend on the caller's Decimal context. With the
+    # ambient Rounded trap enabled, an exact amount like "10.00" must still parse
+    # (to_integral_exact signals Rounded when discarding trailing zeros).
+    import decimal
+
+    ctx = decimal.getcontext()
+    prev = ctx.traps[decimal.Rounded]
+    ctx.traps[decimal.Rounded] = True
+    try:
+        assert normalize.amount_to_cents("10.00") == 1000
+        assert normalize.amount_to_cents("10.005") is None
+        assert normalize.amount_to_cents("1e999999") is None
+    finally:
+        ctx.traps[decimal.Rounded] = prev
