@@ -11,7 +11,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import archive, client, config, queries, store, sync
+from . import archive, categories, client, config, queries, store, sync
 
 mcp = FastMCP("finance-mcp")
 
@@ -53,6 +53,8 @@ def get_transactions(
     end_date: str | None = None,
     account_id: str | None = None,
     search: str | None = None,
+    category: str | None = None,
+    include_transfers: bool = True,
     min_amount: float | None = None,
     max_amount: float | None = None,
     include_pending: bool = True,
@@ -62,7 +64,9 @@ def get_transactions(
 
     Dates are YYYY-MM-DD. Amounts are signed (negative = money out), so use
     ``max_amount=0`` for spending only or ``min_amount=0`` for income only.
-    Returns the matching transactions plus the total match count.
+    Each transaction carries a derived ``category`` and ``is_transfer`` flag; pass
+    ``category`` to filter to one, or ``include_transfers=False`` to drop internal
+    transfers and card payments. Returns the matching transactions plus the count.
     """
     cache = store.load_archive_view()
     rows = queries.filter_transactions(
@@ -71,6 +75,8 @@ def get_transactions(
         end_date=end_date,
         account_id=account_id,
         search=search,
+        category=category,
+        include_transfers=include_transfers,
         min_amount=min_amount,
         max_amount=max_amount,
         include_pending=include_pending,
@@ -87,15 +93,18 @@ def get_transactions(
 
 @mcp.tool()
 def spending_summary(
-    group_by: str = "account",
+    group_by: str = "category",
     start_date: str | None = None,
     end_date: str | None = None,
     include_pending: bool = True,
+    exclude_transfers: bool = True,
 ) -> dict[str, Any]:
-    """Aggregate inflow/outflow over a date range.
+    """Aggregate inflow/outflow over a date range, grouped for budgeting.
 
-    ``group_by`` is ``account``, ``org``, or ``month``. SimpleFIN provides no
-    spending categories, so grouping is by real fields only.
+    ``group_by`` is ``category`` (default), ``account``, ``org``, or ``month``.
+    Categories come from a local rules engine plus manual overrides. Internal
+    transfers and credit-card payments are excluded by default so the totals
+    reflect real spending; set ``exclude_transfers=False`` to include them.
     """
     cache = store.load_archive_view()
     return queries.spending_summary(
@@ -104,6 +113,7 @@ def spending_summary(
         start_date=start_date,
         end_date=end_date,
         include_pending=include_pending,
+        exclude_transfers=exclude_transfers,
     )
 
 
@@ -128,6 +138,85 @@ def archive_stats() -> dict[str, Any]:
     conn = archive.connect()
     try:
         return archive.stats(conn)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def categorization_status() -> dict[str, Any]:
+    """Report category coverage and the breakdown of transactions per category."""
+    # Go through the read path so the cache fallback (legacy cache.json with no
+    # archive.db yet) is reflected instead of reporting 0/0.
+    view = store.load_archive_view()
+    return categories.coverage_report(view["transactions"])
+
+
+@mcp.tool()
+def list_category_rules() -> dict[str, Any]:
+    """List the category rules (pattern -> category) currently in effect."""
+    conn = archive.connect()
+    try:
+        return {"rules": categories.list_rules(conn)}
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def add_category_rule(
+    pattern: str,
+    category: str,
+    field: str = "any",
+    is_transfer: bool = False,
+    priority: int = 100,
+) -> dict[str, Any]:
+    """Add a category rule: a case-insensitive substring match -> category.
+
+    ``field`` is ``description``, ``payee``, or ``any``. ``priority`` is
+    lowest-wins. Set ``is_transfer=True`` for internal transfers / card payments
+    so they are excluded from spending totals.
+    """
+    conn = archive.connect()
+    try:
+        rule_id = categories.add_rule(
+            conn, pattern, category,
+            field=field, is_transfer=is_transfer, priority=priority,
+        )
+        return {"ok": True, "rule_id": rule_id}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def remove_category_rule(rule_id: int) -> dict[str, Any]:
+    """Delete a category rule by its id."""
+    conn = archive.connect()
+    try:
+        return {"ok": categories.remove_rule(conn, rule_id)}
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def set_transaction_category(
+    txn_id: str,
+    category: str,
+    is_transfer: bool = False,
+) -> dict[str, Any]:
+    """Pin a category to a single transaction.
+
+    Manual overrides win over every rule and survive re-syncs, so use this to fix
+    a one-off that the rules get wrong.
+    """
+    conn = archive.connect()
+    try:
+        categories.set_manual_category(
+            conn, txn_id, category, is_transfer=is_transfer
+        )
+        return {"ok": True, "txn_id": txn_id, "category": category}
+    except (LookupError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
     finally:
         conn.close()
 

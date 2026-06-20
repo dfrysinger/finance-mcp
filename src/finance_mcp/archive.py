@@ -15,6 +15,7 @@ cache and the existing query helpers work unchanged on top of the archive.
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -71,6 +72,27 @@ CREATE TABLE IF NOT EXISTS balance_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_snap_date ON balance_snapshots(balance_date_ts);
 
+-- User-editable rules: a case-insensitive substring match -> category.
+CREATE TABLE IF NOT EXISTS category_rules (
+    rule_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern     TEXT NOT NULL,
+    field       TEXT NOT NULL DEFAULT 'any',   -- description | payee | any
+    category    TEXT NOT NULL,
+    is_transfer INTEGER NOT NULL DEFAULT 0,     -- internal transfer, not real spend
+    priority    INTEGER NOT NULL DEFAULT 100,   -- lower wins
+    created_at  TEXT
+);
+
+-- Per-transaction manual overrides; kept separate from `transactions` so a sync
+-- (which upserts transactions) can never clobber a hand-assigned category.
+CREATE TABLE IF NOT EXISTS transaction_categories (
+    txn_id      TEXT PRIMARY KEY,
+    category    TEXT NOT NULL,
+    is_transfer INTEGER NOT NULL DEFAULT 0,
+    source      TEXT NOT NULL DEFAULT 'manual',
+    updated_at  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -86,12 +108,34 @@ _ACCOUNT_COLUMNS = [
 ]
 
 
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """Switch the database to WAL mode, retrying on a transient lock.
+
+    Upgrading a brand-new database to WAL needs an exclusive lock, and SQLite
+    deliberately does NOT invoke the busy handler for that lock upgrade (it
+    returns SQLITE_BUSY immediately to avoid deadlock), so ``busy_timeout`` does
+    not cover it. When two processes first-create the archive at once (e.g. the
+    CLI and the MCP server), one would otherwise crash with "database is locked".
+    Retry briefly; once the other connection has set WAL the pragma is a no-op.
+    """
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 def connect(path: Path | None = None) -> sqlite3.Connection:
     """Open (creating if needed) the archive database with the schema applied."""
     path = path or (config.home_dir() / "archive.db")
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    _enable_wal(conn)
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.executescript(_SCHEMA)
     try:

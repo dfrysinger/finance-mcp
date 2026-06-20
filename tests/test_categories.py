@@ -1,0 +1,350 @@
+from finance_mcp import archive, categories
+
+
+def _conn(tmp_path):
+    return archive.connect(tmp_path / "a.db")
+
+
+def _seed_txn(conn, tid):
+    conn.execute("INSERT OR IGNORE INTO transactions (id) VALUES (?)", (tid,))
+    conn.commit()
+
+
+def _txn(tid, desc="", payee="", amount=-10.0):
+    return {"id": tid, "description": desc, "payee": payee, "amount_float": amount}
+
+
+def test_seed_default_rules_is_idempotent(tmp_path):
+    conn = _conn(tmp_path)
+    n1 = categories.seed_default_rules(conn)
+    assert n1 > 0
+    n2 = categories.seed_default_rules(conn)
+    assert n2 == 0
+    assert len(categories.list_rules(conn)) == n1
+
+
+def test_force_reseed_restores_deleted_defaults_without_duplicating(tmp_path):
+    conn = _conn(tmp_path)
+    n1 = categories.seed_default_rules(conn)
+    victim = categories.list_rules(conn)[0]["rule_id"]
+    categories.remove_rule(conn, victim)
+    assert len(categories.list_rules(conn)) == n1 - 1
+    restored = categories.seed_default_rules(conn, force=True)
+    assert restored == 1
+    assert len(categories.list_rules(conn)) == n1  # no duplicates
+
+
+def test_deleting_all_rules_is_durable(tmp_path):
+    # Regression: an intentional empty rule set must survive subsequent reads.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    for r in categories.list_rules(conn):
+        categories.remove_rule(conn, r["rule_id"])
+    assert categories.list_rules(conn) == []
+    # A later read calls seed again — the meta sentinel must prevent re-seeding.
+    assert categories.seed_default_rules(conn) == 0
+    assert categories.list_rules(conn) == []
+
+
+def test_custom_rule_first_still_loads_defaults(tmp_path):
+    # Regression: adding a custom rule before the first seeding read must NOT
+    # suppress the defaults (otherwise transfer rules go missing and transfers
+    # get counted as spending).
+    conn = _conn(tmp_path)
+    conn.execute("DELETE FROM meta WHERE key='rules_seeded'")
+    conn.commit()
+    categories.add_rule(conn, "mycustommerchant", "Custom")
+    inserted = categories.seed_default_rules(conn)
+    patterns = [r["pattern"] for r in categories.list_rules(conn)]
+    assert inserted == len(categories.DEFAULT_RULES)  # all defaults loaded
+    assert "mycustommerchant" in patterns  # custom rule preserved
+    # a transfer default is present, so transfers will be excluded from spend
+    assert any(r["is_transfer"] for r in categories.list_rules(conn))
+
+
+def test_seed_fills_missing_defaults_without_duplicating_existing(tmp_path):
+    # A pre-sentinel archive that already holds a rule matching a default pattern:
+    # seeding fills the rest without duplicating that pattern.
+    conn = _conn(tmp_path)
+    conn.execute("DELETE FROM meta WHERE key='rules_seeded'")
+    conn.commit()
+    categories.add_rule(conn, "harmons", "MyGroceries")
+    inserted = categories.seed_default_rules(conn)
+    patterns = [r["pattern"] for r in categories.list_rules(conn)]
+    assert patterns.count("harmons") == 1  # not duplicated
+    assert inserted == len(categories.DEFAULT_RULES) - 1
+    # the user's own mapping wins, the default 'harmons' rule was not added
+    txns = [_txn("t1", desc="HARMONS #12")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "MyGroceries"
+
+
+def test_rule_match_assigns_category(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "harmons", "Groceries")
+    txns = [_txn("t1", desc="HARMONS #12 OREM UT")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Groceries"
+    assert txns[0]["category_source"] == "rule"
+    assert txns[0]["is_transfer"] is False
+
+
+def test_unmatched_is_uncategorized(tmp_path):
+    conn = _conn(tmp_path)
+    txns = [_txn("t1", desc="SOME UNKNOWN MERCHANT")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+    assert txns[0]["category_source"] == "none"
+
+
+def test_priority_lower_wins(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "pizza", "Dining", priority=70)
+    categories.add_rule(conn, "marcos pizza", "FastFood", priority=50)
+    txns = [_txn("t1", desc="MARCOS PIZZA 123")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "FastFood"
+
+
+def test_manual_override_wins_over_rule(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "harmons", "Groceries")
+    _seed_txn(conn, "t1")
+    categories.set_manual_category(conn, "t1", "Gifts")
+    txns = [_txn("t1", desc="HARMONS #12")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Gifts"
+    assert txns[0]["category_source"] == "manual"
+
+
+def test_manual_override_upsert_replaces(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_txn(conn, "t1")
+    categories.set_manual_category(conn, "t1", "Gifts")
+    categories.set_manual_category(conn, "t1", "Travel", is_transfer=False)
+    txns = [_txn("t1")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Travel"
+
+
+def test_clear_manual_falls_back_to_rule(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "harmons", "Groceries")
+    _seed_txn(conn, "t1")
+    categories.set_manual_category(conn, "t1", "Gifts")
+    assert categories.clear_manual_category(conn, "t1") is True
+    txns = [_txn("t1", desc="HARMONS")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Groceries"
+
+
+def test_field_scoping_payee_only(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "amazon", "Shopping", field="payee")
+    in_desc = [_txn("t1", desc="AMAZON.COM")]
+    in_payee = [_txn("t2", payee="Amazon")]
+    categories.apply_categories(conn, in_desc)
+    categories.apply_categories(conn, in_payee)
+    assert in_desc[0]["category"] == categories.UNCATEGORIZED
+    assert in_payee[0]["category"] == "Shopping"
+
+
+def test_transfer_flag_propagates(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "transfer to", "Transfer", is_transfer=True)
+    txns = [_txn("t1", desc="TRANSFER TO SAVINGS")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["is_transfer"] is True
+
+
+def test_remove_rule(tmp_path):
+    conn = _conn(tmp_path)
+    rid = categories.add_rule(conn, "harmons", "Groceries")
+    assert categories.remove_rule(conn, rid) is True
+    assert categories.remove_rule(conn, rid) is False
+
+
+def test_add_rule_rejects_bad_field(tmp_path):
+    conn = _conn(tmp_path)
+    try:
+        categories.add_rule(conn, "x", "Y", field="bogus")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for bad field")
+
+
+def test_add_rule_rejects_blank_pattern(tmp_path):
+    conn = _conn(tmp_path)
+    for bad in ("", "   "):
+        try:
+            categories.add_rule(conn, bad, "Groceries")
+        except ValueError:
+            continue
+        raise AssertionError("expected ValueError for blank pattern")
+
+
+def test_add_rule_rejects_blank_category(tmp_path):
+    conn = _conn(tmp_path)
+    try:
+        categories.add_rule(conn, "harmons", "   ")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for blank category")
+
+
+def test_set_manual_category_rejects_unknown_txn(tmp_path):
+    conn = _conn(tmp_path)
+    try:
+        categories.set_manual_category(conn, "nope", "Gifts")
+    except LookupError:
+        assert conn.execute("SELECT COUNT(*) FROM transaction_categories").fetchone()[0] == 0
+        return
+    raise AssertionError("expected LookupError for unknown txn_id")
+
+
+def test_coverage_report(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "harmons", "Groceries")
+    txns = [
+        _txn("t1", desc="HARMONS"),
+        _txn("t2", desc="HARMONS"),
+        _txn("t3", desc="MYSTERY"),
+    ]
+    report = categories.coverage(conn, txns)
+    assert report["total"] == 3
+    assert report["categorized"] == 2
+    assert report["uncategorized"] == 1
+    assert report["coverage_pct"] == 66.7
+    assert report["categories"]["Groceries"] == 2
+
+
+def test_p2p_payments_count_as_spending_not_transfer(tmp_path):
+    # Regression: Venmo/Zelle/Cash App are dual-use; default-flagging them as
+    # transfers would hide real outflow (rent, contractors) from the budget.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    for desc in ("VENMO PAYMENT 1234", "ZELLE TO JOHN", "CASH APP *RENT",
+                 "ZELLE TRANSFER TO JOHN", "VENMO TRANSFER TO JANE"):
+        txns = [_txn("t1", desc=desc, amount=-500.0)]
+        categories.apply_categories(conn, txns)
+        assert txns[0]["is_transfer"] is False, desc
+        assert txns[0]["category"] == "P2P Payment", desc
+
+
+def test_mobile_deposit_is_not_a_transfer(tmp_path):
+    # Regression: a mobile check deposit is real inbound money, not an internal
+    # move; flagging it is_transfer would hide income from inflow totals.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    txns = [_txn("t1", desc="DEPOSIT MOBILE BANKING", amount=1200.0)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["is_transfer"] is False
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_autopay_does_not_hide_real_bills(tmp_path):
+    # Regression: a generic "autopay"/"e-payment" transfer rule must not shadow
+    # specific merchant rules and hide real utility/insurance bills from the budget.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    categories.add_rule(conn, "rocky mountain power", "Utilities", field="any")
+    txns = [_txn("t1", desc="ROCKY MOUNTAIN POWER AUTOPAY", amount=-150.0)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["is_transfer"] is False
+    assert txns[0]["category"] == "Utilities"
+    # "AUTOMATIC PAYMENT" is the same defect class — also must not hide the bill.
+    spelled = [_txn("t3", desc="ROCKY MOUNTAIN POWER AUTOMATIC PAYMENT", amount=-150.0)]
+    categories.apply_categories(conn, spelled)
+    assert spelled[0]["is_transfer"] is False
+    assert spelled[0]["category"] == "Utilities"
+    # An unrecognized autopay stays visible spend, not a hidden transfer.
+    other = [_txn("t2", desc="GEICO AUTOPAY", amount=-90.0)]
+    categories.apply_categories(conn, other)
+    assert other[0]["is_transfer"] is False
+
+
+def test_atm_withdrawal_counts_as_spending_not_transfer(tmp_path):
+    # Regression: bare "withdrawal" must NOT be a default transfer rule, or real
+    # ATM/cash withdrawals would be hidden from the budget.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    txns = [_txn("t1", desc="ATM WITHDRAWAL 1234 MAIN ST", amount=-100.0)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["is_transfer"] is False
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_default_rules_cover_real_merchants(tmp_path):
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    cases = {
+        "HARMONS #12": "Groceries",
+        "MCDONALD'S F123": "Dining",
+        "AMAZON.COM*ABC": "Shopping",
+        "APPLE.COM/BILL": "Subscriptions",
+        "Transfer To Share 5": "Transfer",
+    }
+    txns = [_txn(f"t{i}", desc=d) for i, d in enumerate(cases)]
+    categories.apply_categories(conn, txns)
+    got = {t["description"]: t["category"] for t in txns}
+    for desc, expected in cases.items():
+        assert got[desc] == expected, f"{desc} -> {got[desc]} != {expected}"
+
+
+def test_concurrent_seeding_does_not_duplicate_rules(tmp_path):
+    # Regression: two connections seeding an existing archive at the same time must
+    # not double-insert the defaults (which would survive a single remove_rule and
+    # keep hiding spend). BEGIN IMMEDIATE serializes them; the loser sees the
+    # sentinel and inserts nothing.
+    import threading
+
+    db = tmp_path / "race.db"
+    # Establish the archive (schema + WAL) first, as a prior sync would, then race
+    # only the seeding — the concurrency the fix actually guards.
+    archive.connect(db).close()
+
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def worker():
+        conn = archive.connect(db)
+        try:
+            barrier.wait(timeout=5)
+            categories.seed_default_rules(conn)
+        except Exception as exc:  # surface, don't swallow
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, errors
+    conn = archive.connect(db)
+    try:
+        patterns = [r["pattern"] for r in categories.list_rules(conn)]
+    finally:
+        conn.close()
+    assert len(patterns) == len(set(patterns))
+    assert len(patterns) == len(categories.DEFAULT_RULES)
+
+
+def test_seed_refuses_to_commit_callers_transaction(tmp_path):
+    # Regression: seed_default_rules must not commit a transaction it did not open
+    # (that would make a caller's pending writes durable past their own rollback).
+    import pytest
+
+    conn = _conn(tmp_path)
+    conn.execute("INSERT INTO meta (key, value) VALUES ('caller', 'pending')")
+    assert conn.in_transaction
+    with pytest.raises(RuntimeError):
+        categories.seed_default_rules(conn)
+    # The caller can still roll back their own work.
+    conn.rollback()
+    assert conn.execute(
+        "SELECT value FROM meta WHERE key='caller'"
+    ).fetchone() is None
+    conn.close()

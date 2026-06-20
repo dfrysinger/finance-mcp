@@ -50,20 +50,42 @@ def load_archive_view() -> dict:
     JSON cache if the archive does not exist yet (e.g. before the first sync on
     this version).
     """
-    from . import archive  # local import avoids a circular dependency at import time
+    from . import archive, categories  # local import avoids a circular import
 
     db_path = config.home_dir() / "archive.db"
     if not db_path.exists():
-        return load_cache()
+        # No archive yet (e.g. a legacy cache.json from before this version).
+        # Serve the cache, but still categorize via a throwaway seeded DB so a
+        # transfer-excluding summary stays honest instead of silently counting
+        # transfers as spending.
+        base = load_cache()
+        if base["transactions"]:
+            mem = archive.connect(Path(":memory:"))
+            try:
+                categories.seed_default_rules(mem)
+                categories.apply_categories(mem, base["transactions"])
+            finally:
+                mem.close()
+        return base
+
     conn = archive.connect(db_path)
     try:
-        if archive.is_empty(conn):
-            return load_cache()
+        # Seed the default rule set once (tracked by a meta sentinel) so
+        # is_transfer is populated on every read path (CLI and MCP). Without this,
+        # spending_summary would claim exclude_transfers while excluding nothing.
+        categories.seed_default_rules(conn)
         base = load_cache()
+        if archive.is_empty(conn):
+            txns = base["transactions"]
+            accounts = base["accounts"]
+        else:
+            txns = archive.load_transactions(conn)
+            accounts = archive.load_accounts(conn)
+        categories.apply_categories(conn, txns)
         return {
             "synced_at": base.get("synced_at"),
-            "accounts": archive.load_accounts(conn),
-            "transactions": archive.load_transactions(conn),
+            "accounts": accounts,
+            "transactions": txns,
             "errors": base.get("errors", []),
             "errlist": base.get("errlist", []),
         }

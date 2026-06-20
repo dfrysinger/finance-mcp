@@ -62,4 +62,33 @@ def test_spending_summary_rejects_bad_group_by(normalized):
     import pytest
 
     with pytest.raises(ValueError):
-        queries.spending_summary(normalized["transactions"], group_by="category")
+        queries.spending_summary(normalized["transactions"], group_by="nonsense")
+
+
+def test_filter_by_category(normalized):
+    txns = [dict(t) for t in normalized["transactions"]]
+    txns[0]["category"] = "Coffee"
+    rows = queries.filter_transactions(txns, category="coffee")
+    assert {t["id"] for t in rows} == {txns[0]["id"]}
+
+
+def test_filter_exclude_transfers(normalized):
+    txns = [dict(t) for t in normalized["transactions"]]
+    txns[0]["is_transfer"] = True
+    rows = queries.filter_transactions(txns, include_transfers=False)
+    assert txns[0]["id"] not in {t["id"] for t in rows}
+
+
+def test_spending_summary_by_category_excludes_transfers(normalized):
+    txns = [dict(t) for t in normalized["transactions"]]
+    for t in txns:
+        t["category"] = "Transfer" if t["amount_float"] and t["amount_float"] < -40 else "Dining"
+        t["is_transfer"] = t["category"] == "Transfer"
+    result = queries.spending_summary(txns, group_by="category")
+    assert result["exclude_transfers"] is True
+    groups = {g["group"] for g in result["groups"]}
+    assert "Transfer" not in groups
+
+    included = queries.spending_summary(txns, group_by="category", exclude_transfers=False)
+    assert "Transfer" in {g["group"] for g in included["groups"]}
+

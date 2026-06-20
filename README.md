@@ -53,8 +53,15 @@ uv run finance-mcp accounts                          # balances per account
 uv run finance-mcp transactions --search grocery     # search the full archive
 uv run finance-mcp transactions --start 2026-01-01 --account <id> --json
 uv run finance-mcp summary --group-by month          # inflow/outflow aggregation
+uv run finance-mcp summary                            # defaults to group-by category, excludes transfers
 uv run finance-mcp networth                          # net-worth total per snapshot date
 uv run finance-mcp stats                             # archive size + date coverage
+uv run finance-mcp categorize                        # seed default rules + show coverage
+uv run finance-mcp uncategorized                     # top still-uncategorized merchants
+uv run finance-mcp rules list                        # show categorization rules
+uv run finance-mcp rules add --pattern "trader joe" --category Groceries
+uv run finance-mcp rules rm --rule-id <id>           # remove a rule
+uv run finance-mcp set-category <txn_id> Travel      # pin one transaction's category
 uv run finance-mcp sync --days 120                    # refresh from SimpleFIN
 ```
 
@@ -96,8 +103,13 @@ The server runs over stdio and exposes these tools:
 |------|----------|---------|
 | `list_accounts` | no | accounts + balances + institution |
 | `account_balances` | no | just balances and as-of dates |
-| `get_transactions` | no | filter by date / account / search / amount |
-| `spending_summary` | no | inflow/outflow grouped by account, org, or month |
+| `get_transactions` | no | filter by date / account / search / amount (includes category) |
+| `spending_summary` | no | inflow/outflow grouped by category, account, org, or month |
+| `categorization_status` | no | category coverage + spend-by-category breakdown |
+| `list_category_rules` | no | the active substring → category rules |
+| `add_category_rule` | no | add a rule (optionally flag matches as transfers) |
+| `remove_category_rule` | no | delete a rule by id |
+| `set_transaction_category` | no | pin one transaction's category (survives sync) |
 | `net_worth_history` | no | total balance per snapshot date (net-worth trend) |
 | `archive_stats` | no | archive size + earliest/latest transaction |
 | `sync_now` | **yes** | refresh the cache + archive from SimpleFIN |
@@ -153,8 +165,11 @@ which `sync` (CLI) or `sync_now` keeps up to date.
 
 ## Notes / limitations
 
-- SimpleFIN does not provide spending **categories**, so `spending_summary` groups
-  only by real fields (account, institution, month). No categories are invented.
+- SimpleFIN does not provide spending **categories**, so categories are assigned
+  locally by a rule engine (case-insensitive substring match on description/payee)
+  plus per-transaction manual overrides — nothing is guessed from outside your data.
+  Internal movements (transfers, card payments, P2P) are flagged so honest spend
+  totals exclude them; pass `--include-transfers` / `include_transfers=true` to count them.
 - Amounts are signed: negative = money out. Use `max_amount=0` for spending-only,
   `min_amount=0` for income-only.
 

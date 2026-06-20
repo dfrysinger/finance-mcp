@@ -38,16 +38,23 @@ def filter_transactions(
     min_amount: float | None = None,
     max_amount: float | None = None,
     include_pending: bool = True,
+    category: str | None = None,
+    include_transfers: bool = True,
     limit: int | None = None,
 ) -> list[dict]:
     """Return transactions matching all supplied filters (AND semantics)."""
     start_ts = _parse_date(start_date)
     end_ts = _parse_date(end_date)
     needle = search.lower().strip() if search else None
+    want_cat = category.strip().lower() if category else None
 
     out: list[dict] = []
     for txn in transactions:
         if not include_pending and txn.get("pending"):
+            continue
+        if not include_transfers and txn.get("is_transfer"):
+            continue
+        if want_cat is not None and (txn.get("category") or "").lower() != want_cat:
             continue
         ts = txn.get("posted_ts")
         if start_ts is not None and (ts is None or ts < start_ts):
@@ -84,6 +91,7 @@ _GROUPERS = {
     "account": lambda t: t.get("account_name") or t.get("account_id") or "unknown",
     "org": lambda t: t.get("org") or "unknown",
     "month": _month_key,
+    "category": lambda t: t.get("category") or "Uncategorized",
 }
 
 
@@ -94,11 +102,14 @@ def spending_summary(
     start_date: str | None = None,
     end_date: str | None = None,
     include_pending: bool = True,
+    exclude_transfers: bool = True,
 ) -> dict[str, Any]:
     """Aggregate inflow/outflow over a date range, grouped by a real field.
 
-    ``group_by`` is one of ``account``, ``org``, ``month``. Outflow is the sum of
-    negative amounts (money out), inflow the sum of positive amounts.
+    ``group_by`` is one of ``account``, ``org``, ``month``, ``category``. Outflow
+    is the sum of negative amounts (money out), inflow the sum of positive
+    amounts. Internal transfers and card payments are excluded by default so the
+    budget reflects real spending.
     """
     if group_by not in _GROUPERS:
         raise ValueError(f"group_by must be one of {sorted(_GROUPERS)}")
@@ -109,6 +120,7 @@ def spending_summary(
         start_date=start_date,
         end_date=end_date,
         include_pending=include_pending,
+        include_transfers=not exclude_transfers,
     )
 
     groups: dict[str, dict[str, float]] = defaultdict(
@@ -139,6 +151,7 @@ def spending_summary(
         "group_by": group_by,
         "start_date": start_date,
         "end_date": end_date,
+        "exclude_transfers": exclude_transfers,
         "transaction_count": len(rows),
         "amount_missing_count": skipped,
         "total_inflow": round(total_in, 2),

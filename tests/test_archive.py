@@ -100,3 +100,37 @@ def test_load_transactions_sorted_desc(tmp_path):
     archive.upsert(conn, _normalized())
     ts = [t["posted_ts"] for t in archive.load_transactions(conn)]
     assert ts == sorted(ts, reverse=True)
+
+
+def test_concurrent_first_connect_does_not_lock(tmp_path):
+    # Regression: two processes first-creating the archive at once must not crash
+    # with "database is locked". The WAL-mode upgrade needs an exclusive lock that
+    # SQLite's busy handler skips, so connect() retries it explicitly.
+    import threading
+
+    db = tmp_path / "fresh.db"
+    barrier = threading.Barrier(4)
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=5)
+            conn = archive.connect(db)
+            conn.close()
+        except Exception as exc:  # surface, don't swallow
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    assert not errors, errors
+    # WAL mode is actually in effect.
+    conn = archive.connect(db)
+    try:
+        mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+    finally:
+        conn.close()
+    assert mode.lower() == "wal"
