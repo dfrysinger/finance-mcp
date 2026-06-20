@@ -14,3 +14,7 @@ wheels/
 .finance-mcp/
 *access_url*
 cache.json
+archive.db
+*.db
+*.db-wal
+*.db-shm

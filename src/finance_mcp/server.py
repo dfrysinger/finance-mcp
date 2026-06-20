@@ -11,7 +11,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import client, config, queries, store, sync
+from . import archive, client, config, queries, store, sync
 
 mcp = FastMCP("finance-mcp")
 
@@ -19,7 +19,7 @@ mcp = FastMCP("finance-mcp")
 @mcp.tool()
 def list_accounts() -> dict[str, Any]:
     """List cached accounts with balances and the institution each belongs to."""
-    cache = store.load_cache()
+    cache = store.load_archive_view()
     return {
         "synced_at": cache.get("synced_at"),
         "account_count": len(cache["accounts"]),
@@ -32,7 +32,7 @@ def list_accounts() -> dict[str, Any]:
 @mcp.tool()
 def account_balances() -> dict[str, Any]:
     """Return just the balance and as-of date for each cached account."""
-    cache = store.load_cache()
+    cache = store.load_archive_view()
     balances = [
         {
             "account_id": a.get("account_id"),
@@ -64,7 +64,7 @@ def get_transactions(
     ``max_amount=0`` for spending only or ``min_amount=0`` for income only.
     Returns the matching transactions plus the total match count.
     """
-    cache = store.load_cache()
+    cache = store.load_archive_view()
     rows = queries.filter_transactions(
         cache["transactions"],
         start_date=start_date,
@@ -97,7 +97,7 @@ def spending_summary(
     ``group_by`` is ``account``, ``org``, or ``month``. SimpleFIN provides no
     spending categories, so grouping is by real fields only.
     """
-    cache = store.load_cache()
+    cache = store.load_archive_view()
     return queries.spending_summary(
         cache["transactions"],
         group_by=group_by,
@@ -105,6 +105,31 @@ def spending_summary(
         end_date=end_date,
         include_pending=include_pending,
     )
+
+
+@mcp.tool()
+def net_worth_history() -> dict[str, Any]:
+    """Total balance across all accounts per as-of date, from the archive.
+
+    Each sync records a balance snapshot, so this builds a net-worth trend over
+    time (oldest first). Loan/credit balances are negative, so the total is true
+    net worth.
+    """
+    conn = archive.connect()
+    try:
+        return {"history": archive.net_worth_history(conn)}
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def archive_stats() -> dict[str, Any]:
+    """Report archive size and date coverage (transaction count, earliest/latest)."""
+    conn = archive.connect()
+    try:
+        return archive.stats(conn)
+    finally:
+        conn.close()
 
 
 @mcp.tool()

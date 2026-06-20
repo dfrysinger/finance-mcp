@@ -50,16 +50,43 @@ may live in a synced folder like Dropbox):
 
 ```bash
 uv run finance-mcp accounts                          # balances per account
-uv run finance-mcp transactions --search grocery     # filter cached transactions
+uv run finance-mcp transactions --search grocery     # search the full archive
 uv run finance-mcp transactions --start 2026-01-01 --account <id> --json
 uv run finance-mcp summary --group-by month          # inflow/outflow aggregation
+uv run finance-mcp networth                          # net-worth total per snapshot date
+uv run finance-mcp stats                             # archive size + date coverage
 uv run finance-mcp sync --days 120                    # refresh from SimpleFIN
 ```
 
 SimpleFIN caps a request at 90 days and expects <=24 requests/day, so `sync`
-chunks long ranges into <=89-day windows and you should rely on the cache for
+chunks long ranges into <=89-day windows and you should rely on the archive for
 day-to-day queries rather than re-syncing constantly. Any SimpleFIN warnings or
 errors (`errors`/`errlist`) are always surfaced.
+
+## Local archive (multi-year history)
+
+Every `sync` does two things locally, both in `~/.finance-mcp/` (mode `0600`):
+
+- updates `cache.json` — the latest normalized snapshot, and
+- folds the data into `archive.db`, a **SQLite** database that is the durable,
+  searchable, multi-year history.
+
+The archive is **append-only**: transactions are upserted by their stable
+SimpleFIN id (a pending charge is later promoted to posted without duplicating),
+`first_seen` is preserved, and nothing is ever deleted — so a transaction stays
+in the archive even after it ages out of SimpleFIN's rolling window. Each sync
+also records a **balance snapshot** per account, which is what powers
+`networth` / `net_worth_history` trends over time.
+
+All read commands and MCP tools serve from `archive.db` (falling back to
+`cache.json` only before the first sync on this version). You can also query it
+with any SQLite tool:
+
+```bash
+sqlite3 ~/.finance-mcp/archive.db \
+  "SELECT posted, amount, description FROM transactions ORDER BY posted_ts DESC LIMIT 10;"
+```
+
 
 ## MCP server (use it from Copilot)
 
@@ -71,7 +98,9 @@ The server runs over stdio and exposes these tools:
 | `account_balances` | no | just balances and as-of dates |
 | `get_transactions` | no | filter by date / account / search / amount |
 | `spending_summary` | no | inflow/outflow grouped by account, org, or month |
-| `sync_now` | **yes** | refresh the cache from SimpleFIN |
+| `net_worth_history` | no | total balance per snapshot date (net-worth trend) |
+| `archive_stats` | no | archive size + earliest/latest transaction |
+| `sync_now` | **yes** | refresh the cache + archive from SimpleFIN |
 
 ### Install for others (no clone needed)
 
@@ -119,8 +148,8 @@ If you cloned the repo and prefer running from the working tree:
 }
 ```
 
-`get_transactions`/`spending_summary` serve only what `sync` has already cached,
-so run a `sync` (CLI) or call `sync_now` periodically.
+`get_transactions`/`spending_summary` serve the durable archive (`archive.db`),
+which `sync` (CLI) or `sync_now` keeps up to date.
 
 ## Notes / limitations
 

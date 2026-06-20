@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 
-from . import client, config, normalize, store
+from . import archive, client, config, normalize, store
 
 # Stay safely under SimpleFIN's 90-day-per-request ceiling.
 _CHUNK_SECONDS = 89 * 24 * 60 * 60
@@ -67,11 +67,25 @@ def sync(
     cache["errlist"] = errlist
     store.save_cache(cache)
 
+    # Fold this sync into the durable multi-year archive. The JSON cache already
+    # holds the full accumulated set (old + new), and the archive upsert never
+    # deletes, so the archive retains history even if the cache is ever reset.
+    conn = archive.connect()
+    try:
+        archive_stats = archive.upsert(conn, {
+            "transactions": cache["transactions"],
+            "accounts": cache["accounts"],
+        })
+    finally:
+        conn.close()
+
     return {
         "synced_at": datetime.now(tz=timezone.utc).isoformat(),
         "days": days,
         "account_count": len(cache["accounts"]),
         "transaction_count": len(transactions),
+        "archived_transactions": archive_stats["transactions_added"],
+        "balance_snapshots_added": archive_stats["balance_snapshots_added"],
         "errors": errors,
         "errlist": errlist,
     }

@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from . import client, config, queries, store, sync
+from . import archive, client, config, queries, store, sync
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
@@ -40,7 +40,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
 
 
 def _cmd_accounts(args: argparse.Namespace) -> int:
-    cache = store.load_cache()
+    cache = store.load_archive_view()
     if args.json:
         print(json.dumps(cache["accounts"], indent=2))
         return 0
@@ -57,7 +57,7 @@ def _cmd_accounts(args: argparse.Namespace) -> int:
 
 
 def _cmd_transactions(args: argparse.Namespace) -> int:
-    cache = store.load_cache()
+    cache = store.load_archive_view()
     rows = queries.filter_transactions(
         cache["transactions"],
         start_date=args.start,
@@ -80,7 +80,7 @@ def _cmd_transactions(args: argparse.Namespace) -> int:
 
 
 def _cmd_summary(args: argparse.Namespace) -> int:
-    cache = store.load_cache()
+    cache = store.load_archive_view()
     result = queries.spending_summary(
         cache["transactions"],
         group_by=args.group_by,
@@ -88,6 +88,32 @@ def _cmd_summary(args: argparse.Namespace) -> int:
         end_date=args.end,
     )
     print(json.dumps(result, indent=2))
+    return 0
+
+
+def _cmd_networth(args: argparse.Namespace) -> int:
+    conn = archive.connect()
+    try:
+        history = archive.net_worth_history(conn)
+    finally:
+        conn.close()
+    if args.json:
+        print(json.dumps(history, indent=2))
+        return 0
+    if not history:
+        print("No balance snapshots yet. Run `finance-mcp sync`.")
+        return 0
+    for row in history:
+        print(f"{row['date']}  {row['total']:>16,.2f}  ({row['account_count']} accounts)")
+    return 0
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    conn = archive.connect()
+    try:
+        print(json.dumps(archive.stats(conn), indent=2))
+    finally:
+        conn.close()
     return 0
 
 
@@ -127,6 +153,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_sum.add_argument("--start")
     p_sum.add_argument("--end")
     p_sum.set_defaults(func=_cmd_summary)
+
+    p_nw = sub.add_parser("networth", help="net-worth total per snapshot date")
+    p_nw.add_argument("--json", action="store_true")
+    p_nw.set_defaults(func=_cmd_networth)
+
+    p_stats = sub.add_parser("stats", help="archive size and date coverage")
+    p_stats.set_defaults(func=_cmd_stats)
 
     return parser
 
