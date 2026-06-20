@@ -1,0 +1,32 @@
+{
+  "errors": [],
+  "accounts": [
+    {
+      "org": {"domain": "mybank.com", "name": "My Bank", "sfin-url": "https://sfin.example/x"},
+      "id": "ACT-checking",
+      "name": "Checking",
+      "currency": "USD",
+      "balance": "1234.56",
+      "available-balance": "1200.00",
+      "balance-date": 1700000000,
+      "transactions": [
+        {"id": "t1", "posted": 1699900000, "amount": "-45.00", "description": "Coffee Shop", "payee": "Coffee Shop", "memo": "", "pending": false},
+        {"id": "t2", "posted": 1699990000, "amount": "2000.00", "description": "Payroll", "payee": "Employer", "memo": "", "pending": false},
+        {"id": "t3", "posted": 1700050000, "amount": "-12.34", "description": "Pending charge", "payee": "Store", "memo": "", "pending": true}
+      ]
+    },
+    {
+      "org": {"domain": "cyprus.example", "name": "Cyprus Credit Union"},
+      "id": "ACT-card",
+      "name": "Rewards Card",
+      "currency": "USD",
+      "balance": "-89.10",
+      "available-balance": "910.90",
+      "balance-date": 1700000000,
+      "transactions": [
+        {"id": "t4", "posted": 1699800000, "amount": "-89.10", "description": "Grocery Store", "payee": "Grocery", "memo": "", "pending": false},
+        {"id": "t5", "posted": 1699850000, "amount": "-0", "description": "Zero amount edge", "payee": "", "memo": "", "pending": false}
+      ]
+    }
+  ]
+}

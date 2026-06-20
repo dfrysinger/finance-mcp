@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Never commit any local transaction data or credentials, just in case
+# FINANCE_MCP_HOME is ever pointed inside the project tree.
+.finance-mcp/
+*access_url*
+cache.json
