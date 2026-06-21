@@ -38,10 +38,9 @@ Design decisions worth knowing:
 
 from __future__ import annotations
 
-import calendar
 from datetime import date, timedelta
 
-from .budget_config import BudgetConfig
+from .budget_config import BudgetConfig, monthly_dates
 from .normalize import amount_to_cents
 
 # Default forward window length. A fixed duration (rather than a calendar
@@ -57,20 +56,10 @@ def _cents(amount: int) -> float:
 def _monthly_dates(day: int, as_of: date, through: date) -> list[date]:
     """Concrete due-dates for a monthly day-of-month within the closed window.
 
-    ``day`` is clamped to each month's actual length (so 31 lands on Feb 28/29),
-    and only occurrences inside ``[as_of, through]`` are returned.
+    Thin wrapper over the canonical calendar expansion in ``budget_config`` so
+    the forecast and the allocation audit date every occurrence identically.
     """
-    out: list[date] = []
-    y, m = as_of.year, as_of.month
-    while (y, m) <= (through.year, through.month):
-        last = calendar.monthrange(y, m)[1]
-        d = date(y, m, min(day, last))
-        if as_of <= d <= through:
-            out.append(d)
-        m += 1
-        if m > 12:
-            m, y = 1, y + 1
-    return out
+    return monthly_dates(day, as_of, through)
 
 
 def _events_for(

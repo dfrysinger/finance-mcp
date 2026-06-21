@@ -204,12 +204,33 @@ when is it at risk." A deterministic running-balance projection over the calenda
   `at_risk` / `balance_unknown`). CLI:
   `finance-mcp forecast [--as-of YYYY-MM-DD] [--through YYYY-MM-DD] [--config PATH] [--json]`.
 
-### Piece D — Allocation audit (priority 3)
+### Piece D — Allocation audit (priority 3) · **built** (`src/finance_mcp/allocation.py`)
 
 Did each scheduled paycheck→envelope transfer fire on its expected day for its
-expected amount? Compares the recurring-transfer schedule in the budget config
-against reconciled transfer legs. Surfaces missing / late / wrong-amount
-allocations.
+expected amount? `allocation_audit` (pure) expands each `scheduled_transfer`'s
+monthly cadence over a window (via the shared `budget_config.monthly_dates`) and
+matches every occurrence against actual money movement; `allocation_report` is
+the archive-loading wrapper.
+
+- **Evidence depends on kind.** An *internal* transfer (names a `from` envelope)
+  is satisfied only by a **reconciled** transfer link (`confirmed`/`inferred`)
+  whose debit account maps to the source envelope and whose credit account maps
+  to the destination. An *external* transfer (direct deposit, no `from`) is
+  satisfied by a real credit posted to a destination-envelope account that is
+  not itself a transfer leg.
+- **Per-occurrence status:** `on_time` / `early` / `late` (with `drift_days`,
+  dated by when the money *landed* — the credit leg) / `wrong_amount`
+  (right envelopes and within tolerance, amount differs) / `missing`.
+- **Matching is greedy + deterministic.** Occurrences match earliest-expected
+  first; each occurrence consumes at most one actual and each actual at most
+  once; an exact-amount actual is preferred over a same-envelope near-date
+  mismatch; anything beyond `day_tolerance` (default 7 days — safe against the
+  ~30-day monthly cadence) is left `missing` rather than force-matched to the
+  wrong month.
+- **Limitation (intentional):** a needs-confirm (`unconfirmed`) link is **not**
+  counted as fired. A genuinely-ambiguous allocation surfaces here as `missing`
+  rather than being silently credited to a possibly-wrong envelope; the user
+  resolves it in the confirm surface (Piece 5) first.
 
 ### Piece E — Subscription audit
 

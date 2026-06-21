@@ -13,8 +13,10 @@ with a specific message rather than producing a quietly-wrong budget.
 
 from __future__ import annotations
 
+import calendar
 import json
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -102,6 +104,28 @@ class BudgetConfig:
             for acct in env.accounts:
                 index[acct] = env
         return index
+
+
+def monthly_dates(day: int, start: date, end: date) -> list[date]:
+    """Concrete dates for a monthly day-of-month within the closed window.
+
+    ``day`` is clamped to each month's actual length (so 31 lands on Feb 28/29),
+    and only occurrences inside ``[start, end]`` are returned. This is the single
+    expansion of the recurring calendar's monthly cadence: the forecast
+    projection and the allocation audit both consume it, so a scheduled
+    occurrence is dated identically wherever it is reasoned about.
+    """
+    out: list[date] = []
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        last = calendar.monthrange(y, m)[1]
+        d = date(y, m, min(day, last))
+        if start <= d <= end:
+            out.append(d)
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    return out
 
 
 def _money_to_cents(
