@@ -1,6 +1,6 @@
 # Envelope Budgeting — Design
 
-Status: **design locked, building iteratively** · Last updated: 2026-06-20
+Status: **design locked, building iteratively** · Last updated: 2026-06-21
 
 This document is the single source of truth for the envelope-budgeting feature
 track in finance-mcp. It is intentionally free of any personal data: every
@@ -60,19 +60,34 @@ lacks, and we refuse to introduce a second source of truth for category rules.
 
 Built and reviewed one at a time, in dependency order.
 
-### Piece A — Statement import (foundation)
+### Piece A — Statement import (foundation) · **built** (`src/finance_mcp/importer.py`)
 
 A CSV importer that reads each supported export schema and writes archive
 `transactions` rows.
 
 - **Format adapters.** One small adapter per source schema (per-envelope bank
-  export, and each card export). Each adapter maps its columns onto the archive's
-  normalized transaction shape. New formats are added as new adapters, not by
-  editing a monolith.
-- **Stable synthetic ids.** Imported rows get a deterministic id derived from
-  `(source, account, date, amount, description)` so re-importing the same file is
-  idempotent and so an imported row can be reconciled/deduped against a SimpleFIN
-  row for the same transaction.
+  export, and each card export: Schwab, Apple Card, Chase, Fidelity). Each adapter
+  maps its columns onto the archive's normalized transaction shape and asserts its
+  own sign convention. New formats are added as new adapters, not by editing a
+  monolith. Adapters are matched by their header set; a `forbidden` header set
+  disambiguates schemas that share a required core (e.g. Apple vs. Chase).
+- **Stable synthetic ids.** Imported rows get a deterministic id derived from the
+  stable natural key `(source, account, date, amount, description, payee,
+  occurrence)` so re-importing the same file is idempotent and an imported row can
+  be reconciled/deduped against a SimpleFIN row for the same transaction.
+  Optional / version-dependent detail columns (transaction type, memo, check
+  number, cardholder) are stored display-only in `memo` and kept OUT of the id, so
+  an export that omits one does not re-key. The amount is scale-canonical in the id
+  (5.0 / 5.00 / 5 → one id) without rounding; the id payload is JSON-encoded so a
+  field containing the delimiter cannot collide two distinct rows.
+- **Fail-loud parsing.** Malformed CSV quoting is parsed strictly and surfaced as a
+  skipped file rather than silently swallowing following rows; a schema-matched file
+  that yields zero rows is reported, not hidden as a clean import.
+- **Account identity.** Each adapter derives the account from the filename. When no
+  account number can be derived (a renamed / non-standard export), the row still
+  imports under a generic per-source account but the file is surfaced in the import
+  summary's `warnings` so it is never *silently* misfiled. Apple Card has no
+  per-account number and uses a fixed id by design (not flagged).
 - **Idempotent upsert.** Re-running import never duplicates and never clobbers a
   hand-assigned category (categories live in their own table).
 - **Output.** A richer multi-year `transactions` archive. The existing transfer

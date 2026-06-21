@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from . import archive, categories, client, config, queries, store, sync
+from . import archive, categories, client, config, importer, queries, store, sync
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
@@ -118,6 +118,35 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(archive.stats(conn), indent=2))
     finally:
         conn.close()
+    return 0
+
+
+def _cmd_import(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    paths = [Path(p).expanduser() for p in args.paths]
+    missing = [str(p) for p in paths if not p.exists()]
+    if missing:
+        print(f"Path not found: {', '.join(missing)}", file=sys.stderr)
+        return 1
+    summary = importer.import_paths(paths, dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps(summary, indent=2))
+        return 0
+    verb = "Would import" if summary["dry_run"] else "Imported"
+    print(
+        f"{verb} {summary['rows_parsed']} rows from "
+        f"{summary['files_imported']} file(s); "
+        f"{summary['transactions_added']} new transaction(s) added; "
+        f"{summary['rows_skipped']} row(s) skipped."
+    )
+    for r in summary["results"]:
+        skip = f" (-{r['rows_skipped']})" if r.get("rows_skipped") else ""
+        print(f"  {r['source'] or '?':9} {r['rows']:>6}{skip}  {r['file']}")
+    for w in summary.get("warnings", []):
+        print(f"  WARNING: {w['file']} -> {w['reason']}", file=sys.stderr)
+    for s in summary["skipped"]:
+        print(f"  skipped: {s['file']} ({s['reason']})", file=sys.stderr)
     return 0
 
 
@@ -299,6 +328,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stats = sub.add_parser("stats", help="archive size and date coverage")
     p_stats.set_defaults(func=_cmd_stats)
+
+    p_imp = sub.add_parser(
+        "import",
+        help="import exported statement CSVs (file or directory) into the archive",
+    )
+    p_imp.add_argument("paths", nargs="+", help="CSV file(s) or director(ies)")
+    p_imp.add_argument("--dry-run", action="store_true",
+                       help="parse and count without writing to the archive")
+    p_imp.add_argument("--json", action="store_true")
+    p_imp.set_defaults(func=_cmd_import)
 
     return parser
 
