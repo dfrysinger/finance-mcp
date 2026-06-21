@@ -248,6 +248,72 @@ def _cmd_uncategorized(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_month(value: str) -> tuple[int, int]:
+    """Parse a ``YYYY-MM`` month string into ``(year, month)``."""
+    parts = (value or "").strip().split("-")
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        raise ValueError(f"month must be YYYY-MM, got {value!r}")
+    year, month = int(parts[0]), int(parts[1])
+    if not 1 <= month <= 12:
+        raise ValueError(f"month must be 1..12, got {month}")
+    return year, month
+
+
+def _cmd_burndown(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from . import budget_config, burndown
+
+    try:
+        year, month = _parse_month(args.month)
+    except ValueError as exc:
+        print(f"Invalid --month: {exc}", file=sys.stderr)
+        return 1
+    cfg_path = Path(args.config).expanduser() if args.config else config.budget_config_path()
+    try:
+        cfg = budget_config.load_config(cfg_path)
+    except budget_config.BudgetConfigError as exc:
+        print(f"Budget config error: {exc}", file=sys.stderr)
+        return 1
+
+    report = burndown.burndown_report(cfg, year=year, month=month)
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+
+    t = report["totals"]
+    print(f"Burn-down for {report['period']}")
+    print(f"  {'Envelope':<22} {'Target':>10} {'Spent':>10} {'Remaining':>11}  Status")
+    for e in report["envelopes"]:
+        target = f"{e['monthly_target']:.2f}" if e["monthly_target"] is not None else "—"
+        if e["over_budget"] is None:
+            status = "(no target)"
+        elif e["over_budget"]:
+            status = f"OVER by {-e['remaining']:.2f}"
+        else:
+            status = "ok"
+        remaining = f"{e['remaining']:.2f}" if e["remaining"] is not None else "—"
+        print(f"  {e['envelope']:<22} {target:>10} {e['actual_spend']:>10.2f} "
+              f"{remaining:>11}  {status}")
+    print(f"  {'TOTAL':<22} {t['total_target']:>10.2f} "
+          f"{t['total_actual_spend']:>10.2f} {t['total_remaining']:>11.2f}  "
+          f"({t['envelopes_over_budget']} over)")
+    if t.get("total_untargeted_spend"):
+        print(f"  (untargeted envelope spend, not in the total above: "
+              f"{t['total_untargeted_spend']:.2f})")
+    if report["unmapped"]:
+        print("  Unmapped spend (accounts not in any envelope):")
+        for u in report["unmapped"]:
+            label = u["account_name"] or u["account_id"] or "(no account)"
+            print(f"    {label:<28} {u['actual_spend']:>10.2f} ({u['txn_count']} txns)")
+        print(f"    {'total unmapped':<28} {t['total_unmapped_spend']:>10.2f}")
+    d = report["diagnostics"]
+    if d["amount_missing"]:
+        print(f"  (skipped {d['amount_missing']} in-month transactions with an "
+              f"unparseable amount)")
+    return 0
+
+
 def _print_errors(errors: list, errlist: list) -> None:
     for err in [*(errors or []), *(errlist or [])]:
         print(f"  ! SimpleFIN: {err}", file=sys.stderr)
@@ -338,6 +404,15 @@ def build_parser() -> argparse.ArgumentParser:
                        help="parse and count without writing to the archive")
     p_imp.add_argument("--json", action="store_true")
     p_imp.set_defaults(func=_cmd_import)
+
+    p_bd = sub.add_parser(
+        "burndown",
+        help="per-envelope planned target vs. actual spend for one month",
+    )
+    p_bd.add_argument("--month", required=True, help="month to report, as YYYY-MM")
+    p_bd.add_argument("--config", help="path to budget config (default: ~/.finance-mcp/budget.json)")
+    p_bd.add_argument("--json", action="store_true")
+    p_bd.set_defaults(func=_cmd_burndown)
 
     return parser
 

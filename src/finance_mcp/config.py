@@ -35,6 +35,11 @@ def cache_path() -> Path:
     return home_dir() / "cache.json"
 
 
+def budget_config_path() -> Path:
+    """Default path to the user-supplied envelope-budget config (SSOT of intent)."""
+    return home_dir() / "budget.json"
+
+
 def load_access_url() -> str | None:
     """Return the saved access URL, or None if setup has not been run."""
     # Environment wins so the URL can be injected without touching disk.

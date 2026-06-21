@@ -93,14 +93,44 @@ A CSV importer that reads each supported export schema and writes archive
 - **Output.** A richer multi-year `transactions` archive. The existing transfer
   reconciler and product-type map run over it unchanged.
 
-### Piece B — Envelope burn-down (priority 1)
+### Piece B — Envelope burn-down (priority 1) · **built** (`src/finance_mcp/burndown.py`)
 
 For a given month, per envelope: **planned target vs. actual spend**, where
 actual spend = envelope outflows **minus reconciled inter-envelope transfers**
 (transfers are allocation flow, not spend — the reconciler already isolates them).
 
-- Output per envelope: target, actual spend, remaining headroom, over/under flag.
-- Pure function over reconciled, categorized transactions + the budget config.
+- **Budget config is the SSOT for intent** (`budget_config.py`). A user-supplied
+  JSON file (default `~/.finance-mcp/budget.json`, override with `--config`) maps
+  each envelope to a name, one or more account ids, and an optional monthly
+  target. Validation fails loud: a blank name, an account claimed by two
+  envelopes, or a target that is not a whole number of cents raises rather than
+  producing a quietly-wrong budget. Unknown keys are ignored so later pieces can
+  extend the same file (the recurring calendar) without breaking older readers.
+- **Spend is outflow, not net of refunds.** Headline `actual_spend` is the sum of
+  an envelope's non-transfer outflows. Refunds (non-transfer, non-income credits)
+  and net-of-refund spend are reported alongside but never folded into the
+  headline — netting a stray credit into spend would underreport and hide an
+  overrun.
+- **Integer cents, never floats.** Every amount is parsed from the authoritative
+  decimal string into integer cents, so a `750.0` target never compares `> 750.00`
+  and flags a false overrun.
+- **Transfers excluded two ways, both counted.** A transaction is not spend if the
+  categorizer flagged it `is_transfer` or it is a leg of a reconciled transfer
+  link (status confirmed/inferred only — an unmatched single leg stays in spend).
+  Until the reconcile piece runs, exclusion comes from the category flag; the
+  report surfaces both counts.
+- **Nothing silently dropped.** Outflow on an account in no envelope is surfaced
+  in an `unmapped` bucket. Envelopes with no transactions still appear at zero.
+- **Month by posted date.** Transactions are bucketed by the bank's posted date
+  string (`YYYY-MM`), matching the rest of the tool and sidestepping any
+  timezone/DST boundary error. An undated row cannot be placed in any month, so —
+  like a row from a different month — it is skipped silently; only in-month rows
+  whose amount cannot be parsed are surfaced as an `amount_missing` diagnostic.
+- **Output.** Per envelope: target, outflow, refunds, actual spend, net spend,
+  remaining headroom, over/under flag, percent used. Plus totals and the unmapped
+  bucket. Pure function over categorized transactions + config + reconciled legs;
+  a thin wrapper loads those from the archive. CLI: `finance-mcp burndown
+  --month YYYY-MM`.
 
 ### Piece C — Sufficiency / forecast (priority 2)
 
@@ -142,12 +172,14 @@ new capability.
 
 ## Budget config
 
-A single user-supplied file (format TBD during Piece B — likely JSON) holding:
+A single user-supplied JSON file (default `~/.finance-mcp/budget.json`,
+`--config` to override) holding:
 
-- **Envelopes**: stable account identifier → human envelope name + role.
-- **Monthly targets**: per envelope.
-- **Recurring calendar**: expected charges (merchant pattern, amount, cadence,
-  day-of-month window, paying envelope) and scheduled paycheck→envelope transfers.
+- **Envelopes**: each binds a human name to one or more stable account ids and an
+  optional monthly target. One account belongs to exactly one envelope.
+- **Recurring calendar** (added in later pieces): expected charges (merchant
+  pattern, amount, cadence, day-of-month window, paying envelope) and scheduled
+  paycheck→envelope transfers.
 
 This file is the SSOT for budget *intent*. It lives outside the repo (it is
 personal data), alongside the existing finance-mcp credential/cache home, and is
