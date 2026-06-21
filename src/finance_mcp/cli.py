@@ -314,6 +314,78 @@ def _cmd_burndown(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_date(value: str):
+    from datetime import date
+
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"date must be YYYY-MM-DD, got {value!r}") from exc
+
+
+def _cmd_forecast(args: argparse.Namespace) -> int:
+    from datetime import timedelta
+    from pathlib import Path
+
+    from . import budget_config, forecast
+
+    try:
+        as_of = _parse_date(args.as_of) if args.as_of else None
+        through = _parse_date(args.through) if args.through else None
+    except ValueError as exc:
+        print(f"Invalid date: {exc}", file=sys.stderr)
+        return 1
+    if as_of is None:
+        from datetime import date as _date
+
+        as_of = _date.today()
+    if through is None:
+        through = as_of + timedelta(days=forecast.DEFAULT_HORIZON_DAYS)
+    if through < as_of:
+        print(
+            f"Invalid window: --through {through} is before --as-of {as_of}",
+            file=sys.stderr,
+        )
+        return 1
+
+    cfg_path = Path(args.config).expanduser() if args.config else config.budget_config_path()
+    try:
+        cfg = budget_config.load_config(cfg_path)
+    except budget_config.BudgetConfigError as exc:
+        print(f"Budget config error: {exc}", file=sys.stderr)
+        return 1
+
+    report = forecast.forecast_report(cfg, as_of=as_of, through=through)
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+
+    s = report["summary"]
+    print(f"Forecast {report['as_of']} → {report['through']}")
+    print(f"  {'Envelope':<22} {'Balance':>11} {'In':>10} {'Out':>10} {'Min':>11}  Verdict")
+    for e in report["envelopes"]:
+        if e["verdict"] == "balance_unknown":
+            print(f"  {e['envelope']:<22} {'—':>11} {e['total_in']:>10.2f} "
+                  f"{e['total_out']:>10.2f} {'—':>11}  balance unknown")
+            continue
+        verdict = "ok"
+        if e["verdict"] == "at_risk":
+            verdict = f"AT RISK {e['at_risk_date']} (short {e['shortfall']:.2f})"
+        else:
+            caveats = []
+            if e["same_day_funding_dependent"]:
+                caveats.append("same-day funded")
+            if e["relies_on_projected_income"]:
+                caveats.append("relies on projected income")
+            if caveats:
+                verdict = f"ok ({', '.join(caveats)})"
+        print(f"  {e['envelope']:<22} {e['current_balance']:>11.2f} {e['total_in']:>10.2f} "
+              f"{e['total_out']:>10.2f} {e['projected_min_balance']:>11.2f}  {verdict}")
+    print(f"  ({s['at_risk']} at risk, {s['sufficient']} ok, "
+          f"{s['balance_unknown']} balance unknown)")
+    return 0
+
+
 def _print_errors(errors: list, errlist: list) -> None:
     for err in [*(errors or []), *(errlist or [])]:
         print(f"  ! SimpleFIN: {err}", file=sys.stderr)
@@ -413,6 +485,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_bd.add_argument("--config", help="path to budget config (default: ~/.finance-mcp/budget.json)")
     p_bd.add_argument("--json", action="store_true")
     p_bd.set_defaults(func=_cmd_burndown)
+
+    p_fc = sub.add_parser(
+        "forecast",
+        help="per-envelope sufficiency: will it cover upcoming bills, and when is it at risk",
+    )
+    p_fc.add_argument("--as-of", help="start of the window, as YYYY-MM-DD (default: today)")
+    p_fc.add_argument(
+        "--through",
+        help="end of the window, as YYYY-MM-DD (default: as-of + 60 days)",
+    )
+    p_fc.add_argument("--config", help="path to budget config (default: ~/.finance-mcp/budget.json)")
+    p_fc.add_argument("--json", action="store_true")
+    p_fc.set_defaults(func=_cmd_forecast)
 
     return parser
 

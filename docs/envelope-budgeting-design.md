@@ -132,11 +132,77 @@ actual spend = envelope outflows **minus reconciled inter-envelope transfers**
   a thin wrapper loads those from the archive. CLI: `finance-mcp burndown
   --month YYYY-MM`.
 
-### Piece C — Sufficiency / forecast (priority 2)
+### Piece C — Sufficiency / forecast (priority 2) · **built** (`src/finance_mcp/forecast.py`)
 
-For each envelope: current balance + scheduled inflows for the period vs. known
+For each envelope: current balance + scheduled inflows for the horizon vs. known
 upcoming bills from the recurring calendar → "will it cover what's coming, and by
-when is it at risk." Deterministic projection over the calendar.
+when is it at risk." A deterministic running-balance projection over the calendar.
+
+- **Recurring calendar in the config** (`budget_config.py`, same file). Two new
+  sections, both forward-compatible (older readers ignore them):
+  - `recurring`: bills. Each binds a `name`, a paying `envelope` (must match an
+    existing envelope), a positive `amount` (whole cents), a `cadence`
+    (`monthly`), and a `day` (1–31, due day-of-month, clamped to each month's
+    length so 31 → Feb 28/29).
+  - `scheduled_transfers`: inflows into envelopes. Each has a `to` envelope, an
+    optional `from` envelope, an `amount`, a `cadence`, and a `day`. **When
+    `from` is set the transfer is internal** (e.g. paycheck hub → category
+    envelope) and emits a paired *debit on the source* and *credit on the
+    destination*, so a fan-out can never credit one envelope without debiting
+    its funder — money is conserved. With no `from` it is an external inflow
+    (a direct deposit straight into the envelope), credit only.
+  - Validation fails loud: a bill or transfer naming an unknown envelope, a
+    non-whole-cent/negative amount, a day outside 1–31, or an unsupported
+    cadence raises. Each envelope reference is resolved to its canonical name
+    **once at parse time** so validation and projection can never bind to
+    different envelopes.
+- **Deterministic projection.** Bills and transfers are expanded into concrete
+  dated events inside the closed window `[as_of, through]` (monthly cadence; day
+  clamped per month via `calendar.monthrange`). Each envelope's events are walked
+  in date order from its current balance; the running minimum and the **first**
+  date the balance goes below zero (the at-risk date) and the largest shortfall
+  are recorded. The verdict derives from the projected **minimum** balance, not
+  the end balance, so an envelope that dips negative mid-horizon and recovers is
+  still flagged `at_risk`.
+- **Same-day timing is surfaced, not hidden.** On a day where an inflow and a
+  bill coincide, the realistic walk applies the inflow first (a scheduled
+  allocation is meant to fund that day's bills). But when that same-day inflow is
+  *load-bearing* — the day's bills would overdraw without it — the envelope is
+  flagged `same_day_funding_dependent` so the user knows solvency depends on
+  intraday settlement timing they don't control.
+- **Integer cents, honest unknowns.** Balances come from the authoritative
+  decimal-string `balance` on each account, parsed to integer cents. If **any**
+  of an envelope's accounts has no synced balance, the whole envelope is
+  `balance_unknown` and gets no sufficiency verdict — a partially-known envelope
+  is never silently treated as if the missing account held zero.
+- **Schedule-based, forward-looking — not reconciled against actuals.** Forecast
+  projects *scheduled* occurrences in the window; it does not check whether a
+  given bill or deposit already posted (that "did it land?" check is the
+  subscription audit, Piece E). The two directions are *not* symmetric:
+  - An **outflow** (bill) paid early both reduces the current balance and is
+    projected again — a pessimistic double-count that can only produce a false
+    *at-risk*, never a false *sufficient*. That is the safe direction for a
+    safety tool, so it is left as-is.
+  - An **inflow** (a scheduled transfer or deposit) that already posted is
+    *already reflected* in the synced starting balance; crediting it again would
+    optimistically overstate funds and could flip a real shortfall into a false
+    *sufficient* — the one unsafe direction. Forecast bounds this without
+    reconciling against actuals: it re-walks each envelope crediting **none** of
+    its scheduled inflows (the worst case where every projected inflow has
+    already arrived) and, when that strips a `sufficient` verdict into a
+    shortfall, flags `relies_on_projected_income`. A sufficiency that leans on
+    unreconciled future income is therefore surfaced, never silently trusted.
+
+  Forecast is not additive with burn-down's month-to-date actuals.
+- **Stable horizon.** The default window is a fixed duration (`as_of` + 60 days)
+  rather than a calendar boundary, so the projected occurrence counts do not
+  swing with the day the report is run. The resolved `[as_of, through]` window
+  and per-envelope occurrence counts are echoed in the output.
+- **Output.** Per envelope: current balance, total scheduled in/out, projected
+  end and minimum balance, at-risk flag + date + shortfall, the same-day-funding
+  flag, the `relies_on_projected_income` flag, and a verdict (`sufficient` /
+  `at_risk` / `balance_unknown`). CLI:
+  `finance-mcp forecast [--as-of YYYY-MM-DD] [--through YYYY-MM-DD] [--config PATH] [--json]`.
 
 ### Piece D — Allocation audit (priority 3)
 
@@ -177,9 +243,10 @@ A single user-supplied JSON file (default `~/.finance-mcp/budget.json`,
 
 - **Envelopes**: each binds a human name to one or more stable account ids and an
   optional monthly target. One account belongs to exactly one envelope.
-- **Recurring calendar** (added in later pieces): expected charges (merchant
-  pattern, amount, cadence, day-of-month window, paying envelope) and scheduled
-  paycheck→envelope transfers.
+- **Recurring calendar** (added in Piece C): `recurring` bills (paying envelope,
+  amount, cadence, due day-of-month) and `scheduled_transfers` (an optional
+  source envelope, a destination envelope, amount, cadence, day). An internal
+  transfer (with a source) is conserved as a paired debit/credit.
 
 This file is the SSOT for budget *intent*. It lives outside the repo (it is
 personal data), alongside the existing finance-mcp credential/cache home, and is

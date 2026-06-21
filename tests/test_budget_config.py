@@ -162,7 +162,10 @@ def test_rejects_non_string_role():
 
 def test_unknown_keys_ignored_for_forward_compat():
     cfg = parse_config(
-        _cfg(recurring=[{"merchant": "Netflix"}], envelopes=[{"name": "X", "accounts": ["a"]}])
+        _cfg(
+            future_section=[{"merchant": "Netflix"}],
+            envelopes=[{"name": "X", "accounts": ["a"]}],
+        )
     )
     assert len(cfg.envelopes) == 1
 
@@ -192,3 +195,143 @@ def test_load_config_roundtrip(tmp_path):
     cfg = load_config(p)
     assert isinstance(cfg.envelopes[0], Envelope)
     assert cfg.envelopes[0].monthly_target_cents == 75000
+
+# --- Recurring calendar: bills ------------------------------------------------
+
+
+def test_parses_recurring_bills():
+    cfg = parse_config(
+        _cfg(
+            recurring=[
+                {"name": "Rent", "envelope": "Groceries", "amount": 1500,
+                 "cadence": "monthly", "day": 1},
+            ]
+        )
+    )
+    assert len(cfg.recurring) == 1
+    b = cfg.recurring[0]
+    assert b.name == "Rent"
+    assert b.envelope == "Groceries"
+    assert b.amount_cents == 150000
+    assert b.cadence == "monthly"
+    assert b.day == 1
+
+
+def test_recurring_defaults_to_empty():
+    cfg = parse_config(_cfg())
+    assert cfg.recurring == ()
+    assert cfg.scheduled_transfers == ()
+
+
+def test_bill_envelope_must_exist():
+    with pytest.raises(BudgetConfigError, match="does not match any configured envelope"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Nope", "amount": 10, "cadence": "monthly", "day": 5}
+        ]))
+
+
+def test_bill_envelope_resolves_case_insensitively():
+    cfg = parse_config(_cfg(recurring=[
+        {"name": "X", "envelope": "groceries", "amount": 10, "cadence": "monthly", "day": 5}
+    ]))
+    # Resolved to the canonical stored name, not the reference's casing.
+    assert cfg.recurring[0].envelope == "Groceries"
+
+
+def test_bill_amount_must_be_positive():
+    with pytest.raises(BudgetConfigError, match="greater than zero"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 0, "cadence": "monthly", "day": 5}
+        ]))
+
+
+def test_bill_amount_subcent_rejected():
+    with pytest.raises(BudgetConfigError, match="whole number of cents"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10.005, "cadence": "monthly", "day": 5}
+        ]))
+
+
+def test_bill_unsupported_cadence_rejected():
+    with pytest.raises(BudgetConfigError, match="cadence must be one of"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "weekly", "day": 5}
+        ]))
+
+
+def test_bill_day_out_of_range_rejected():
+    with pytest.raises(BudgetConfigError, match="day must be between 1 and 31"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly", "day": 32}
+        ]))
+
+
+def test_bill_day_must_be_int_not_bool():
+    with pytest.raises(BudgetConfigError, match="day must be an integer"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly", "day": True}
+        ]))
+
+
+def test_bill_name_required():
+    with pytest.raises(BudgetConfigError, match="name must be a non-empty"):
+        parse_config(_cfg(recurring=[
+            {"envelope": "Groceries", "amount": 10, "cadence": "monthly", "day": 5}
+        ]))
+
+
+def test_recurring_must_be_list():
+    with pytest.raises(BudgetConfigError, match="'recurring' must be a list"):
+        parse_config(_cfg(recurring={"not": "a list"}))
+
+
+# --- Recurring calendar: scheduled transfers ----------------------------------
+
+
+def test_parses_external_inflow():
+    cfg = parse_config(_cfg(scheduled_transfers=[
+        {"name": "Paycheck", "to": "Groceries", "amount": 500, "cadence": "monthly", "day": 15}
+    ]))
+    t = cfg.scheduled_transfers[0]
+    assert t.to_envelope == "Groceries"
+    assert t.from_envelope is None
+    assert t.amount_cents == 50000
+    assert t.day == 15
+
+
+def test_parses_internal_transfer_with_from():
+    cfg = parse_config(_cfg(scheduled_transfers=[
+        {"name": "Fanout", "from": "Restaurants", "to": "Groceries",
+         "amount": 200, "cadence": "monthly", "day": 1}
+    ]))
+    t = cfg.scheduled_transfers[0]
+    assert t.from_envelope == "Restaurants"
+    assert t.to_envelope == "Groceries"
+
+
+def test_transfer_to_must_exist():
+    with pytest.raises(BudgetConfigError, match="does not match any configured envelope"):
+        parse_config(_cfg(scheduled_transfers=[
+            {"name": "X", "to": "Nope", "amount": 10, "cadence": "monthly", "day": 5}
+        ]))
+
+
+def test_transfer_from_must_exist():
+    with pytest.raises(BudgetConfigError, match="does not match any configured envelope"):
+        parse_config(_cfg(scheduled_transfers=[
+            {"name": "X", "from": "Nope", "to": "Groceries", "amount": 10,
+             "cadence": "monthly", "day": 5}
+        ]))
+
+
+def test_transfer_from_and_to_must_differ():
+    with pytest.raises(BudgetConfigError, match="must move between two different envelopes"):
+        parse_config(_cfg(scheduled_transfers=[
+            {"name": "X", "from": "Groceries", "to": "Groceries", "amount": 10,
+             "cadence": "monthly", "day": 5}
+        ]))
+
+
+def test_scheduled_transfers_must_be_list():
+    with pytest.raises(BudgetConfigError, match="'scheduled_transfers' must be a list"):
+        parse_config(_cfg(scheduled_transfers="nope"))

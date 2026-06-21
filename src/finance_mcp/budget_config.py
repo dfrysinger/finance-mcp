@@ -24,6 +24,10 @@ from typing import Any
 # here so an older reader does not reject a config carrying newer sections.
 SUPPORTED_VERSION = 1
 
+# Recurring calendar cadences the projector understands. An unsupported cadence
+# is rejected at parse time rather than silently mis-forecast.
+SUPPORTED_CADENCES = frozenset({"monthly"})
+
 
 class BudgetConfigError(Exception):
     """A budget config file is missing, malformed, or internally inconsistent."""
@@ -46,9 +50,46 @@ class Envelope:
 
 
 @dataclass(frozen=True)
+class RecurringBill:
+    """One recurring outflow (a bill) due from an envelope each cycle.
+
+    ``envelope`` is the canonical name of the paying envelope, resolved at parse
+    time. ``day`` is the nominal day-of-month it is due (1–31); the projector
+    clamps it to each month's actual length. ``amount_cents`` is positive.
+    """
+
+    name: str
+    envelope: str
+    amount_cents: int
+    cadence: str
+    day: int
+
+
+@dataclass(frozen=True)
+class ScheduledTransfer:
+    """One scheduled inflow into an envelope each cycle.
+
+    ``to_envelope`` is the canonical destination name. ``from_envelope`` is the
+    canonical source name when the transfer is *internal* (e.g. a paycheck hub
+    fanning out to a category envelope) — the projector then debits the source
+    and credits the destination, conserving money. When ``from_envelope`` is
+    ``None`` the transfer is an external inflow (a direct deposit), credit only.
+    """
+
+    name: str
+    to_envelope: str
+    amount_cents: int
+    cadence: str
+    day: int
+    from_envelope: str | None = None
+
+
+@dataclass(frozen=True)
 class BudgetConfig:
     version: int
     envelopes: tuple[Envelope, ...]
+    recurring: tuple[RecurringBill, ...] = ()
+    scheduled_transfers: tuple[ScheduledTransfer, ...] = ()
 
     def account_index(self) -> dict[str, Envelope]:
         """Map every configured account id to its owning envelope.
@@ -63,41 +104,70 @@ class BudgetConfig:
         return index
 
 
-def _target_to_cents(value: Any, *, envelope: str) -> int | None:
-    """Convert a JSON monthly target to integer cents, or None if absent.
+def _money_to_cents(
+    value: Any, *, where: str, label: str = "amount", allow_zero: bool = False
+) -> int:
+    """Parse a JSON money value to integer cents, failing loud on anything fishy.
 
-    A target that is not a whole number of cents (e.g. ``10.005``) is rejected
-    rather than rounded, so the budget never silently invents a fraction of a
-    cent the user did not write.
+    A value that is not a finite, whole number of cents (e.g. ``10.005``) is
+    rejected rather than rounded, so the budget never silently invents a
+    fraction of a cent the user did not write. Negative is always rejected;
+    zero is rejected unless ``allow_zero``.
     """
-    if value is None:
-        return None
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise BudgetConfigError(
-            f"envelope {envelope!r}: monthly_target must be a number, "
-            f"got {type(value).__name__}"
+            f"{where}: {label} must be a number, got {type(value).__name__}"
         )
     try:
         dollars = Decimal(str(value))
     except InvalidOperation as exc:
-        raise BudgetConfigError(
-            f"envelope {envelope!r}: monthly_target {value!r} is not a number"
-        ) from exc
+        raise BudgetConfigError(f"{where}: {label} {value!r} is not a number") from exc
     if not dollars.is_finite():
-        raise BudgetConfigError(
-            f"envelope {envelope!r}: monthly_target must be finite, got {value!r}"
-        )
-    if dollars < 0:
-        raise BudgetConfigError(
-            f"envelope {envelope!r}: monthly_target must not be negative, got {value!r}"
-        )
+        raise BudgetConfigError(f"{where}: {label} must be finite, got {value!r}")
     cents = dollars * 100
     if cents != cents.to_integral_value():
         raise BudgetConfigError(
-            f"envelope {envelope!r}: monthly_target {value!r} is not a whole "
-            "number of cents"
+            f"{where}: {label} {value!r} is not a whole number of cents"
         )
-    return int(cents)
+    cents_int = int(cents)
+    if cents_int < 0:
+        raise BudgetConfigError(f"{where}: {label} must not be negative, got {value!r}")
+    if cents_int == 0 and not allow_zero:
+        raise BudgetConfigError(
+            f"{where}: {label} must be greater than zero, got {value!r}"
+        )
+    return cents_int
+
+
+def _target_to_cents(value: Any, *, envelope: str) -> int | None:
+    """Convert a JSON monthly target to integer cents, or None if absent."""
+    if value is None:
+        return None
+    return _money_to_cents(
+        value, where=f"envelope {envelope!r}", label="monthly_target", allow_zero=True
+    )
+
+
+def _require_name(value: Any, *, where: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise BudgetConfigError(f"{where}: name must be a non-empty string")
+    return value.strip()
+
+
+def _require_cadence(value: Any, *, where: str) -> str:
+    if isinstance(value, str) and value.strip().lower() in SUPPORTED_CADENCES:
+        return value.strip().lower()
+    raise BudgetConfigError(
+        f"{where}: cadence must be one of {sorted(SUPPORTED_CADENCES)}, got {value!r}"
+    )
+
+
+def _require_day(value: Any, *, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BudgetConfigError(f"{where}: day must be an integer 1-31, got {value!r}")
+    if not 1 <= value <= 31:
+        raise BudgetConfigError(f"{where}: day must be between 1 and 31, got {value}")
+    return value
 
 
 def parse_config(data: Any) -> BudgetConfig:
@@ -177,7 +247,99 @@ def parse_config(data: Any) -> BudgetConfig:
             )
         )
 
-    return BudgetConfig(version=version, envelopes=tuple(envelopes))
+    recurring = _parse_recurring(data, envelopes)
+    scheduled = _parse_scheduled_transfers(data, envelopes)
+
+    return BudgetConfig(
+        version=version,
+        envelopes=tuple(envelopes),
+        recurring=recurring,
+        scheduled_transfers=scheduled,
+    )
+
+
+def _envelope_resolver(envelopes: list[Envelope]):
+    """Build a resolver that maps a calendar entry's envelope reference to the
+    envelope's canonical name, using the same case-insensitive rule the envelope
+    names are de-duplicated by. Resolving once at parse time guarantees that
+    validation and the later projection bind to the same envelope."""
+    canonical = {env.name.lower(): env.name for env in envelopes}
+
+    def resolve(ref: Any, *, where: str, field: str) -> str:
+        if not isinstance(ref, str) or not ref.strip():
+            raise BudgetConfigError(
+                f"{where}: {field} must be a non-empty envelope name"
+            )
+        got = canonical.get(ref.strip().lower())
+        if got is None:
+            raise BudgetConfigError(
+                f"{where}: {field} {ref.strip()!r} does not match any configured envelope"
+            )
+        return got
+
+    return resolve
+
+
+def _parse_recurring(
+    data: dict, envelopes: list[Envelope]
+) -> tuple[RecurringBill, ...]:
+    raw_recurring = data.get("recurring", [])
+    if not isinstance(raw_recurring, list):
+        raise BudgetConfigError("budget config 'recurring' must be a list")
+    resolve = _envelope_resolver(envelopes)
+    bills: list[RecurringBill] = []
+    for i, raw in enumerate(raw_recurring):
+        where = f"recurring[{i}]"
+        if not isinstance(raw, dict):
+            raise BudgetConfigError(f"{where} must be an object")
+        name = _require_name(raw.get("name"), where=where)
+        ctx = f"recurring bill {name!r}"
+        bills.append(
+            RecurringBill(
+                name=name,
+                envelope=resolve(raw.get("envelope"), where=ctx, field="envelope"),
+                amount_cents=_money_to_cents(raw.get("amount"), where=ctx),
+                cadence=_require_cadence(raw.get("cadence"), where=ctx),
+                day=_require_day(raw.get("day"), where=ctx),
+            )
+        )
+    return tuple(bills)
+
+
+def _parse_scheduled_transfers(
+    data: dict, envelopes: list[Envelope]
+) -> tuple[ScheduledTransfer, ...]:
+    raw_transfers = data.get("scheduled_transfers", [])
+    if not isinstance(raw_transfers, list):
+        raise BudgetConfigError("budget config 'scheduled_transfers' must be a list")
+    resolve = _envelope_resolver(envelopes)
+    transfers: list[ScheduledTransfer] = []
+    for i, raw in enumerate(raw_transfers):
+        where = f"scheduled_transfers[{i}]"
+        if not isinstance(raw, dict):
+            raise BudgetConfigError(f"{where} must be an object")
+        name = _require_name(raw.get("name"), where=where)
+        ctx = f"scheduled transfer {name!r}"
+        to_env = resolve(raw.get("to"), where=ctx, field="to")
+        from_env = None
+        if raw.get("from") is not None:
+            from_env = resolve(raw.get("from"), where=ctx, field="from")
+            if from_env == to_env:
+                raise BudgetConfigError(
+                    f"{ctx}: 'from' and 'to' are the same envelope {to_env!r}; a "
+                    "transfer must move between two different envelopes"
+                )
+        transfers.append(
+            ScheduledTransfer(
+                name=name,
+                to_envelope=to_env,
+                from_envelope=from_env,
+                amount_cents=_money_to_cents(raw.get("amount"), where=ctx),
+                cadence=_require_cadence(raw.get("cadence"), where=ctx),
+                day=_require_day(raw.get("day"), where=ctx),
+            )
+        )
+    return tuple(transfers)
 
 
 def load_config(path: Path) -> BudgetConfig:
