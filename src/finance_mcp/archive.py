@@ -448,6 +448,16 @@ def set_account_type(
     conn.commit()
 
 
+def delete_account_type(conn: sqlite3.Connection, account_id: str) -> None:
+    """Remove one account's product-type row (no-op if absent).
+
+    Used to clear a stale lower-trust guess once structural evidence turns
+    contradictory; callers are responsible for protecting ``confirmed`` rows.
+    """
+    conn.execute("DELETE FROM account_types WHERE account_id = ?", (account_id,))
+    conn.commit()
+
+
 def load_account_types(conn: sqlite3.Connection) -> dict[str, dict]:
     """Return the product-type map keyed by ``account_id``."""
     rows = conn.execute("SELECT * FROM account_types").fetchall()

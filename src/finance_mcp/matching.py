@@ -47,6 +47,7 @@ STATUS_UNMATCHED = "unmatched"
 # --- Confidence taxonomy (encodes WHY a link was drawn) ------------------------
 CONF_STRUCTURAL = "inferred-structurally-forced"
 CONF_ENVELOPE = "inferred-envelope-set"
+CONF_KEYWORD = "inferred-keyword-type-confirmed"
 CONF_UNCONFIRMED = "unconfirmed-tentative"
 CONF_UNMATCHED = "unmatched"
 
@@ -54,8 +55,86 @@ CONF_UNMATCHED = "unmatched"
 METHOD_MUTUAL_UNIQUE = "mutual-unique"
 METHOD_FORCED_PERFECT = "forced-perfect"
 METHOD_ENVELOPE_SET = "envelope-set"
+METHOD_KEYWORD_TYPE = "keyword-type"
 
 DATE_RULE_SAME_DAY = "same-day"
+
+# --- Destination product-type keyword extraction -------------------------------
+#
+# Schwab embeds the *destination* product type in a transfer's description
+# ("...to Schwab Bank Investor Checking"), but the feed truncates it
+# ("...Investor Checkin" — trailing letters lost), so detection is prefix
+# tolerant. Each canonical type lists the lowercased tokens that identify it,
+# longest/most-specific first so a bare "checking" never shadows a fuller match.
+# The two values are the user's Schwab Bank envelope product types; the set is
+# data, easy to extend. The token sets are disjoint, so a description matches at
+# most one type. These canonical strings are the SAME values stored in the
+# account_types map, so keyword == account-type comparison is plain equality.
+PRODUCT_CHECKING = "Investor Checking"
+PRODUCT_SAVINGS = "Investor Savings"
+
+_TYPE_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (PRODUCT_SAVINGS, ("investor savings", "investor saving", "savings", "saving")),
+    (PRODUCT_CHECKING, ("investor checking", "investor checkin", "checking", "checkin")),
+)
+
+
+def destination_type(description: str | None) -> str | None:
+    """Extract the Schwab product-type keyword a transfer names, if any.
+
+    Returns the canonical product type (e.g. ``"Investor Checking"``) the
+    description points at — prefix tolerant against the feed's truncation — or
+    ``None`` when no known type token is present. The token sets are disjoint, so
+    a description can resolve to at most one type; savings is merely scanned first
+    for determinism.
+    """
+    if not description:
+        return None
+    text = description.lower()
+    for canonical, tokens in _TYPE_TOKENS:
+        if any(tok in text for tok in tokens):
+            return canonical
+    return None
+
+
+def _type_of(
+    account_id: str | None, account_types: dict | None
+) -> tuple[str | None, str | None]:
+    """Look up an account's (product_type, source) from the type map.
+
+    Accepts both the rich shape ``{account_id: {"product_type", "source"}}``
+    returned by the archive and a plain ``{account_id: "Investor Checking"}``
+    convenience shape. Unknown account → ``(None, None)``, so a missing type
+    degrades gracefully to "can't disprove" rather than blocking a match.
+    """
+    if not account_id or not account_types:
+        return None, None
+    entry = account_types.get(account_id)
+    if entry is None:
+        return None, None
+    if isinstance(entry, str):
+        return entry, None
+    if isinstance(entry, dict):
+        return entry.get("product_type"), entry.get("source")
+    return None, None
+
+
+def _edge_consistent(d: "_Leg", c: "_Leg", account_types: dict | None) -> bool:
+    """True unless a named keyword provably contradicts a known account type.
+
+    A debit names its *destination* type (must equal the credit account's type);
+    a credit names its *source* type (must equal the debit account's type). A
+    missing keyword or a missing/unknown account type can't disprove an edge, so
+    it is treated as consistent — the guard only ever *removes* a pairing the
+    type map positively contradicts, never invents one.
+    """
+    dest_type, _ = _type_of(c.account_id, account_types)
+    if d.keyword is not None and dest_type is not None and d.keyword != dest_type:
+        return False
+    src_type, _ = _type_of(d.account_id, account_types)
+    if c.keyword is not None and src_type is not None and c.keyword != src_type:
+        return False
+    return True
 
 # Safety caps so a pathologically large same-day same-amount collision cannot
 # blow up the perfect-matching *enumeration*. Stage 1 counts matchings by
@@ -82,6 +161,7 @@ class _Leg:
     account_name: str | None
     date: str  # YYYY-MM-DD (posted date; time-of-day is a useless placeholder)
     cents: int  # signed; negative = debit (money out), positive = credit (money in)
+    keyword: str | None = None  # destination/source product type named in the description
 
 
 @dataclass
@@ -105,6 +185,8 @@ class TransferProposal:
     credit_account_name: str | None = None
     method: str | None = None
     date_rule: str | None = DATE_RULE_SAME_DAY
+    keyword: str | None = None
+    type_source: str | None = None
     candidates_before: int | None = None
     candidates_after: int | None = None
     candidate_txn_ids: tuple[str, ...] = ()
@@ -112,7 +194,10 @@ class TransferProposal:
 
 
 def propose_transfer_links(
-    transactions: list[dict], *, is_transfer_key: str = "is_transfer"
+    transactions: list[dict],
+    *,
+    is_transfer_key: str = "is_transfer",
+    account_types: dict | None = None,
 ) -> list[TransferProposal]:
     """Reconstruct internal-transfer counterparties from archived transactions.
 
@@ -121,13 +206,21 @@ def propose_transfer_links(
     refund vs a purchase) must not be paired. Returns one proposal per transfer
     leg: forced links and envelope-set links carry both sides; ambiguous and
     unmatched legs are surfaced individually. The input list is not mutated.
+
+    ``account_types`` is the optional static product-type map (``{account_id:
+    {"product_type", "source"}}`` as the archive stores it, or a plain
+    ``{account_id: "Investor Checking"}``). When supplied it is used only as a
+    tie-breaker for still-ambiguous collisions (Stage 3) and as a guard that
+    flags a structurally-forced match contradicting a known type — never to
+    invent a link. When omitted, matching degrades cleanly to structural +
+    envelope + confirm, exactly as before.
     """
     legs, unmatched = _build_legs(transactions, is_transfer_key)
     proposals: list[TransferProposal] = list(unmatched)
 
     keyed = sorted(legs, key=lambda lg: (lg.date, abs(lg.cents)))
     for _, bucket_iter in groupby(keyed, key=lambda lg: (lg.date, abs(lg.cents))):
-        proposals.extend(_resolve_bucket(list(bucket_iter)))
+        proposals.extend(_resolve_bucket(list(bucket_iter), account_types))
     return proposals
 
 
@@ -187,6 +280,7 @@ def _build_legs(
         cents = amount_to_cents(txn.get("amount"))
         posted = txn.get("posted")
         date = posted[:10] if isinstance(posted, str) and len(posted) >= 10 else None
+        keyword = destination_type(txn.get("description"))
         if cents is None or cents == 0 or date is None:
             is_debit = _sign_hint(txn) < 0
             reason = "no posted date" if date is None else "amount not whole cents"
@@ -202,17 +296,20 @@ def _build_legs(
                     credit_account_id=None if is_debit else txn.get("account_id"),
                     credit_account_name=None if is_debit else txn.get("account_name"),
                     date_rule=None,
+                    keyword=keyword,
                     explanation=f"Cannot reconcile ({reason}); unmatched.",
                 )
             )
             continue
         legs.append(
-            _Leg(tid, txn.get("account_id"), txn.get("account_name"), date, cents)
+            _Leg(tid, txn.get("account_id"), txn.get("account_name"), date, cents, keyword)
         )
     return legs, bad
 
 
-def _resolve_bucket(bucket: list[_Leg]) -> list[TransferProposal]:
+def _resolve_bucket(
+    bucket: list[_Leg], account_types: dict | None = None
+) -> list[TransferProposal]:
     """Resolve all legs sharing one (date, magnitude) bucket."""
     debits = [lg for lg in bucket if lg.cents < 0]
     credits = [lg for lg in bucket if lg.cents > 0]
@@ -241,7 +338,9 @@ def _resolve_bucket(bucket: list[_Leg]) -> list[TransferProposal]:
     proposals: list[TransferProposal] = []
     for comp_debits, comp_credits in _components(debits, credits, adj):
         proposals.extend(
-            _resolve_component(comp_debits, comp_credits, adj, len(debits), len(credits))
+            _resolve_component(
+                comp_debits, comp_credits, adj, len(debits), len(credits), account_types
+            )
         )
     return proposals
 
@@ -278,8 +377,17 @@ def _resolve_component(
     adj: dict[_Leg, list[_Leg]],
     bucket_debits: int,
     bucket_credits: int,
+    account_types: dict | None = None,
 ) -> list[TransferProposal]:
-    """Resolve one connected component via Stage 1, then Stage 2, then residue."""
+    """Resolve one component: Stage 1 (forced), 2 (envelope), 3 (keyword), residue.
+
+    When an ``account_types`` map is supplied it acts at two points: as a *guard*
+    that refuses a structurally-forced pairing the map positively contradicts
+    (flagging the component for review instead of trusting it), and as a Stage-3
+    *tie-breaker* that re-resolves an otherwise-ambiguous component using only
+    keyword-consistent edges. Without the map, Stages 1–2 and residue behave
+    exactly as before.
+    """
     # A degree-0 leg (its only same-amount same-day partners are on its own
     # account) sits alone in its component and can never link.
     if not debits or not credits:
@@ -289,39 +397,95 @@ def _resolve_component(
         ]
 
     # Stage 1 — structurally forced (the one and only perfect matching).
+    contradiction_reason: str | None = None
     if len(debits) + len(credits) <= _MAX_COMPONENT_LEGS:
         forced = _unique_perfect_matching(debits, credits, adj)
         if forced is not None:
-            single_edge = len(debits) == 1 and len(credits) == 1
-            method = METHOD_MUTUAL_UNIQUE if single_edge else METHOD_FORCED_PERFECT
-            return [
-                _link(
-                    d, c, CONF_STRUCTURAL, method,
-                    bucket_debits, bucket_credits, adj,
+            # Guard: even the sole structural pairing is not trusted if the type
+            # map says a leg's named destination/source contradicts the matched
+            # account's known type. Flag for review rather than auto-link.
+            if account_types and any(
+                not _edge_consistent(d, c, account_types) for d, c in forced
+            ):
+                contradiction_reason = (
+                    "the only structural pairing conflicts with a known account type"
                 )
-                for d, c in forced
-            ]
+            else:
+                single_edge = len(debits) == 1 and len(credits) == 1
+                method = METHOD_MUTUAL_UNIQUE if single_edge else METHOD_FORCED_PERFECT
+                return [
+                    _link(
+                        d, c, CONF_STRUCTURAL, method,
+                        bucket_debits, bucket_credits, adj,
+                    )
+                    for d, c in forced
+                ]
 
     # Stage 2 — envelope set (single distinct source or single distinct dest).
-    envelope = _envelope_set(debits, credits, adj)
-    if envelope is not None:
-        pairs, single_source, single_dest = envelope
-        group_size = len(pairs)
-        return [
-            _link(
-                d, c, CONF_ENVELOPE, METHOD_ENVELOPE_SET,
-                bucket_debits, bucket_credits, adj,
-                envelope_source=single_source, envelope_dest=single_dest,
-                group_size=group_size,
-            )
-            for d, c in pairs
-        ]
+    # Skipped when Stage 1 was contradicted: envelope pairing is arbitrary within
+    # the group, so it would silently re-assert a flow the type map disputes. An
+    # envelope whose every assignment the type map disproves is itself flagged
+    # contradicted and falls through to confirmation rather than emitting.
+    if contradiction_reason is None:
+        envelope = _envelope_set(debits, credits, adj, account_types)
+        if envelope is not None:
+            pairs, single_source, single_dest, contradicted = envelope
+            if contradicted:
+                # Multiple pairings exist but none is type-consistent — a distinct
+                # reason from Stage 1's single-pairing contradiction.
+                contradiction_reason = "no account-type-consistent pairing exists"
+            else:
+                group_size = len(pairs)
+                return [
+                    _link(
+                        d, c, CONF_ENVELOPE, METHOD_ENVELOPE_SET,
+                        bucket_debits, bucket_credits, adj,
+                        envelope_source=single_source, envelope_dest=single_dest,
+                        group_size=group_size,
+                    )
+                    for d, c in pairs
+                ]
 
-    # Residue — genuinely ambiguous; surface each leg with its candidates.
+    # Stage 3 — keyword/type tie-breaker. Restrict the component to edges the
+    # type map cannot contradict; if that leaves exactly one perfect matching the
+    # collision is resolved by the named type, not a guess. Bounded by the same
+    # component-size cap as Stage 1 because it reuses the recursive enumerator —
+    # a larger component fails safe to confirmation rather than overflowing.
+    if account_types and len(debits) + len(credits) <= _MAX_COMPONENT_LEGS:
+        fadj = _keyword_filtered_adj(debits, credits, adj, account_types)
+        forced_kw = _unique_perfect_matching(debits, credits, fadj)
+        if forced_kw is not None:
+            return [
+                _keyword_link(
+                    d, c, bucket_debits, bucket_credits, fadj, account_types
+                )
+                for d, c in forced_kw
+            ]
+
+    # Residue — genuinely ambiguous; surface each leg with its candidates. If a
+    # type-map contradiction sent us here, say so honestly with its reason.
     return [
-        _needs_confirm(lg, adj, bucket_debits, bucket_credits)
+        _needs_confirm(
+            lg, adj, bucket_debits, bucket_credits, contradiction_reason=contradiction_reason
+        )
         for lg in (*debits, *credits)
     ]
+
+
+def _keyword_filtered_adj(
+    debits: list[_Leg],
+    credits: list[_Leg],
+    adj: dict[_Leg, list[_Leg]],
+    account_types: dict | None,
+) -> dict[_Leg, list[_Leg]]:
+    """Copy the component's adjacency keeping only keyword-consistent edges."""
+    fadj: dict[_Leg, list[_Leg]] = {lg: [] for lg in (*debits, *credits)}
+    for d in debits:
+        for c in adj[d]:
+            if _edge_consistent(d, c, account_types):
+                fadj[d].append(c)
+                fadj[c].append(d)
+    return fadj
 
 
 def _unique_perfect_matching(
@@ -377,15 +541,28 @@ def _unique_perfect_matching(
 
 
 def _envelope_set(
-    debits: list[_Leg], credits: list[_Leg], adj: dict[_Leg, list[_Leg]]
-) -> tuple[list[tuple[_Leg, _Leg]], bool, bool] | None:
+    debits: list[_Leg],
+    credits: list[_Leg],
+    adj: dict[_Leg, list[_Leg]],
+    account_types: dict | None = None,
+) -> tuple[list[tuple[_Leg, _Leg]], bool, bool, bool] | None:
     """Resolve a component whose source set (or dest set) is a single account.
 
     When every debit is from one account, each credit's source is known even if
     which exact debit funded which credit is arbitrary; symmetrically for a
     single destination. Requires a balanced, fully matchable component so the
-    arbitrary pairing is a valid one-to-one assignment. Returns the chosen pairs
-    plus whether the source and/or destination was the single-account side.
+    arbitrary pairing is a valid one-to-one assignment. Returns the chosen pairs,
+    whether the source and/or destination was the single-account side, and a
+    ``contradicted`` flag.
+
+    The flow set (which source funded which destinations) is what envelope-set
+    asserts; the exact debit-to-credit pairing inside the group is otherwise
+    arbitrary. When a type map is available a *keyword-consistent* perfect
+    matching is preferred so the representative pairs do not contradict known
+    account types. If the map disproves *every* complete assignment (no
+    keyword-consistent perfect matching exists) the envelope hypothesis itself is
+    in doubt, so ``contradicted`` is returned True and the caller surfaces the
+    component for confirmation rather than emitting a type-crossing pairing.
     """
     if len(debits) != len(credits):
         return None
@@ -396,7 +573,15 @@ def _envelope_set(
     pairs = _any_perfect_matching(debits, credits, adj)
     if pairs is None:
         return None
-    return pairs, single_source, single_dest
+    contradicted = False
+    if account_types:
+        fadj = _keyword_filtered_adj(debits, credits, adj, account_types)
+        filtered = _any_perfect_matching(debits, credits, fadj)
+        if filtered is not None:
+            pairs = filtered
+        else:
+            contradicted = True
+    return pairs, single_source, single_dest, contradicted
 
 
 def _any_perfect_matching(
@@ -472,6 +657,8 @@ def _link(
     envelope_source: bool = False,
     envelope_dest: bool = False,
     group_size: int = 0,
+    keyword: str | None = None,
+    type_source: str | None = None,
 ) -> TransferProposal:
     magnitude = abs(debit.cents)
     # before = same-day same-amount opposite legs; after = those on a different
@@ -489,6 +676,20 @@ def _link(
             f"determined (single-{'source' if envelope_source else 'destination'} "
             f"group of {group_size}); exact debit-to-credit pairing arbitrary "
             f"within the group."
+        )
+    elif method == METHOD_KEYWORD_TYPE:
+        if keyword:
+            basis = (
+                f"named product type \u201c{keyword}\u201d ({type_source or 'unknown'} type)"
+            )
+        else:
+            # The pair carried no keyword of its own — it was forced by the type
+            # filter eliminating other legs' options, not by its own description.
+            basis = "account-type elimination"
+        explanation = (
+            f"Same-day exact-amount match: {_fmt(magnitude)} from {_name(debit)} "
+            f"to {_name(credit)}. Disambiguated by {basis}; "
+            f"{after} of {before} same-amount counterparties survive the type filter."
         )
     elif method == METHOD_MUTUAL_UNIQUE:
         explanation = (
@@ -514,9 +715,49 @@ def _link(
         credit_account_name=credit.account_name,
         method=method,
         date_rule=DATE_RULE_SAME_DAY,
+        keyword=keyword,
+        type_source=type_source,
         candidates_before=before,
         candidates_after=after,
         explanation=explanation,
+    )
+
+
+def _keyword_link(
+    debit: _Leg,
+    credit: _Leg,
+    bucket_debits: int,
+    bucket_credits: int,
+    adj: dict[_Leg, list[_Leg]],
+    account_types: dict | None,
+) -> TransferProposal:
+    """Build a Stage-3 keyword/type link, recording the keyword that applied.
+
+    A debit names its destination type (confirmed by the credit account's type);
+    a credit names its source type (confirmed by the debit account's type). The
+    proposal records whichever keyword actually constrained this pair — the side
+    whose counterpart account carries a known type — so the audit trail names the
+    real evidence, not always the debit. If a side has a keyword but its
+    counterpart is untyped, that keyword did not constrain the edge, so the other
+    side is preferred. A pair forced purely by elimination (no usable keyword on
+    either side) records no keyword.
+    """
+    debit_ptype, debit_src = _type_of(credit.account_id, account_types)
+    credit_ptype, credit_src = _type_of(debit.account_id, account_types)
+    if debit.keyword is not None and debit_ptype is not None:
+        keyword, type_source = debit.keyword, debit_src
+    elif credit.keyword is not None and credit_ptype is not None:
+        keyword, type_source = credit.keyword, credit_src
+    elif debit.keyword is not None:
+        keyword, type_source = debit.keyword, None
+    elif credit.keyword is not None:
+        keyword, type_source = credit.keyword, None
+    else:
+        keyword, type_source = None, None
+    return _link(
+        debit, credit, CONF_KEYWORD, METHOD_KEYWORD_TYPE,
+        bucket_debits, bucket_credits, adj,
+        keyword=keyword, type_source=type_source,
     )
 
 
@@ -525,15 +766,23 @@ def _needs_confirm(
     adj: dict[_Leg, list[_Leg]],
     bucket_debits: int,
     bucket_credits: int,
+    *,
+    contradiction_reason: str | None = None,
 ) -> TransferProposal:
     candidates = adj[leg]
     is_debit = leg.cents < 0
     before = bucket_credits if is_debit else bucket_debits
     after = len(candidates)
-    explanation = (
-        f"Same-day {_fmt(abs(leg.cents))} transfer with {after} equally-likely "
-        f"counterpart{'s' if after != 1 else ''}; needs confirmation."
-    )
+    if contradiction_reason is not None:
+        explanation = (
+            f"Same-day {_fmt(abs(leg.cents))} transfer: {contradiction_reason}; "
+            f"flagged for review."
+        )
+    else:
+        explanation = (
+            f"Same-day {_fmt(abs(leg.cents))} transfer with {after} equally-likely "
+            f"counterpart{'s' if after != 1 else ''}; needs confirmation."
+        )
     return TransferProposal(
         status=STATUS_UNCONFIRMED,
         confidence=CONF_UNCONFIRMED,
@@ -546,6 +795,7 @@ def _needs_confirm(
         credit_account_name=None if is_debit else leg.account_name,
         method=None,
         date_rule=DATE_RULE_SAME_DAY,
+        keyword=leg.keyword,
         candidates_before=before,
         candidates_after=after,
         candidate_txn_ids=tuple(c.txn_id for c in candidates),
