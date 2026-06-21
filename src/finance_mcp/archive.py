@@ -423,6 +423,39 @@ def load_transfer_links(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def replace_machine_links(conn: sqlite3.Connection, rows: list[dict]) -> int:
+    """Atomically replace every machine-written link with ``rows``.
+
+    Confirmed links (``status='confirmed'``) are user-authoritative and left
+    untouched; every other link (inferred / unconfirmed / unmatched) is deleted
+    and re-created from ``rows`` inside a single transaction, so a failed write
+    can never leave a half-reconciled set. Each row is a dict keyed by the
+    ``transfer_links`` data columns (see ``_LINK_COLUMNS``); a missing key writes
+    NULL. Returns the number of rows written.
+
+    A row must not reference a leg already claimed by a confirmed link: the
+    schema's cross-role trigger and per-leg UNIQUE indexes abort such a write,
+    and the whole batch is rolled back rather than a row being silently dropped.
+    The reconcile policy excludes confirmed legs from the matcher's input so this
+    abort is a guard against a logic error, not an expected path.
+    """
+    now = _now()
+    placeholders = ", ".join(["?"] * (len(_LINK_COLUMNS) + 2))
+    insert_sql = (
+        f"INSERT INTO transfer_links ({', '.join(_LINK_COLUMNS)}, created_at, updated_at) "
+        f"VALUES ({placeholders})"
+    )
+    try:
+        conn.execute("DELETE FROM transfer_links WHERE status <> 'confirmed'")
+        for r in rows:
+            conn.execute(insert_sql, tuple(r.get(c) for c in _LINK_COLUMNS) + (now, now))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return len(rows)
+
+
 def set_account_type(
     conn: sqlite3.Connection,
     account_id: str,
