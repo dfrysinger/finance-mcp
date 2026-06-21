@@ -266,6 +266,57 @@ def test_bill_day_out_of_range_rejected():
         ]))
 
 
+def test_bill_match_optional_and_parsed():
+    cfg = parse_config(_cfg(recurring=[
+        {"name": "Netflix", "envelope": "Groceries", "amount": 16, "cadence": "monthly",
+         "day": 10, "match": "NETFLIX"}
+    ]))
+    assert cfg.recurring[0].match == "NETFLIX"
+    # Absent match defaults to None (backward compatible).
+    cfg2 = parse_config(_cfg(recurring=[
+        {"name": "Rent", "envelope": "Groceries", "amount": 1500, "cadence": "monthly", "day": 1}
+    ]))
+    assert cfg2.recurring[0].match is None
+
+
+def test_bill_match_digits_only_rejected():
+    # A keyword with no letter normalizes to no tokens and would match nothing,
+    # so it must be rejected at parse time rather than silently never matching.
+    with pytest.raises(BudgetConfigError, match="must contain at least one letter"):
+        parse_config(_cfg(recurring=[
+            {"name": "Gas", "envelope": "Groceries", "amount": 40, "cadence": "monthly",
+             "day": 5, "match": "76"}
+        ]))
+
+
+def test_bill_match_empty_string_rejected():
+    with pytest.raises(BudgetConfigError, match="match must be a non-empty string"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+             "day": 5, "match": "   "}
+        ]))
+
+
+def test_bill_match_accepts_letters_that_casefold_to_ascii():
+    # A keyword whose only letter is non-ASCII but case-folds to an ASCII letter
+    # (e.g. U+0130 -> 'i', U+212A KELVIN SIGN -> 'k') still normalizes to a
+    # matchable token, so it must be accepted, not rejected.
+    cfg = parse_config(_cfg(recurring=[
+        {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+         "day": 5, "match": "\u212aelvin"}
+    ]))
+    assert cfg.recurring[0].match == "\u212aelvin"
+
+
+def test_bill_match_non_ascii_non_letter_rejected():
+    # CJK / pure-symbol keywords normalize to no token and must fail loud.
+    with pytest.raises(BudgetConfigError, match="must contain at least one letter"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+             "day": 5, "match": "\u4e2d\u6587"}
+        ]))
+
+
 def test_bill_day_must_be_int_not_bool():
     with pytest.raises(BudgetConfigError, match="day must be an integer"):
         parse_config(_cfg(recurring=[

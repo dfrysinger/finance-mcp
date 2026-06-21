@@ -58,6 +58,11 @@ class RecurringBill:
     ``envelope`` is the canonical name of the paying envelope, resolved at parse
     time. ``day`` is the nominal day-of-month it is due (1–31); the projector
     clamps it to each month's actual length. ``amount_cents`` is positive.
+    ``match`` is an optional keyword (normalized to tokens and matched as a
+    token-subset against a transaction's merchant identity — description and
+    payee only; ``memo`` is excluded except as a sole fallback when both are
+    empty) that pins the bill to its merchant so the subscription audit can
+    reliably tell whether the charge posted.
     """
 
     name: str
@@ -65,6 +70,7 @@ class RecurringBill:
     amount_cents: int
     cadence: str
     day: int
+    match: str | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +190,30 @@ def _require_cadence(value: Any, *, where: str) -> str:
     raise BudgetConfigError(
         f"{where}: cadence must be one of {sorted(SUPPORTED_CADENCES)}, got {value!r}"
     )
+
+
+def _optional_match(value: Any, *, where: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise BudgetConfigError(
+            f"{where}: match must be a non-empty string when present, got {value!r}"
+        )
+    cleaned = value.strip()
+    # The subscription audit normalizes merchant text by lowercasing, dropping
+    # non-ASCII-alnum separators, and dropping pure-digit tokens, so a keyword
+    # with no surviving letter (e.g. "76", "365", or punctuation) would match
+    # nothing and report the bill missing forever. Lowercase first (mirroring
+    # that normalization) before checking for a surviving ASCII letter, so the
+    # check is exactly equivalent to "normalization yields >= 1 token" — a few
+    # non-ASCII letters case-fold to ASCII (e.g. U+0130, U+212A) and must be
+    # accepted, not rejected.
+    if not any(c.isascii() and c.isalpha() for c in cleaned.lower()):
+        raise BudgetConfigError(
+            f"{where}: match must contain at least one letter so it can match a "
+            f"merchant (a digits-only keyword matches nothing), got {value!r}"
+        )
+    return cleaned
 
 
 def _require_day(value: Any, *, where: str) -> int:
@@ -325,6 +355,7 @@ def _parse_recurring(
                 amount_cents=_money_to_cents(raw.get("amount"), where=ctx),
                 cadence=_require_cadence(raw.get("cadence"), where=ctx),
                 day=_require_day(raw.get("day"), where=ctx),
+                match=_optional_match(raw.get("match"), where=ctx),
             )
         )
     return tuple(bills)

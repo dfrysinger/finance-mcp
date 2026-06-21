@@ -232,15 +232,97 @@ the archive-loading wrapper.
   rather than being silently credited to a possibly-wrong envelope; the user
   resolves it in the confirm surface (Piece 5) first.
 
-### Piece E — Subscription audit
+### Piece E — Subscription audit · **built** (`src/finance_mcp/subscription.py`)
 
-Two scripted outputs the assistant reasons over:
+Did each tracked recurring charge post when it should have, and what
+recurring-looking merchants aren't tracked yet? `subscription_audit` (pure)
+produces two structured outputs the assistant reasons over; `subscription_report`
+is the archive-loading wrapper.
 
-1. **Expected-but-missing** — a tracked recurring charge (known merchant, amount,
-   cadence) that did not post in its expected window. Fully deterministic.
-2. **Candidate-new** — recurring-looking merchants (repeating at a stable amount
-   and cadence) that are **not** in the tracked set. The script surfaces the
-   candidates; the LLM judges whether each is really a new subscription.
+A tracked recurring charge is a `recurring` bill in the budget config. To make
+"missing" alerts reliable rather than noisy, a bill may carry an optional
+`match` keyword — case-insensitive, normalized into tokens and tested as a
+token-subset against a transaction's merchant identity (description / payee;
+memo only when it is the only text present) — that pins the bill to its
+merchant. The keyword must contain at least one letter (a digits-only keyword
+like `"76"` normalizes to no token and would match nothing, so it is rejected at
+config-parse time).
+
+1. **Expected-but-missing** (deterministic). Each bill's monthly cadence is
+   expanded over the window via the shared `budget_config.monthly_dates`. An
+   occurrence is *matched* when a debit lands within `day_tolerance` days for the
+   expected amount (within `amount_tolerance_cents`) and — when the bill has a
+   `match` keyword — whose merchant text contains it; without a keyword the debit
+   must instead fall on one of the bill's envelope's accounts. Matching is greedy
+   and deterministic (earliest occurrence first; each debit consumed once;
+   exact-amount preferred). An unmatched occurrence is reported `missing` only
+   once it is genuinely overdue — an occurrence within `grace_days` of the window
+   end is skipped (it may still post), so the audit never cries wolf on a charge
+   that simply isn't due yet.
+   - **No-keyword fallback.** A bill without a `match` keyword is matched by its
+     envelope→account binding instead (a debit on one of the envelope's accounts
+     for the expected amount near the day). Pinning the merchant with a `match`
+     keyword is strictly more reliable — it survives the charge landing on a
+     different card — so it is recommended for any subscription you want a
+     dependable missing-charge alert on.
+2. **Candidate-new** (script surfaces, LLM judges). Debits not consumed by any
+   tracked bill — and whose merchant doesn't match a tracked bill's keyword — are
+   grouped by `(normalized merchant, exact amount)`. A group with at least
+   `min_occurrences` debits whose median spacing lands in a recurring band
+   (weekly ≈ 7, monthly ≈ 30, yearly ≈ 365) is surfaced as a candidate with its
+   amount, occurrence count, first/last seen, median interval, inferred cadence,
+   and a few sample descriptions. The script makes no judgment call — it hands
+   the assistant an auditable candidate list to reason over.
+
+- **Window.** `subscription_report` defaults to a 365-day lookback so a monthly
+  subscription reliably clears `min_occurrences`. **Limitation:** an annual
+  subscription posts at most once in that window and so will not surface as a
+  candidate (it needs multiple years of history); a tracked annual bill is still
+  checked for expected-but-missing normally.
+- **Money / cadence.** Integer cents throughout, rendered to dollars only at the
+  report edge; amounts are grouped on exact cents (a stable price is the
+  subscription signal), so a mid-window price change splits a merchant into two
+  groups.
+- **Candidate grouping (merchant identity + subset-merge).** Both bill matching
+  and candidate suppression use the merchant-identity tokens (description +
+  payee, normalized; memo only when it is the only text present), so a tracked
+  brand in the payee still pins its bill and the catch-all `memo` column
+  (transaction type, check number, cardholder, …) can't satisfy a bill and hide
+  a genuinely-missing charge. Candidate *grouping* buckets debits by (amount,
+  identity-token set), then defragments in two cadence-aware phases so a merge can
+  only ever *help*, never *demote*. Phase 1 emits any bucket that already recurs
+  on its own (meets the occurrence threshold with a non-irregular cadence) and
+  never folds it into a superset. Phase 2 subset-merges only the remaining
+  sub-threshold buckets — folding each token set into its **unique maximal
+  superset** at the same amount — and keeps a merged group only if it now recurs.
+  This reunites one merchant whose identity tokens vary across charges as a subset
+  *chain* — an auxiliary field populated on only some rows (`{netflix}` ⊆
+  `{netflix, com}`), or a per-charge auth code / location that inflates the set
+  (`{spotify}` ⊆ `{spotify, new, york, …}`, `{com, wix}` ⊆ `{com, wix, www}` —
+  both observed in real data) — so the merchant clears the threshold instead of
+  fragmenting below it, while a one-off off-cadence remnant (`{netflix, promo}`)
+  can neither demote an already-recurring merchant nor fabricate one. A token set
+  that sits under *two or more incomparable* maximal supersets is genuinely
+  ambiguous (a bare `{pos, purchase}` under both `{pos, purchase, hulu}` and
+  `{pos, purchase, disney}`) and is left standalone, so two distinct merchants
+  never merge. A merchant named only in the payee under a numeric/junk description
+  still groups (the numeric tokens normalize away) and is labeled from the field
+  that carries a real merchant token.
+
+  *Accepted limitation (advisory output only):* the subset-merge defragments a
+  merchant only when its identity token sets form a *chain* (totally ordered by
+  subset). A merchant whose descriptor varies in *incomparable* ways across rows —
+  e.g. `SPOTIFY USA`, `SPOTIFY COM`, `SPOTIFY NY` normalizing to the antichain
+  `{spotify, usa}` / `{spotify, com}` / `{spotify, ny}` — produces no subset
+  relationships, so its rows do not merge and it can fall below the occurrence
+  threshold. Reuniting an antichain requires weighting tokens by how
+  *distinctive* they are (IDF / stopword clustering), a tunable heuristic that
+  trades one class of false-merge/false-split error for another and cannot be made
+  threshold-free; it would expand, not shrink, the scripted surface. Because
+  `candidate_new` is an advisory list an assistant reviews — never the
+  deterministic billing-miss alert, which does not use this grouping — this fuzzy
+  defragmentation is deliberately delegated to the LLM assistant per the
+  scripted-vs-LLM boundary below.
 
 ## Scripted vs. LLM boundary
 
