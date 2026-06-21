@@ -237,3 +237,100 @@ def reconcile(conn=None, *, run_id: str | None = None, is_transfer_key: str = "i
     finally:
         if own_conn:
             conn.close()
+
+
+def _dollars(cents: int | None) -> str | None:
+    """Render integer cents as a fixed two-decimal dollar string (None passes through)."""
+    if cents is None:
+        return None
+    sign = "-" if cents < 0 else ""
+    whole, frac = divmod(abs(cents), 100)
+    return f"{sign}{whole}.{frac:02d}"
+
+
+_STATUS_ORDER = {
+    STATUS_UNCONFIRMED: 0,  # needs the user's attention first
+    CONFIRMED: 1,
+    STATUS_INFERRED: 2,
+    STATUS_UNMATCHED: 3,
+}
+
+
+def transfers_view(conn=None, *, status: str | None = None) -> dict:
+    """Render persisted transfer links as auditable ``From -> To $X [why]`` rows.
+
+    Joins each link's legs back to their transactions so the source and
+    destination accounts (which the raw feed hides) are named, and carries the
+    ``explanation`` that records *why* the pairing was drawn. ``conn`` defaults to
+    the durable archive; when opened here it is closed again. ``status`` optionally
+    restricts the rows to one lifecycle state (``confirmed`` / ``inferred`` /
+    ``unconfirmed`` / ``unmatched``); an unknown value yields an empty list rather
+    than silently returning everything. Needs-confirm rows sort first so the
+    surface leads with what the user must act on.
+    """
+    own_conn = conn is None
+    if own_conn:
+        conn = archive.connect()
+    try:
+        links = archive.load_transfer_links(conn)
+        txn_by_id = {
+            t["id"]: t for t in archive.load_transactions(conn)
+            if t.get("id") is not None
+        }
+    finally:
+        if own_conn:
+            conn.close()
+
+    if status is not None:
+        links = [link for link in links if link.get("status") == status]
+
+    def _account(tid: str | None) -> str | None:
+        if tid is None:
+            return None
+        txn = txn_by_id.get(tid)
+        if txn is None:
+            return None
+        return txn.get("account_name") or txn.get("account_id")
+
+    transfers = []
+    summary: dict[str, int] = {}
+    for link in links:
+        st = link.get("status")
+        summary[st] = summary.get(st, 0) + 1
+        transfers.append(
+            {
+                "link_id": link.get("link_id"),
+                "status": st,
+                "method": link.get("method"),
+                "confidence": link.get("confidence"),
+                "amount": _dollars(link.get("amount_cents")),
+                "from_account": _account(link.get("debit_txn_id")),
+                "to_account": _account(link.get("credit_txn_id")),
+                "debit_txn_id": link.get("debit_txn_id"),
+                "credit_txn_id": link.get("credit_txn_id"),
+                "why": link.get("explanation"),
+            }
+        )
+
+    transfers.sort(
+        key=lambda r: (_STATUS_ORDER.get(r["status"], 99), r["link_id"] or 0)
+    )
+    return {"transfers": transfers, "summary": summary, "total": len(transfers)}
+
+
+def confirm(link_id: int, conn=None) -> dict:
+    """Confirm one transfer link by id and return the updated row.
+
+    Thin wrapper over :func:`archive.confirm_transfer_link` that defaults to the
+    durable archive and closes a connection it opened. Confirming locks the
+    pairing in: subsequent reconcile runs exclude its legs from the matcher, so
+    the user's decision is authoritative and never silently recomputed.
+    """
+    own_conn = conn is None
+    if own_conn:
+        conn = archive.connect()
+    try:
+        return archive.confirm_transfer_link(conn, link_id)
+    finally:
+        if own_conn:
+            conn.close()

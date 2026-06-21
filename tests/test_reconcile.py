@@ -408,3 +408,160 @@ def test_pair_that_vanishes_then_returns_is_promoted_not_kept_dangling(tmp_path,
     assert back["links"] == 1
     assert back["needs_confirm"] == 0
     assert back["promoted"] == 1
+
+
+# --- transfers_view + confirm (Piece 5 surfaces) ------------------------------
+
+
+def _seed_one_inferred_link(tmp_path, monkeypatch):
+    """Seed an archive with a single mutual-unique inferred link; return its id."""
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("d1", "Groceries", "-100.00", desc="Transfer to Main"),
+            _txn("c1", "Main", "100.00", desc="Transfer from Groceries"),
+        ]})
+        _mark_transfers(conn, "d1", "c1")
+    finally:
+        conn.close()
+    reconcile.reconcile()
+    conn = archive.connect()
+    try:
+        link = next(l for l in archive.load_transfer_links(conn)
+                    if l["status"] == STATUS_INFERRED)
+        return link["link_id"]
+    finally:
+        conn.close()
+
+
+def test_transfers_view_names_both_legs_and_carries_why(tmp_path, monkeypatch):
+    _seed_one_inferred_link(tmp_path, monkeypatch)
+    view = reconcile.transfers_view()
+    assert view["total"] == 1
+    row = view["transfers"][0]
+    assert row["from_account"] == "Groceries"
+    assert row["to_account"] == "Main"
+    assert row["amount"] == "100.00"
+    assert row["status"] == STATUS_INFERRED
+    assert row["why"]  # explanation present
+    assert view["summary"][STATUS_INFERRED] == 1
+
+
+def test_transfers_view_status_filter_excludes_others(tmp_path, monkeypatch):
+    _seed_one_inferred_link(tmp_path, monkeypatch)
+    assert reconcile.transfers_view(status=STATUS_INFERRED)["total"] == 1
+    assert reconcile.transfers_view(status="confirmed")["total"] == 0
+    # An unknown status yields nothing rather than silently returning all rows.
+    assert reconcile.transfers_view(status="bogus")["total"] == 0
+
+
+def test_transfers_view_needs_confirm_sorts_first(tmp_path, monkeypatch):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        # An inferred pair and a separate needs-confirm pair.
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("d1", "A", "-100.00"),
+            _txn("c1", "B", "100.00"),
+        ]})
+        archive.insert_transfer_link(
+            conn, status=STATUS_INFERRED, debit_txn_id="d1", credit_txn_id="c1",
+            amount_cents=10000, explanation="inferred.",
+        )
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("d2", "C", "-50.00"),
+            _txn("c2", "D", "50.00"),
+        ]})
+        archive.insert_transfer_link(
+            conn, status=STATUS_UNCONFIRMED, debit_txn_id="d2", credit_txn_id="c2",
+            amount_cents=5000, explanation="needs review.",
+        )
+    finally:
+        conn.close()
+    view = reconcile.transfers_view()
+    assert view["transfers"][0]["status"] == STATUS_UNCONFIRMED
+
+
+def test_confirm_promotes_and_survives_reconcile(tmp_path, monkeypatch):
+    link_id = _seed_one_inferred_link(tmp_path, monkeypatch)
+    confirmed = reconcile.confirm(link_id)
+    assert confirmed["status"] == "confirmed"
+
+    # A later reconcile must preserve the confirmed link untouched.
+    report = reconcile.reconcile()
+    assert report["confirmed_preserved"] == 1
+    view = reconcile.transfers_view(status="confirmed")
+    assert view["total"] == 1
+    assert view["transfers"][0]["link_id"] == link_id
+
+
+def test_confirm_is_idempotent(tmp_path, monkeypatch):
+    link_id = _seed_one_inferred_link(tmp_path, monkeypatch)
+    first = reconcile.confirm(link_id)
+    second = reconcile.confirm(link_id)
+    assert first["status"] == second["status"] == "confirmed"
+
+
+def test_confirm_unknown_link_raises_lookup(tmp_path, monkeypatch):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    archive.connect().close()
+    with pytest.raises(LookupError):
+        reconcile.confirm(999)
+
+
+def test_confirm_rejects_single_leg_unmatched(tmp_path, monkeypatch):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("d1", "A", "-100.00"),
+        ]})
+        link_id = archive.insert_transfer_link(
+            conn, status=STATUS_UNMATCHED, debit_txn_id="d1",
+            amount_cents=10000, explanation="no counterparty.",
+        )
+    finally:
+        conn.close()
+    with pytest.raises(ValueError):
+        reconcile.confirm(link_id)
+
+
+def test_confirm_rejects_single_leg_unconfirmed(tmp_path, monkeypatch):
+    # An ambiguous transfer resolves one leg but cannot pin the counterparty, so
+    # it persists as a single-leg needs-confirm row. It still has no pairing to
+    # authorize, so confirming it must be refused just like an unmatched leg.
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("d1", "A", "-200.00"),
+        ]})
+        link_id = archive.insert_transfer_link(
+            conn, status=STATUS_UNCONFIRMED, debit_txn_id="d1",
+            amount_cents=20000, explanation="ambiguous counterpart.",
+        )
+    finally:
+        conn.close()
+    with pytest.raises(ValueError):
+        reconcile.confirm(link_id)
+
+
+def test_confirm_rejects_link_with_vanished_counterparty(tmp_path, monkeypatch):
+    # A two-leg link whose credit leg references a transaction not in the archive
+    # must not be lockable as authoritative: confirming would freeze a pairing
+    # over a transaction that no longer exists.
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("d1", "A", "-100.00"),
+        ]})
+        link_id = archive.insert_transfer_link(
+            conn, status=STATUS_UNCONFIRMED, debit_txn_id="d1",
+            credit_txn_id="ghost", amount_cents=10000, explanation="stale.",
+        )
+    finally:
+        conn.close()
+    with pytest.raises(ValueError, match="no longer in the archive"):
+        reconcile.confirm(link_id)

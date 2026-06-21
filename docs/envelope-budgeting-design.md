@@ -339,6 +339,42 @@ Rule of thumb: **scripts produce structured, auditable facts and candidate
 lists; the LLM does the judgment calls.** Decide the owner explicitly for every
 new capability.
 
+## Piece F — Surfaces (CLI + MCP) · **built** (`cli.py`, `server.py`, `reconcile.py`, `archive.py`)
+
+Every prior piece ships a pure module plus an archive-loading `*_report`
+wrapper, deliberately *without* a user-facing surface — surfacing is this piece.
+A person drives the system from the terminal; the Copilot assistant drives the
+same engine over MCP. The two surfaces are kept at parity so neither path is a
+second-class citizen.
+
+- **Reports are read-only mirrors.** `allocation` / `subscriptions` (CLI) and
+  `allocation_audit_report` / `subscription_audit_report` / `budget_burndown` /
+  `budget_forecast` (MCP) load the budget config and durable archive and render
+  the existing report dicts. They add no new logic — same numbers, two surfaces.
+  Both accept `--json` (CLI) / return raw dicts (MCP) so the assistant gets the
+  full structured output, not just the human text.
+- **Transfer confirm flow.** Reconciliation infers the hidden counterparty of
+  each internal transfer, but a *changed* pairing is downgraded to needs-confirm
+  for the user to review (see below). The surface closes that loop:
+  - `transfers` / `list_transfers` render every link as
+    `from_account -> to_account $amount [why]`, recovering the account names the
+    raw feed hides and carrying the `explanation` that records *why* the pairing
+    was drawn. Needs-confirm rows sort first. An optional status filter narrows
+    to one lifecycle state; an unknown status yields an empty list rather than
+    silently returning everything.
+  - `confirm <link_id>` / `confirm_transfer(link_id)` promote one link to
+    `confirmed`. A confirmed link is user-authoritative: subsequent reconciles
+    exclude its legs from the matcher, so the decision is never silently
+    recomputed. Confirm is idempotent and refuses a single-leg `unmatched` row
+    (there is no counterparty to authorize).
+  - `reconcile` / `reconcile_transfers` re-run the matcher idempotently so the
+    link set reflects the latest sync before the user reviews it.
+- **Surface owns no logic.** `confirm` resolves to `archive.confirm_transfer_link`
+  (the only mutation) and `transfers` to `reconcile.transfers_view` (a pure
+  join). The CLI and MCP layers are thin: parse, call, render. This keeps the
+  audited engine the single source of truth and the surfaces independently
+  testable.
+
 ## Budget config
 
 A single user-supplied JSON file (default `~/.finance-mcp/budget.json`,

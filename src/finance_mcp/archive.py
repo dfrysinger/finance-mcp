@@ -456,6 +456,62 @@ def replace_machine_links(conn: sqlite3.Connection, rows: list[dict]) -> int:
     return len(rows)
 
 
+def confirm_transfer_link(conn: sqlite3.Connection, link_id: int) -> dict:
+    """Promote one machine-written link to ``confirmed`` (user-authoritative).
+
+    A confirmed link is excluded from every future recompute (its legs are taken
+    out of the matcher's input), so confirming is the user's way of locking in a
+    pairing the tool inferred or flagged for review. Returns the updated link row
+    as a dict.
+
+    Only a two-leg link may be confirmed: a single-leg row (an ``unmatched`` leg,
+    or an ``unconfirmed`` leg whose counterparty was too ambiguous to resolve) has
+    no counterparty to authorize, so confirming it would assert a pairing that does
+    not exist. Both legs must also still reference transactions present in the
+    archive — a link whose leg has since left the feed cannot be locked in as
+    authoritative over a transaction that no longer exists. Re-confirming an
+    already-confirmed link is a no-op that still returns the row, so the operation
+    is idempotent. Raises ``LookupError`` if no link has ``link_id``; raises
+    ``ValueError`` if the link is single-leg or references a missing transaction.
+    """
+    row = conn.execute(
+        "SELECT * FROM transfer_links WHERE link_id = ?", (link_id,)
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"no transfer link with link_id {link_id}")
+    link = dict(row)
+    if link["debit_txn_id"] is None or link["credit_txn_id"] is None:
+        raise ValueError(
+            f"link {link_id} has only one leg (no resolved counterparty); only a "
+            "fully-paired link can be confirmed"
+        )
+    present = {
+        r["id"] for r in conn.execute(
+            "SELECT id FROM transactions WHERE id IN (?, ?)",
+            (link["debit_txn_id"], link["credit_txn_id"]),
+        ).fetchall()
+    }
+    missing = {link["debit_txn_id"], link["credit_txn_id"]} - present
+    if missing:
+        raise ValueError(
+            f"link {link_id} references transaction(s) no longer in the archive "
+            f"({', '.join(sorted(missing))}); cannot confirm a stale pairing"
+        )
+    if link["status"] != "confirmed":
+        conn.execute(
+            "UPDATE transfer_links SET status = 'confirmed', updated_at = ? "
+            "WHERE link_id = ?",
+            (_now(), link_id),
+        )
+        conn.commit()
+        link = dict(
+            conn.execute(
+                "SELECT * FROM transfer_links WHERE link_id = ?", (link_id,)
+            ).fetchone()
+        )
+    return link
+
+
 def set_account_type(
     conn: sqlite3.Connection,
     account_id: str,

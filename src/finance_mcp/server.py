@@ -2,7 +2,10 @@
 
 Runs over stdio. Read tools (`list_accounts`, `get_transactions`,
 `account_balances`, `spending_summary`) serve from the local cache and never hit
-the network. `sync_now` is the only tool that reaches out to SimpleFIN.
+the network. Budgeting tools (`budget_burndown`, `budget_forecast`,
+`allocation_audit_report`, `subscription_audit_report`) and transfer tools
+(`reconcile_transfers`, `list_transfers`, `confirm_transfer`) read the durable
+archive. `sync_now` is the only tool that reaches out to SimpleFIN.
 """
 
 from __future__ import annotations
@@ -240,6 +243,186 @@ def sync_now(days: int = 120) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
     summary["ok"] = True
     return summary
+
+
+def _load_budget_config() -> Any:
+    """Load the budget config from its default path, raising BudgetConfigError."""
+    from . import budget_config
+
+    return budget_config.load_config(config.budget_config_path())
+
+
+def _parse_iso(value: str | None):
+    from datetime import date
+
+    return date.fromisoformat(value) if value else None
+
+
+@mcp.tool()
+def budget_burndown(month: str) -> dict[str, Any]:
+    """Per-envelope planned target vs. actual spend for one ``YYYY-MM`` month.
+
+    Reads the budget config and the categorized archive. Returns each envelope's
+    target, actual spend, and remaining (negative = over budget), plus unmapped
+    spend on accounts in no envelope so nothing is silently dropped.
+    """
+    from . import budget_config, burndown
+
+    try:
+        year, mon = (int(p) for p in month.split("-"))
+    except (ValueError, TypeError):
+        return {"ok": False, "error": f"month must be YYYY-MM, got {month!r}"}
+    try:
+        cfg = _load_budget_config()
+    except budget_config.BudgetConfigError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        return burndown.burndown_report(cfg, year=year, month=mon)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+def budget_forecast(
+    as_of: str | None = None, through: str | None = None
+) -> dict[str, Any]:
+    """Per-envelope sufficiency over a window: will each cover its upcoming bills.
+
+    Dates are YYYY-MM-DD. ``as_of`` defaults to today and ``through`` to 60 days
+    later. Each envelope gets a verdict (``ok`` / ``at_risk`` / ``balance_unknown``)
+    with the projected minimum balance and, when at risk, the date and shortfall.
+    """
+    from datetime import date, timedelta
+
+    from . import budget_config, forecast
+
+    try:
+        start = _parse_iso(as_of) or date.today()
+        end = _parse_iso(through) or (start + timedelta(days=forecast.DEFAULT_HORIZON_DAYS))
+    except ValueError as exc:
+        return {"ok": False, "error": f"invalid date: {exc}"}
+    if end < start:
+        return {"ok": False, "error": f"through {end} is before as_of {start}"}
+    try:
+        cfg = _load_budget_config()
+    except budget_config.BudgetConfigError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        return forecast.forecast_report(cfg, as_of=start, through=end)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+def allocation_audit_report(
+    start: str | None = None,
+    end: str | None = None,
+    day_tolerance: int = 7,
+) -> dict[str, Any]:
+    """Audit each scheduled transfer: did it fire on time, late, early, or not at all.
+
+    Dates are YYYY-MM-DD; ``end`` defaults to today and ``start`` to a year back.
+    ``day_tolerance`` is how far a transfer may drift and still count as fired. A
+    genuinely-ambiguous allocation surfaces as ``missing`` until its transfer link
+    is confirmed via ``confirm_transfer``.
+    """
+    from . import allocation, budget_config
+
+    try:
+        s, e = _parse_iso(start), _parse_iso(end)
+    except ValueError as exc:
+        return {"ok": False, "error": f"invalid date: {exc}"}
+    try:
+        cfg = _load_budget_config()
+    except budget_config.BudgetConfigError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        return allocation.allocation_report(cfg, start=s, end=e, day_tolerance=day_tolerance)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+def subscription_audit_report(
+    start: str | None = None,
+    end: str | None = None,
+    day_tolerance: int = 7,
+    min_occurrences: int = 3,
+) -> dict[str, Any]:
+    """Flag tracked bills that did not post (billing problem / cancellation) and
+    surface untracked recurring merchants as candidates for the assistant to judge.
+
+    Dates are YYYY-MM-DD; ``end`` defaults to today and ``start`` to a year back so
+    a monthly charge clears ``min_occurrences``. ``expected_missing`` is the
+    deterministic high-stakes alert; ``candidate_new`` is advisory — the assistant
+    decides which candidates are real subscriptions.
+    """
+    from . import budget_config, subscription
+
+    try:
+        s, e = _parse_iso(start), _parse_iso(end)
+    except ValueError as exc:
+        return {"ok": False, "error": f"invalid date: {exc}"}
+    try:
+        cfg = _load_budget_config()
+    except budget_config.BudgetConfigError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        return subscription.subscription_report(
+            cfg, start=s, end=e,
+            day_tolerance=day_tolerance, min_occurrences=min_occurrences,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+def reconcile_transfers() -> dict[str, Any]:
+    """Rebuild internal-transfer links from the archive (idempotent).
+
+    Re-runs the matcher over the categorized archive and persists the links,
+    preserving every confirmed link and recomputing the rest. Returns counts of
+    inferred / needs-confirm / unmatched links plus promotions and downgrades.
+    Run this after a sync so ``list_transfers`` reflects the latest data.
+    """
+    from . import reconcile
+
+    return reconcile.reconcile()
+
+
+@mcp.tool()
+def list_transfers(status: str | None = None) -> dict[str, Any]:
+    """List reconstructed transfer links as ``from_account -> to_account $amount [why]``.
+
+    The raw feed names only the product type a transfer went to, never the named
+    account; each link here recovers the hidden counterparty and records why it was
+    drawn. ``status`` optionally restricts to one lifecycle state (``confirmed`` /
+    ``inferred`` / ``unconfirmed`` / ``unmatched``); ``unconfirmed`` links are the
+    ones awaiting the user's review and sort first.
+    """
+    from . import reconcile
+
+    return reconcile.transfers_view(status=status)
+
+
+@mcp.tool()
+def confirm_transfer(link_id: int) -> dict[str, Any]:
+    """Confirm one transfer link by id, locking the pairing as authoritative.
+
+    A confirmed link is excluded from every future reconcile, so the user's
+    decision is never silently recomputed. Only a two-leg link can be confirmed;
+    confirming an unmatched single leg is rejected. Returns the updated link or an
+    error.
+    """
+    from . import reconcile
+
+    try:
+        link = reconcile.confirm(link_id)
+    except LookupError as exc:
+        return {"ok": False, "error": str(exc)}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "link": link}
 
 
 def main() -> None:

@@ -386,6 +386,181 @@ def _cmd_forecast(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_allocation(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from . import allocation, budget_config
+
+    try:
+        start = _parse_date(args.start) if args.start else None
+        end = _parse_date(args.end) if args.end else None
+    except ValueError as exc:
+        print(f"Invalid date: {exc}", file=sys.stderr)
+        return 1
+    if start is not None and end is not None and end < start:
+        print(f"Invalid window: --end {end} is before --start {start}",
+              file=sys.stderr)
+        return 1
+
+    cfg_path = Path(args.config).expanduser() if args.config else config.budget_config_path()
+    try:
+        cfg = budget_config.load_config(cfg_path)
+    except budget_config.BudgetConfigError as exc:
+        print(f"Budget config error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        report = allocation.allocation_report(
+            cfg, start=start, end=end, day_tolerance=args.day_tolerance
+        )
+    except ValueError as exc:
+        print(f"Allocation audit error: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+
+    w = report["window"]
+    s = report["summary"]
+    print(f"Allocation audit {w['start']} -> {w['end']} "
+          f"(tolerance {report['day_tolerance']}d)")
+    if not report["transfers"]:
+        print("  (no scheduled transfers configured)")
+    for tr in report["transfers"]:
+        src = tr["from_envelope"] or "(external)"
+        print(f"  {tr['name']}: {src} -> {tr['to_envelope']} "
+              f"${tr['amount']} [{tr['kind']}]")
+        for occ in tr["occurrences"]:
+            if occ["status"] == "missing":
+                print(f"    {occ['expected_date']}  MISSING "
+                      f"(expected ${occ['expected_amount']})")
+            else:
+                drift = occ["drift_days"]
+                drift_s = f", {drift:+d}d" if drift else ""
+                print(f"    {occ['expected_date']}  {occ['status']}{drift_s}  "
+                      f"actual ${occ['actual_amount']} on {occ['actual_date']}")
+    parts = [f"{v} {k}" for k, v in s.items() if v]
+    print(f"  ({', '.join(parts) if parts else 'no occurrences'})")
+    return 0
+
+
+def _cmd_subscriptions(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from . import budget_config, subscription
+
+    try:
+        start = _parse_date(args.start) if args.start else None
+        end = _parse_date(args.end) if args.end else None
+    except ValueError as exc:
+        print(f"Invalid date: {exc}", file=sys.stderr)
+        return 1
+    if start is not None and end is not None and end < start:
+        print(f"Invalid window: --end {end} is before --start {start}",
+              file=sys.stderr)
+        return 1
+
+    cfg_path = Path(args.config).expanduser() if args.config else config.budget_config_path()
+    try:
+        cfg = budget_config.load_config(cfg_path)
+    except budget_config.BudgetConfigError as exc:
+        print(f"Budget config error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        report = subscription.subscription_report(
+            cfg, start=start, end=end,
+            day_tolerance=args.day_tolerance,
+            min_occurrences=args.min_occurrences,
+        )
+    except ValueError as exc:
+        print(f"Subscription audit error: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+
+    w = report["window"]
+    sm = report["summary"]
+    print(f"Subscription audit {w['start']} -> {w['end']}")
+    print(f"  Tracked bills: {sm['tracked']}")
+    if report["expected_missing"]:
+        print("  MISSING expected charges (possible billing problem / cancellation):")
+        for m in report["expected_missing"]:
+            last = m.get("last_seen") or "never"
+            print(f"    {m['name']}: expected ~${m['expected_amount']} "
+                  f"on {m['expected_date']}, last seen {last}")
+    else:
+        print("  No missing expected charges.")
+    if report["candidate_new"]:
+        print("  Candidate untracked recurring charges (review with assistant):")
+        for c in report["candidate_new"]:
+            print(f"    {c['merchant']}: ${c['amount']} x{c['occurrences']} "
+                  f"({c['cadence']})")
+    else:
+        print("  No new recurring candidates found.")
+    return 0
+
+
+def _cmd_reconcile(args: argparse.Namespace) -> int:
+    from . import reconcile
+
+    report = reconcile.reconcile()
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+    print("Transfer reconciliation")
+    print(f"  links inferred:   {report['links']}")
+    print(f"  needs confirm:    {report['needs_confirm']}")
+    print(f"  unmatched legs:   {report['unmatched']}")
+    print(f"  confirmed (kept): {report['confirmed_preserved']}")
+    print(f"  promoted:         {report['promoted']}")
+    print(f"  downgraded:       {report['downgraded']}")
+    return 0
+
+
+def _cmd_transfers(args: argparse.Namespace) -> int:
+    from . import reconcile
+
+    view = reconcile.transfers_view(status=args.status)
+    if args.json:
+        print(json.dumps(view, indent=2))
+        return 0
+
+    label = f" ({args.status})" if args.status else ""
+    print(f"Transfers{label}: {view['total']}")
+    for tr in view["transfers"]:
+        src = tr["from_account"] or "?"
+        dst = tr["to_account"] or "?"
+        amount = tr["amount"] if tr["amount"] is not None else "?"
+        why = f"  [{tr['why']}]" if tr["why"] else ""
+        print(f"  #{tr['link_id']} {tr['status']:<11} "
+              f"{src} -> {dst} ${amount}{why}")
+    if not view["transfers"]:
+        print("  (none)")
+    return 0
+
+
+def _cmd_confirm(args: argparse.Namespace) -> int:
+    from . import reconcile
+
+    try:
+        link = reconcile.confirm(args.link_id)
+    except LookupError as exc:
+        print(f"No such link: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"Cannot confirm: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(link, indent=2))
+        return 0
+    print(f"Confirmed link #{link['link_id']}: "
+          f"{link['debit_txn_id']} -> {link['credit_txn_id']} "
+          f"(status {link['status']})")
+    return 0
+
+
 def _print_errors(errors: list, errlist: list) -> None:
     for err in [*(errors or []), *(errlist or [])]:
         print(f"  ! SimpleFIN: {err}", file=sys.stderr)
@@ -498,6 +673,59 @@ def build_parser() -> argparse.ArgumentParser:
     p_fc.add_argument("--config", help="path to budget config (default: ~/.finance-mcp/budget.json)")
     p_fc.add_argument("--json", action="store_true")
     p_fc.set_defaults(func=_cmd_forecast)
+
+    p_al = sub.add_parser(
+        "allocation",
+        help="did each scheduled transfer fire on time, late, or not at all",
+    )
+    p_al.add_argument("--start", help="window start, as YYYY-MM-DD (default: a year back)")
+    p_al.add_argument("--end", help="window end, as YYYY-MM-DD (default: today)")
+    p_al.add_argument("--day-tolerance", type=int, default=7,
+                      help="days a transfer may drift and still count as fired")
+    p_al.add_argument("--config", help="path to budget config (default: ~/.finance-mcp/budget.json)")
+    p_al.add_argument("--json", action="store_true")
+    p_al.set_defaults(func=_cmd_allocation)
+
+    p_sub = sub.add_parser(
+        "subscriptions",
+        help="missing expected charges + candidate untracked recurring merchants",
+    )
+    p_sub.add_argument("--start", help="window start, as YYYY-MM-DD (default: a year back)")
+    p_sub.add_argument("--end", help="window end, as YYYY-MM-DD (default: today)")
+    p_sub.add_argument("--day-tolerance", type=int, default=7,
+                       help="days a charge may drift and still count as on schedule")
+    p_sub.add_argument("--min-occurrences", type=int, default=3,
+                       help="times a merchant must recur to surface as a candidate")
+    p_sub.add_argument("--config", help="path to budget config (default: ~/.finance-mcp/budget.json)")
+    p_sub.add_argument("--json", action="store_true")
+    p_sub.set_defaults(func=_cmd_subscriptions)
+
+    p_rec = sub.add_parser(
+        "reconcile",
+        help="rebuild internal-transfer links from the archive (idempotent)",
+    )
+    p_rec.add_argument("--json", action="store_true")
+    p_rec.set_defaults(func=_cmd_reconcile)
+
+    p_tr = sub.add_parser(
+        "transfers",
+        help="list reconciled transfer links (From -> To $X [why])",
+    )
+    p_tr.add_argument(
+        "--status",
+        choices=["confirmed", "inferred", "unconfirmed", "unmatched"],
+        help="show only links in this lifecycle state",
+    )
+    p_tr.add_argument("--json", action="store_true")
+    p_tr.set_defaults(func=_cmd_transfers)
+
+    p_cf = sub.add_parser(
+        "confirm",
+        help="confirm one transfer link by id (locks it as authoritative)",
+    )
+    p_cf.add_argument("link_id", type=int, help="the link id to confirm")
+    p_cf.add_argument("--json", action="store_true")
+    p_cf.set_defaults(func=_cmd_confirm)
 
     return parser
 
