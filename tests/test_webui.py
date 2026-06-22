@@ -323,3 +323,256 @@ def test_named_host_is_allowed(tmp_path, monkeypatch):
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
+
+
+# --- mutating POST endpoint (subscriptions mark) ------------------------------
+
+def _budget_with_replit(monkeypatch, tmp_path):
+    _write_budget(monkeypatch, tmp_path, {
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [
+            {"name": "Replit", "envelope": "Card", "amount": 20.00,
+             "cadence": "monthly", "day": 10, "match": "replit"},
+        ],
+    })
+
+
+def test_post_mark_canceling_persists(tmp_path, monkeypatch):
+    _budget_with_replit(monkeypatch, tmp_path)
+    status, body = webui.handle_api_post(
+        "subscriptions/mark",
+        {"name": "replit", "lifecycle": "canceling",
+         "cancel_effective": "2026-06-01"},
+    )
+    assert status == 200
+    assert body["ok"] is True
+    saved = json.loads(config.budget_config_path().read_text(encoding="utf-8"))
+    bill = saved["recurring"][0]
+    assert bill["lifecycle"] == "canceling"
+    assert bill["cancel_effective"] == "2026-06-01"
+
+
+def test_post_mark_reactivate_clears_effective(tmp_path, monkeypatch):
+    _write_budget(monkeypatch, tmp_path, {
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [
+            {"name": "Replit", "envelope": "Card", "amount": 20.00,
+             "cadence": "monthly", "day": 10, "match": "replit",
+             "lifecycle": "canceled", "cancel_effective": "2026-03-01"},
+        ],
+    })
+    status, body = webui.handle_api_post(
+        "subscriptions/mark", {"name": "Replit", "lifecycle": "active"})
+    assert status == 200 and body["ok"] is True
+    saved = json.loads(config.budget_config_path().read_text(encoding="utf-8"))
+    bill = saved["recurring"][0]
+    assert bill.get("lifecycle", "active") == "active"
+    assert "cancel_effective" not in bill or bill["cancel_effective"] is None
+
+
+def test_post_mark_unknown_endpoint_is_404():
+    status, body = webui.handle_api_post("does/not/exist", {"name": "x"})
+    assert status == 404 and body["ok"] is False
+
+
+def test_post_mark_non_object_body_is_400():
+    status, body = webui.handle_api_post("subscriptions/mark", ["not", "a", "dict"])
+    assert status == 400 and body["ok"] is False
+    assert "JSON object" in body["error"]
+
+
+def test_post_mark_missing_required_is_400(tmp_path, monkeypatch):
+    _budget_with_replit(monkeypatch, tmp_path)
+    status, body = webui.handle_api_post(
+        "subscriptions/mark", {"name": "replit"})  # no lifecycle
+    assert status == 400 and body["ok"] is False
+    assert "lifecycle" in body["error"]
+
+
+def test_post_mark_non_string_value_is_400(tmp_path, monkeypatch):
+    _budget_with_replit(monkeypatch, tmp_path)
+    status, body = webui.handle_api_post(
+        "subscriptions/mark",
+        {"name": "replit", "lifecycle": 5, "cancel_effective": "2026-06-01"})
+    assert status == 400 and body["ok"] is False
+
+
+def test_post_mark_no_such_bill_is_400(tmp_path, monkeypatch):
+    _budget_with_replit(monkeypatch, tmp_path)
+    status, body = webui.handle_api_post(
+        "subscriptions/mark",
+        {"name": "nope", "lifecycle": "canceling",
+         "cancel_effective": "2026-06-01"})
+    assert status == 400 and body["ok"] is False
+
+
+def test_http_post_requires_csrf_header_and_persists(tmp_path, monkeypatch):
+    _budget_with_replit(monkeypatch, tmp_path)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+    port = httpd.server_address[1]
+    thread = Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        payload = json.dumps({
+            "name": "replit", "lifecycle": "canceling",
+            "cancel_effective": "2026-06-01"}).encode("utf-8")
+
+        # Without the custom header (the cross-site case) the write is refused.
+        no_hdr = http.client.HTTPConnection("127.0.0.1", port)
+        no_hdr.request("POST", "/api/subscriptions/mark", body=payload,
+                       headers={"Content-Type": "application/json"})
+        assert no_hdr.getresponse().status == 403
+        no_hdr.close()
+        saved = json.loads(config.budget_config_path().read_text(encoding="utf-8"))
+        assert saved["recurring"][0].get("lifecycle", "active") == "active"
+
+        # With the header (the same-origin UI case) the write goes through.
+        ok = http.client.HTTPConnection("127.0.0.1", port)
+        ok.request("POST", "/api/subscriptions/mark", body=payload,
+                   headers={"Content-Type": "application/json",
+                            "X-Requested-With": "finance-mcp"})
+        resp = ok.getresponse()
+        assert resp.status == 200
+        data = json.loads(resp.read().decode("utf-8"))
+        assert data["ok"] is True
+        ok.close()
+        saved = json.loads(config.budget_config_path().read_text(encoding="utf-8"))
+        assert saved["recurring"][0]["lifecycle"] == "canceling"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_http_post_foreign_host_is_rejected(tmp_path, monkeypatch):
+    _budget_with_replit(monkeypatch, tmp_path)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+    httpd.allowed_hosts = webui._host_policy("0.0.0.0")
+    port = httpd.server_address[1]
+    thread = Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        bad = http.client.HTTPConnection("127.0.0.1", port)
+        bad.request("POST", "/api/subscriptions/mark",
+                    body=b'{"name":"replit","lifecycle":"canceling","cancel_effective":"2026-06-01"}',
+                    headers={"Host": "evil.example.com",
+                             "Content-Type": "application/json",
+                             "X-Requested-With": "finance-mcp"})
+        assert bad.getresponse().status == 403
+        bad.close()
+        saved = json.loads(config.budget_config_path().read_text(encoding="utf-8"))
+        assert saved["recurring"][0].get("lifecycle", "active") == "active"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_http_post_bad_json_is_400(tmp_path, monkeypatch):
+    _budget_with_replit(monkeypatch, tmp_path)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+    port = httpd.server_address[1]
+    thread = Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request("POST", "/api/subscriptions/mark", body=b"{not json",
+                     headers={"Content-Type": "application/json",
+                              "X-Requested-With": "finance-mcp"})
+        assert conn.getresponse().status == 400
+        conn.close()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_http_post_short_body_is_rejected(tmp_path, monkeypatch):
+    # A client that declares a Content-Length larger than the bytes it sends,
+    # then closes, must get a clean 400 (short body) rather than a hung worker
+    # or a persisted partial write.
+    import socket
+
+    _budget_with_replit(monkeypatch, tmp_path)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+    port = httpd.server_address[1]
+    thread = Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = b'{"name":"replit"}'  # 17 bytes
+        req = (
+            f"POST /api/subscriptions/mark HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            f"X-Requested-With: finance-mcp\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: 100\r\n"  # lies: promises 100, sends 17
+            f"Connection: close\r\n\r\n"
+        ).encode("ascii") + body
+        s = socket.create_connection(("127.0.0.1", port), timeout=10)
+        s.sendall(req)
+        s.shutdown(socket.SHUT_WR)  # close write side: peer sees EOF after 17 bytes
+        resp = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        s.close()
+        status_line = resp.split(b"\r\n", 1)[0]
+        assert b"400" in status_line, status_line
+        saved = json.loads(config.budget_config_path().read_text(encoding="utf-8"))
+        assert saved["recurring"][0].get("lifecycle", "active") == "active"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_http_post_slow_body_hits_total_deadline(tmp_path, monkeypatch):
+    # A client that opens the body but then dribbles (or simply stops) must be
+    # cut off by the *total* read deadline, not held for length*timeout seconds
+    # by keeping the per-read inactivity timer alive. We shrink the deadline and
+    # send a partial body without closing the write side, so the only way the
+    # handler can respond is by enforcing the overall budget.
+    import socket
+    import time as _time
+
+    _budget_with_replit(monkeypatch, tmp_path)
+    monkeypatch.setattr(webui, "_BODY_DEADLINE", 0.4)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+    port = httpd.server_address[1]
+    thread = Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        head = (
+            f"POST /api/subscriptions/mark HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            f"X-Requested-With: finance-mcp\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: 100\r\n"  # promises 100 bytes
+            f"Connection: close\r\n\r\n"
+        ).encode("ascii")
+        s = socket.create_connection(("127.0.0.1", port), timeout=10)
+        s.sendall(head + b'{"name":')  # send only a few body bytes, then stall
+        started = _time.monotonic()
+        resp = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        elapsed = _time.monotonic() - started
+        s.close()
+        status_line = resp.split(b"\r\n", 1)[0]
+        assert b"408" in status_line, status_line
+        # The response must arrive on the order of the deadline, not the 30s
+        # inactivity timeout — proving the total budget, not per-read, governs.
+        assert elapsed < 5, elapsed
+        saved = json.loads(config.budget_config_path().read_text(encoding="utf-8"))
+        assert saved["recurring"][0].get("lifecycle", "active") == "active"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)

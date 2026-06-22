@@ -1,10 +1,13 @@
-"""Local, read-only web UI for reviewing the archive and budgeting reports.
+"""Local web UI for reviewing the archive and budgeting reports.
 
 Binds to localhost by default and serves a single-page app plus a small JSON
 API. Every endpoint is backed by the same functions the MCP server exposes
 (``server.py``), so the browser view and Copilot see identical data and this
-surface adds no new analysis logic. Nothing is mutated — this is a review-only
-surface, so there is no confirm/sync endpoint here.
+surface adds no new analysis logic. The only mutation this surface offers is
+marking a recurring bill's cancellation lifecycle (``POST
+/api/subscriptions/mark``); it writes through the same ``subscriptions_mark``
+function the CLI and MCP use. That write is guarded by the Host allowlist plus a
+custom-header check so a cross-site page cannot drive it.
 
 Start it with ``finance-mcp web`` (or ``finance-mcp-web``) and open the printed
 URL. Because it serves real financial data, it binds to 127.0.0.1 by default;
@@ -17,6 +20,7 @@ import ipaddress
 import json
 import math
 import sys
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -149,7 +153,86 @@ def handle_api(name: str, params: dict[str, list[str]]) -> tuple[int, dict]:
     return 200, result
 
 
-# Browser DNS-rebinding defense: a 127.0.0.1 bind alone does NOT protect the
+# Mutating endpoints reachable via POST. Kept deliberately tiny: the web UI is a
+# review surface, and the one write it offers is marking a recurring bill's
+# cancellation lifecycle. Same coercion contract as the GET table above.
+_POST_ENDPOINTS: dict[str, tuple] = {
+    "subscriptions/mark": (
+        server.subscriptions_mark,
+        {
+            "name": ("str", True),
+            "lifecycle": ("str", True),
+            "cancel_effective": ("str", False),
+        },
+    ),
+}
+
+# Largest POST body we will read. The only writer takes three short strings, so
+# anything beyond this is malformed or hostile; cap it before allocating.
+_MAX_BODY = 64 * 1024
+
+# Total wall-clock budget for reading a request body, in seconds. The per-read
+# socket timeout below only bounds *inactivity* (it resets on every byte), so a
+# client that dribbles one byte just under the timeout could otherwise pin a
+# worker thread for body_length * timeout seconds. We enforce this as a single
+# deadline across the whole read so the worst case is bounded regardless of how
+# the bytes are paced.
+_BODY_DEADLINE = 30.0
+
+# CSRF defense for the write endpoint. A cross-site HTML form cannot set a custom
+# request header, and a cross-site fetch that sets one triggers a CORS preflight
+# this server never answers, so the browser blocks the real request. Same-origin
+# requests from our own page set it freely. Combined with the Host allowlist,
+# this keeps the mutation reachable only from the local UI.
+_XRW_HEADER = "X-Requested-With"
+_XRW_VALUE = "finance-mcp"
+
+
+def _build_kwargs_json(body: dict, schema: dict[str, tuple]) -> dict:
+    """Coerce a JSON object into kwargs; raise ValueError on bad/missing input.
+
+    Mirrors ``_build_kwargs`` but reads a decoded JSON object instead of query
+    params. ``null`` and empty strings are treated as "not supplied" so the
+    callee's default applies; required params then raise.
+    """
+    kwargs: dict = {}
+    for name, (kind, required) in schema.items():
+        raw = body.get(name)
+        if raw is None or raw == "":
+            if required:
+                raise ValueError(f"missing required parameter: {name}")
+            continue
+        if not isinstance(raw, str):
+            raise ValueError(f"{name} must be a string")
+        kwargs[name] = _coerce_one(name, kind, raw)
+    return kwargs
+
+
+def handle_api_post(name: str, body) -> tuple[int, dict]:
+    """Dispatch one mutating API call. Returns (http_status, json_body).
+
+    Pure function (no socket) for unit-testing. Unknown endpoint -> 404; a body
+    that is not a JSON object or fails validation -> 400; a callee that reports
+    ``ok: False`` (e.g. no such bill) -> 400; an unexpected failure -> 500 with
+    the error class and message (the traceback goes to stderr, never the browser).
+    """
+    spec = _POST_ENDPOINTS.get(name)
+    if spec is None:
+        return 404, {"ok": False, "error": f"unknown endpoint: {name}"}
+    fn, schema = spec
+    if not isinstance(body, dict):
+        return 400, {"ok": False, "error": "request body must be a JSON object"}
+    try:
+        kwargs = _build_kwargs_json(body, schema)
+    except ValueError as exc:
+        return 400, {"ok": False, "error": str(exc)}
+    try:
+        result = fn(**kwargs)
+    except Exception as exc:  # boundary guard: keep the server thread alive
+        traceback.print_exc(file=sys.stderr)
+        return 500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    status = 200 if result.get("ok", True) else 400
+    return status, result
 # data, because a malicious page can point an attacker-controlled hostname at
 # 127.0.0.1 and fetch the API. We additionally require the request's Host header
 # to name a host we expect, and this check is ALWAYS enforced (it fails closed).
@@ -214,6 +297,12 @@ def _host_policy(bind_host: str, extra_hosts: tuple[str, ...] = ()) -> frozenset
 class _Handler(BaseHTTPRequestHandler):
     server_version = "finance-mcp-webui"
 
+    # Bound how long a single connection may keep a worker thread blocked on a
+    # slow or stalled client (e.g. a request that declares a Content-Length but
+    # dribbles or never sends the body). Without this, ThreadingHTTPServer would
+    # pin one thread per such connection indefinitely.
+    timeout = 30
+
     def log_message(self, fmt: str, *args) -> None:  # noqa: A002 - stdlib signature
         sys.stderr.write("[webui] " + (fmt % args) + "\n")
 
@@ -256,6 +345,98 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
     do_HEAD = do_GET
+
+    def _read_body(self, length: int) -> bytes | None:
+        """Read up to ``length`` body bytes under a single total deadline.
+
+        ``_Handler.timeout`` only bounds inactivity (it resets on every byte), so
+        a client dribbling one byte at a time could otherwise hold this worker
+        thread for ``length * timeout`` seconds. We instead enforce one
+        ``_BODY_DEADLINE`` budget across the entire read: before each chunk we
+        shrink the socket timeout to the time left, so no single read can block
+        past the deadline and the total read is bounded however the bytes arrive.
+
+        Returns the bytes read (possibly shorter than ``length`` if the peer
+        closed early — the caller rejects that as a short body). Returns ``None``
+        after sending a 408 if the deadline elapses or the socket errors, so the
+        caller must stop touching the connection.
+        """
+        deadline = time.monotonic() + _BODY_DEADLINE
+        chunks: list[bytes] = []
+        remaining = length
+        try:
+            while remaining > 0:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    self._send(408,
+                               b'{"ok": false, "error": "request body read timed out"}',
+                               "application/json; charset=utf-8")
+                    return None
+                # Cap this read so it cannot block past the overall deadline.
+                self.connection.settimeout(budget)
+                chunk = self.rfile.read1(min(remaining, 65536))
+                if not chunk:
+                    break  # peer closed early; caller sees a short body -> 400
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        except (TimeoutError, OSError):
+            # Slow/stalled client, or the peer dropped mid-body. Give up this
+            # connection rather than block the worker; nothing was written, so
+            # there is no partial state.
+            self._send(408, b'{"ok": false, "error": "request body read timed out"}',
+                       "application/json; charset=utf-8")
+            return None
+        finally:
+            # Restore the steady-state inactivity timeout for any further use of
+            # this connection (e.g. a keep-alive follow-up request).
+            self.connection.settimeout(self.timeout)
+        return b"".join(chunks)
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib signature
+        if not self._host_allowed():
+            # Reject foreign Host headers (DNS-rebinding) before touching data.
+            self._send(403, b"forbidden host", "text/plain; charset=utf-8")
+            return
+        # CSRF guard: a cross-site form cannot set this header, and a cross-site
+        # fetch that sets it triggers a preflight we never answer. Fail closed.
+        if self.headers.get(_XRW_HEADER) != _XRW_VALUE:
+            self._send(403, b"missing or bad X-Requested-With",
+                       "text/plain; charset=utf-8")
+            return
+        path = urlparse(self.path).path
+        if not path.startswith("/api/"):
+            self._send(404, b"not found", "text/plain; charset=utf-8")
+            return
+        name = path[len("/api/"):]
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+            if length < 0 or length > _MAX_BODY:
+                raise ValueError
+        except (TypeError, ValueError):
+            self._send(400, b'{"ok": false, "error": "missing or bad Content-Length"}',
+                       "application/json; charset=utf-8")
+            return
+        raw = b""
+        if length:
+            raw = self._read_body(length)
+            if raw is None:
+                # _read_body already sent a 408; the worker is freed.
+                return
+            if len(raw) != length:
+                # Peer closed after sending fewer bytes than it promised; treat
+                # the truncated body as a bad request rather than guessing.
+                self._send(400, b'{"ok": false, "error": "short request body"}',
+                           "application/json; charset=utf-8")
+                return
+        try:
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            self._send(400, b'{"ok": false, "error": "invalid JSON body"}',
+                       "application/json; charset=utf-8")
+            return
+        status, result = handle_api_post(name, body)
+        payload = json.dumps(result, default=str).encode("utf-8")
+        self._send(status, payload, "application/json; charset=utf-8")
 
 
 def serve(
@@ -370,12 +551,28 @@ INDEX_HTML = r"""<!DOCTYPE html>
           padding:10px 14px; min-width:120px; }
   .card .k { color:var(--muted); font-size:11px; }
   .card .v { font-size:18px; font-weight:600; }
+  button.mini { background:transparent; color:var(--accent); border:1px solid var(--line);
+                border-radius:6px; padding:3px 9px; cursor:pointer; font-size:12px; }
+  button.mini:hover { border-color:var(--accent); }
+  .overlay { position:fixed; inset:0; background:rgba(0,0,0,.55);
+             display:flex; align-items:center; justify-content:center; z-index:50; }
+  .modal { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:18px 20px; width:min(420px,92vw); }
+  .modal h3 { margin:0 0 4px; font-size:15px; }
+  .modal .name { color:var(--muted); font-size:12px; margin-bottom:14px;
+                 word-break:break-word; }
+  .modal label { display:flex; flex-direction:column; gap:4px; font-size:12px;
+                 color:var(--muted); margin-bottom:12px; }
+  .modal select, .modal input { background:var(--bg); color:var(--fg);
+        border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:13px; }
+  .modal .row { display:flex; gap:8px; justify-content:flex-end; margin-top:6px; }
+  .modal .hint { font-size:11px; color:var(--muted); margin:-6px 0 12px; }
 </style>
 </head>
 <body>
 <header>
   <h1>finance-mcp</h1>
-  <span class="sub">local review &middot; read-only</span>
+  <span class="sub">local review</span>
   <span class="sub" id="syncedAt"></span>
 </header>
 <nav id="tabs"></nav>
@@ -387,6 +584,28 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <pre id="raw"></pre>
   </details>
 </main>
+<div id="markOverlay" class="overlay" hidden>
+  <div class="modal">
+    <h3>Mark subscription</h3>
+    <div class="name" id="markName"></div>
+    <label>Status
+      <select id="markLifecycle">
+        <option value="active">active</option>
+        <option value="canceling">canceling (tried, unconfirmed)</option>
+        <option value="canceled">canceled (confirmed)</option>
+      </select>
+    </label>
+    <label>Cancellation effective date
+      <input type="date" id="markEffective">
+    </label>
+    <div class="hint" id="markHint">Required when canceling or canceled &mdash; any charge on or after this date is flagged as the bill coming back.</div>
+    <div id="markError" class="notice err" hidden></div>
+    <div class="row">
+      <button class="mini" onclick="closeMark()">Cancel</button>
+      <button class="go" id="markSave" onclick="submitMark()">Save</button>
+    </div>
+  </div>
+</div>
 <script>
 const TABS = [
   { id:"accounts",      label:"Accounts",      filters:[] },
@@ -441,6 +660,64 @@ function table(rows, cols) {
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 function pill(text, cls) { return `<span class="pill ${cls||''}">${esc(text)}</span>`; }
+
+// Tracked rows from the last subscriptions render, so the Mark button can look
+// up the row it belongs to by index without re-encoding the name into markup.
+let _trackedRows = [];
+let _markIdx = -1;
+
+function openMark(i) {
+  const r = _trackedRows[i];
+  if (!r) return;
+  _markIdx = i;
+  $("markName").textContent = r.name;
+  $("markLifecycle").value = r.lifecycle || "active";
+  $("markEffective").value = r.cancel_effective || "";
+  const err = $("markError"); err.hidden = true; err.textContent = "";
+  $("markOverlay").hidden = false;
+}
+
+function closeMark() {
+  $("markOverlay").hidden = true;
+  _markIdx = -1;
+}
+
+async function submitMark() {
+  const r = _trackedRows[_markIdx];
+  if (!r) { closeMark(); return; }
+  const lifecycle = $("markLifecycle").value;
+  const effective = $("markEffective").value;
+  const err = $("markError");
+  if (lifecycle !== "active" && !effective) {
+    err.textContent = "Pick a cancellation effective date for a canceling/canceled bill.";
+    err.hidden = false;
+    return;
+  }
+  const payload = { name: r.name, lifecycle };
+  if (lifecycle !== "active") payload.cancel_effective = effective;
+  const save = $("markSave");
+  save.disabled = true;
+  try {
+    const res = await fetch("/api/subscriptions/mark", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Requested-With": "finance-mcp" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      err.textContent = data.error || `Request failed (${res.status})`;
+      err.hidden = false;
+      return;
+    }
+    closeMark();
+    load();
+  } catch (e) {
+    err.textContent = `Request failed: ${e}`;
+    err.hidden = false;
+  } finally {
+    save.disabled = false;
+  }
+}
 
 function buildFilters() {
   const wrap = $("filters"); wrap.innerHTML = "";
@@ -619,7 +896,8 @@ const RENDER = {
     if (!sm.tracked) {
       out += `<p class="muted">No saved subscriptions yet &mdash; run <code>finance-mcp subscriptions detect</code> to save your recurring charges as a tracked list.</p>`;
     }
-    out += table(d.tracked||[], [
+    _trackedRows = d.tracked||[];
+    out += table(_trackedRows, [
       {label:"Subscription",get:r=>r.name},
       {label:"Envelope",get:r=>r.envelope||""},
       {label:"Amount",num:true,money:true,get:r=>r.amount},
@@ -634,6 +912,7 @@ const RENDER = {
         }
         return pill(r.status, r.status==="overdue"?"bad":r.status==="active"?"good":"warn");
       }},
+      {label:"",html:true,get:r=>`<button class="mini" onclick="openMark(${_trackedRows.indexOf(r)})">Mark&hellip;</button>`},
     ]);
     out += `<h2>Missing expected charges</h2>`;
     out += table(d.expected_missing||[], [

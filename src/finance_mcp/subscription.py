@@ -39,6 +39,8 @@ into two groups.
 
 from __future__ import annotations
 
+import contextlib
+import threading
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -1212,6 +1214,64 @@ def _amount_to_cents_or_none(value: object) -> int | None:
     return int(cents)
 
 
+# Serializes read-modify-write of the budget config so two markers cannot each
+# read the same starting file and have the later write silently drop the
+# earlier one's change (a lost update). The process-local lock covers the
+# threading web server's concurrent workers; an OS file lock, where available,
+# additionally serializes against a separate process (a CLI run or the MCP
+# server) writing the same file. The guard must wrap the whole read-through-
+# replace, not just the write, because the hazard is acting on a stale read.
+_CONFIG_WRITE_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _config_write_guard(path):
+    """Hold the config write lock across a full read-modify-write of ``path``.
+
+    The process-local lock serializes this process's own threads (the threaded
+    web server is the only concurrency this code itself creates). On POSIX an
+    exclusive ``flock`` on a sibling ``<path>.lock`` file additionally serializes
+    against a separate process — a CLI run or the MCP server writing the same
+    file. If that file lock cannot be taken on a platform that supports it, the
+    write fails loudly rather than silently dropping the cross-process guarantee.
+    A platform without ``fcntl`` falls back to process-local locking only (there
+    is no portable flock there); that still covers the in-process race.
+    """
+    import os
+
+    from . import budget_config
+
+    with _CONFIG_WRITE_LOCK:
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - non-POSIX has no flock
+            fcntl = None
+        lock_fd = None
+        if fcntl is not None:
+            try:
+                lock_fd = os.open(
+                    os.fspath(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600
+                )
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                if lock_fd is not None:
+                    os.close(lock_fd)
+                # Fail closed: this platform supports the cross-process lock but
+                # acquiring it errored, so we cannot promise serialization
+                # against another process. Refuse rather than write blind.
+                raise budget_config.BudgetConfigError(
+                    f"cannot acquire write lock for {path}: {exc}"
+                ) from exc
+        try:
+            yield
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+
+
 def _persist_config(path, raw: dict) -> None:
     """Validate ``raw`` as a budget config and atomically publish it to ``path``.
 
@@ -1284,78 +1344,79 @@ def merge_subscriptions_into_file(path, bills: list[dict]) -> dict:
 
     from . import budget_config
 
-    if path.exists():
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
+    with _config_write_guard(path):
+        if path.exists():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise budget_config.BudgetConfigError(
+                    f"budget config {path} is not valid JSON: {exc}"
+                ) from exc
+            except OSError as exc:
+                raise budget_config.BudgetConfigError(
+                    f"cannot read budget config {path}: {exc}"
+                ) from exc
+            if not isinstance(raw, dict):
+                raise budget_config.BudgetConfigError("budget config must be a JSON object")
+        else:
+            raw = {}
+        raw.setdefault("version", budget_config.SUPPORTED_VERSION)
+        raw.setdefault("envelopes", [])
+        existing = raw.setdefault("recurring", [])
+        if not isinstance(existing, list):
             raise budget_config.BudgetConfigError(
-                f"budget config {path} is not valid JSON: {exc}"
-            ) from exc
-        except OSError as exc:
-            raise budget_config.BudgetConfigError(
-                f"cannot read budget config {path}: {exc}"
-            ) from exc
-        if not isinstance(raw, dict):
-            raise budget_config.BudgetConfigError("budget config must be a JSON object")
-    else:
-        raw = {}
-    raw.setdefault("version", budget_config.SUPPORTED_VERSION)
-    raw.setdefault("envelopes", [])
-    existing = raw.setdefault("recurring", [])
-    if not isinstance(existing, list):
-        raise budget_config.BudgetConfigError(
-            "budget config 'recurring' must be a list"
-        )
+                "budget config 'recurring' must be a list"
+            )
 
-    # Each tracked bill recorded as (keyword tokens, lowercased name, amount in
-    # cents) so a proposal is only treated as a duplicate of one at the same price.
-    seen: list[tuple[frozenset[str], str, int | None]] = []
-    for entry in existing:
-        if isinstance(entry, dict):
-            key = _recurring_match_key(entry.get("match"))
-            name = entry.get("name")
-            name_l = name.strip().lower() if isinstance(name, str) else ""
-            seen.append((key, name_l, _amount_to_cents_or_none(entry.get("amount"))))
+        # Each tracked bill recorded as (keyword tokens, lowercased name, amount in
+        # cents) so a proposal is only treated as a duplicate of one at the same price.
+        seen: list[tuple[frozenset[str], str, int | None]] = []
+        for entry in existing:
+            if isinstance(entry, dict):
+                key = _recurring_match_key(entry.get("match"))
+                name = entry.get("name")
+                name_l = name.strip().lower() if isinstance(name, str) else ""
+                seen.append((key, name_l, _amount_to_cents_or_none(entry.get("amount"))))
 
-    def _already_tracked(key: frozenset[str], name_l: str, amount: int | None) -> bool:
-        # A proposal duplicates an existing bill only when both would match the
-        # same charge: same price AND keyword overlap (subset/superset, mirroring
-        # the audit's ``match_tokens <= charge tokens`` rule). A keyword match at a
-        # *different* amount is a distinct subscription (e.g. a second Apple plan)
-        # and must be kept; an unparseable amount (None) never compares equal, so
-        # it is never deduped away here — the final parse_config validation is what
-        # rejects a truly bad amount. The display name is only a *fallback* tie
-        # break, used when at least one side has no usable keyword (e.g. an
-        # existing envelope-only bill): two keyword-backed bills with disjoint
-        # keywords are distinct merchants even when their display names collide,
-        # which is common when the merchant lives in the payee under a generic
-        # description like "POS PURCHASE" — deduping those on name would silently
-        # drop a real second subscription.
-        for skey, sname, samount in seen:
-            if amount is None or samount is None or amount != samount:
-                continue
-            if key and skey:
-                if key <= skey or skey <= key:
+        def _already_tracked(key: frozenset[str], name_l: str, amount: int | None) -> bool:
+            # A proposal duplicates an existing bill only when both would match the
+            # same charge: same price AND keyword overlap (subset/superset, mirroring
+            # the audit's ``match_tokens <= charge tokens`` rule). A keyword match at a
+            # *different* amount is a distinct subscription (e.g. a second Apple plan)
+            # and must be kept; an unparseable amount (None) never compares equal, so
+            # it is never deduped away here — the final parse_config validation is what
+            # rejects a truly bad amount. The display name is only a *fallback* tie
+            # break, used when at least one side has no usable keyword (e.g. an
+            # existing envelope-only bill): two keyword-backed bills with disjoint
+            # keywords are distinct merchants even when their display names collide,
+            # which is common when the merchant lives in the payee under a generic
+            # description like "POS PURCHASE" — deduping those on name would silently
+            # drop a real second subscription.
+            for skey, sname, samount in seen:
+                if amount is None or samount is None or amount != samount:
+                    continue
+                if key and skey:
+                    if key <= skey or skey <= key:
+                        return True
+                    continue  # two distinct keywords -> distinct merchants, never dedup
+                if name_l and sname and name_l == sname:
                     return True
-                continue  # two distinct keywords -> distinct merchants, never dedup
-            if name_l and sname and name_l == sname:
-                return True
-        return False
+            return False
 
-    added: list[dict] = []
-    skipped: list[dict] = []
-    for bill in bills:
-        key = _recurring_match_key(bill.get("match"))
-        name_l = str(bill.get("name", "")).strip().lower()
-        amount = _amount_to_cents_or_none(bill.get("amount"))
-        if _already_tracked(key, name_l, amount):
-            skipped.append(bill)
-            continue
-        existing.append(bill)
-        seen.append((key, name_l, amount))
-        added.append(bill)
+        added: list[dict] = []
+        skipped: list[dict] = []
+        for bill in bills:
+            key = _recurring_match_key(bill.get("match"))
+            name_l = str(bill.get("name", "")).strip().lower()
+            amount = _amount_to_cents_or_none(bill.get("amount"))
+            if _already_tracked(key, name_l, amount):
+                skipped.append(bill)
+                continue
+            existing.append(bill)
+            seen.append((key, name_l, amount))
+            added.append(bill)
 
-    _persist_config(path, raw)
+        _persist_config(path, raw)
     return {
         "path": str(path),
         "added": len(added),
@@ -1398,69 +1459,70 @@ def set_bill_lifecycle(
         )
     lifecycle = lifecycle.strip().lower()
 
-    if not path.exists():
-        raise budget_config.BudgetConfigError(
-            f"budget config {path} does not exist; nothing to mark"
-        )
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise budget_config.BudgetConfigError(
-            f"budget config {path} is not valid JSON: {exc}"
-        ) from exc
-    except OSError as exc:
-        raise budget_config.BudgetConfigError(
-            f"cannot read budget config {path}: {exc}"
-        ) from exc
-    if not isinstance(raw, dict):
-        raise budget_config.BudgetConfigError("budget config must be a JSON object")
-
-    recurring = raw.get("recurring", [])
-    if not isinstance(recurring, list):
-        raise budget_config.BudgetConfigError(
-            "budget config 'recurring' must be a list"
-        )
-
-    target = name.strip().lower()
-    matches = [
-        entry
-        for entry in recurring
-        if isinstance(entry, dict)
-        and isinstance(entry.get("name"), str)
-        and entry["name"].strip().lower() == target
-    ]
-    if not matches:
-        raise budget_config.BudgetConfigError(
-            f"no recurring bill named {name!r} in {path}"
-        )
-    if len(matches) > 1:
-        raise budget_config.BudgetConfigError(
-            f"{len(matches)} recurring bills named {name!r} in {path}; "
-            "names must be unique to mark one"
-        )
-    entry = matches[0]
-
-    if lifecycle == "active":
-        # cancel_effective is meaningless for an active bill, so reactivating
-        # clears it; requiring the caller to pass none avoids a silent override.
-        if cancel_effective is not None:
+    with _config_write_guard(path):
+        if not path.exists():
             raise budget_config.BudgetConfigError(
-                "cancel_effective must be omitted when reactivating a bill"
+                f"budget config {path} does not exist; nothing to mark"
             )
-        entry.pop("lifecycle", None)
-        entry.pop("cancel_effective", None)
-    else:
-        if cancel_effective is None:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
             raise budget_config.BudgetConfigError(
-                f"cancel_effective (an ISO date) is required to mark a bill "
-                f"{lifecycle!r}"
-            )
-        entry["lifecycle"] = lifecycle
-        entry["cancel_effective"] = cancel_effective
+                f"budget config {path} is not valid JSON: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise budget_config.BudgetConfigError(
+                f"cannot read budget config {path}: {exc}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise budget_config.BudgetConfigError("budget config must be a JSON object")
 
-    # _persist_config re-validates, so a malformed cancel_effective is rejected
-    # here (as a structured error) before it can overwrite a working config.
-    _persist_config(path, raw)
+        recurring = raw.get("recurring", [])
+        if not isinstance(recurring, list):
+            raise budget_config.BudgetConfigError(
+                "budget config 'recurring' must be a list"
+            )
+
+        target = name.strip().lower()
+        matches = [
+            entry
+            for entry in recurring
+            if isinstance(entry, dict)
+            and isinstance(entry.get("name"), str)
+            and entry["name"].strip().lower() == target
+        ]
+        if not matches:
+            raise budget_config.BudgetConfigError(
+                f"no recurring bill named {name!r} in {path}"
+            )
+        if len(matches) > 1:
+            raise budget_config.BudgetConfigError(
+                f"{len(matches)} recurring bills named {name!r} in {path}; "
+                "names must be unique to mark one"
+            )
+        entry = matches[0]
+
+        if lifecycle == "active":
+            # cancel_effective is meaningless for an active bill, so reactivating
+            # clears it; requiring the caller to pass none avoids a silent override.
+            if cancel_effective is not None:
+                raise budget_config.BudgetConfigError(
+                    "cancel_effective must be omitted when reactivating a bill"
+                )
+            entry.pop("lifecycle", None)
+            entry.pop("cancel_effective", None)
+        else:
+            if cancel_effective is None:
+                raise budget_config.BudgetConfigError(
+                    f"cancel_effective (an ISO date) is required to mark a bill "
+                    f"{lifecycle!r}"
+                )
+            entry["lifecycle"] = lifecycle
+            entry["cancel_effective"] = cancel_effective
+
+        # _persist_config re-validates, so a malformed cancel_effective is rejected
+        # here (as a structured error) before it can overwrite a working config.
+        _persist_config(path, raw)
     return {
         "path": str(path),
         "name": entry["name"],

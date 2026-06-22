@@ -1368,8 +1368,13 @@ def test_merge_write_is_atomic_no_temp_leftover(tmp_path):
         path, [{"name": "Netflix", "match": "netflix", "amount": "15.99",
                 "cadence": "monthly", "day": 10}]
     )
-    # The atomic temp file is renamed into place, never left behind.
-    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "budget.json"]
+    # The atomic temp file is renamed into place, never left behind. The sibling
+    # ``.lock`` file (the cross-process write lock) is the only other expected
+    # artifact and is meant to persist.
+    leftovers = [
+        p.name for p in tmp_path.iterdir()
+        if p.name not in ("budget.json", "budget.json.lock")
+    ]
     assert leftovers == []
 
 
@@ -1821,3 +1826,70 @@ def test_came_back_is_scoped_to_audit_window_not_lookback():
     )
     assert len(including["came_back"]) == 1
     assert including["came_back"][0]["came_back_on"] == "2026-03-25"
+
+
+def test_concurrent_marks_do_not_lose_updates(tmp_path):
+    # The web server is threaded, and CLI/MCP write the same file. Two markers
+    # that each read the same starting config must not have the later write
+    # clobber the earlier one's change. Mark many distinct bills concurrently
+    # and assert every mark survived (this races and loses updates without the
+    # read-through-write lock).
+    import threading
+
+    names = [f"Bill{i}" for i in range(12)]
+    path = tmp_path / "budget.json"
+    path.write_text(json.dumps({
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [
+            {"name": n, "envelope": "Card", "amount": 5.00,
+             "cadence": "monthly", "day": 10, "match": n.lower()}
+            for n in names
+        ],
+    }), encoding="utf-8")
+
+    start = threading.Barrier(len(names))
+    errors: list[Exception] = []
+
+    def mark(n: str) -> None:
+        start.wait()
+        try:
+            subscription.set_bill_lifecycle(
+                path, n, "canceling", cancel_effective="2026-06-01"
+            )
+        except Exception as exc:  # noqa: BLE001 - surface in assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=mark, args=(n,)) for n in names]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, errors
+    cfg = budget_config.load_config(path)
+    marked = {b.name for b in cfg.recurring if b.lifecycle == "canceling"}
+    assert marked == set(names)
+
+
+def test_lock_acquisition_failure_fails_closed(tmp_path, monkeypatch):
+    # On a platform that supports the cross-process file lock, an error taking
+    # it must fail the write loudly rather than silently downgrade to
+    # process-local-only serialization (which would not guard another process).
+    import fcntl
+
+    path = tmp_path / "budget.json"
+    _seed_budget(path)
+
+    def boom(*_a, **_k):
+        raise OSError("no locks available")
+
+    monkeypatch.setattr(fcntl, "flock", boom)
+    with pytest.raises(budget_config.BudgetConfigError) as exc:
+        subscription.set_bill_lifecycle(
+            path, "Sketch", "canceling", cancel_effective="2026-06-01"
+        )
+    assert "lock" in str(exc.value).lower()
+    # The config was not modified by the refused write.
+    cfg = budget_config.load_config(path)
+    assert cfg.recurring[0].lifecycle == "active"
