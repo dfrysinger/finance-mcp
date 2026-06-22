@@ -154,6 +154,28 @@ def test_missing_budget_config_returns_structured_error(tmp_path, monkeypatch):
     assert "budget config" in body["error"]
 
 
+def test_subscriptions_endpoint_without_config_shows_candidates(tmp_path, monkeypatch):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("n1", "card", "-9.99", on="2026-01-05", desc="SPOTIFY"),
+            _txn("n2", "card", "-9.99", on="2026-02-05", desc="SPOTIFY"),
+            _txn("n3", "card", "-9.99", on="2026-03-05", desc="SPOTIFY"),
+        ]})
+    finally:
+        conn.close()
+    # No budget.json: subscriptions must still load and surface all detected
+    # recurring merchants rather than returning a config-not-found error.
+    status, body = webui.handle_api(
+        "subscriptions", {"start": ["2026-01-01"], "end": ["2026-05-31"]}
+    )
+    assert status == 200
+    assert body.get("ok") is not False
+    assert body["summary"]["tracked"] == 0
+    assert any("spotify" in c["merchant_key"] for c in body["candidate_new"])
+
+
 def test_unknown_param_is_ignored(tmp_path, monkeypatch):
     _seed_basic(monkeypatch, tmp_path)
     status, body = webui.handle_api("accounts", {"bogus": ["x"]})

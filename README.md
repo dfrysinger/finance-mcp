@@ -63,8 +63,19 @@ uv run finance-mcp rules add --pattern "trader joe" --category Groceries
 uv run finance-mcp rules rm --rule-id <id>           # remove a rule
 uv run finance-mcp set-category <txn_id> Travel      # pin one transaction's category
 uv run finance-mcp sync --days 120                    # refresh from SimpleFIN
+uv run finance-mcp subscriptions detect               # save recurring charges as a tracked list
+uv run finance-mcp subscriptions                      # audit: did tracked bills post? + new candidates
 uv run finance-mcp web                                # local read-only review UI in the browser
 ```
+
+`subscriptions detect` scans the archive for recurring monthly charges and saves
+them into the budget config so your subscriptions become a durable list rather
+than something re-inferred on every run; it is idempotent and skips merchants
+already tracked. `subscriptions` (audit) then reports any tracked bill that did
+not post in its cycle — a possible billing problem or cancellation — and surfaces
+untracked recurring merchants as candidates to add. A saved subscription needs
+no envelope budget: a `match` keyword pins it to its merchant. Detection is a
+heuristic starting point — review the saved list and remove any false positives.
 
 SimpleFIN caps a request at 90 days and expects <=24 requests/day, so `sync`
 chunks long ranges into <=89-day windows and you should rely on the archive for

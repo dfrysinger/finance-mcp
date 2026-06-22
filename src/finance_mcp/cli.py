@@ -447,7 +447,7 @@ def _cmd_allocation(args: argparse.Namespace) -> int:
 def _cmd_subscriptions(args: argparse.Namespace) -> int:
     from pathlib import Path
 
-    from . import budget_config, subscription
+    from . import budget_config, subscription, store
 
     try:
         start = _parse_date(args.start) if args.start else None
@@ -461,11 +461,69 @@ def _cmd_subscriptions(args: argparse.Namespace) -> int:
         return 1
 
     cfg_path = Path(args.config).expanduser() if args.config else config.budget_config_path()
-    try:
-        cfg = budget_config.load_config(cfg_path)
-    except budget_config.BudgetConfigError as exc:
-        print(f"Budget config error: {exc}", file=sys.stderr)
-        return 1
+
+    if args.action == "detect":
+        from datetime import date, timedelta
+
+        e = end or date.today()
+        s = start or (e - timedelta(days=subscription.DEFAULT_WINDOW_DAYS))
+        try:
+            view = store.load_archive_view()
+            existing_cfg = (
+                budget_config.load_config(cfg_path) if cfg_path.exists() else None
+            )
+            detected = subscription.detect_subscriptions(
+                view["transactions"], start=s, end=e,
+                min_occurrences=args.min_occurrences,
+                day_tolerance=args.day_tolerance,
+                config=existing_cfg,
+            )
+            summary = subscription.merge_subscriptions_into_file(cfg_path, detected["bills"])
+        except (ValueError, budget_config.BudgetConfigError) as exc:
+            print(f"Subscription detect error: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            summary["unsupported_cadence"] = [
+                sk for sk in detected["skipped"] if sk.get("kind") == "unsupported_cadence"
+            ]
+            summary["needs_review"] = [
+                sk for sk in detected["skipped"] if sk.get("kind") == "needs_review"
+            ]
+            print(json.dumps(summary, indent=2))
+            return 0
+        print(f"Detected subscriptions {s} -> {e} (saved to {summary['path']})")
+        print(f"  Added: {summary['added']}   Already tracked: {summary['already_tracked']}"
+              f"   Tracked total: {summary['tracked_total']}")
+        for b in summary["added_bills"]:
+            print(f"    + {b['name']}: ${b['amount']} on day {b['day']} (match {b['match']!r})")
+        unsupported = [
+            sk for sk in detected["skipped"] if sk.get("kind") == "unsupported_cadence"
+        ]
+        review = [
+            sk for sk in detected["skipped"] if sk.get("kind") == "needs_review"
+        ]
+        if unsupported:
+            print("  Not saved (only monthly bills can be tracked):")
+            for sk in unsupported:
+                print(f"    - {sk['merchant']} ({sk['cadence']})")
+        if review:
+            print("  Needs review (not auto-saved):")
+            for sk in review:
+                print(f"    - {sk['merchant']}: {sk['reason']}")
+        return 0
+
+    # action == "audit": with no config there are simply no tracked bills, and
+    # the audit still surfaces every untracked recurring merchant it finds.
+    if cfg_path.exists():
+        try:
+            cfg = budget_config.load_config(cfg_path)
+        except budget_config.BudgetConfigError as exc:
+            print(f"Budget config error: {exc}", file=sys.stderr)
+            return 1
+    else:
+        cfg = budget_config.BudgetConfig(
+            version=budget_config.SUPPORTED_VERSION, envelopes=()
+        )
 
     try:
         report = subscription.subscription_report(
@@ -696,6 +754,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_sub = sub.add_parser(
         "subscriptions",
         help="missing expected charges + candidate untracked recurring merchants",
+    )
+    p_sub.add_argument(
+        "action", nargs="?", choices=["audit", "detect"], default="audit",
+        help="'audit' (default) checks tracked bills and surfaces candidates; "
+             "'detect' saves detected recurring charges into the budget config",
     )
     p_sub.add_argument("--start", help="window start, as YYYY-MM-DD (default: a year back)")
     p_sub.add_argument("--end", help="window end, as YYYY-MM-DD (default: today)")

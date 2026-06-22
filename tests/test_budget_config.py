@@ -238,6 +238,24 @@ def test_bill_envelope_resolves_case_insensitively():
     assert cfg.recurring[0].envelope == "Groceries"
 
 
+def test_bill_without_envelope_but_with_match_parses():
+    # A standalone subscription needs no envelope: a match keyword pins it to its
+    # merchant so the audit can still tell whether it posted.
+    cfg = parse_config(_cfg(recurring=[
+        {"name": "Netflix", "amount": 15.99, "cadence": "monthly",
+         "day": 10, "match": "NETFLIX"}
+    ]))
+    assert cfg.recurring[0].envelope is None
+    assert cfg.recurring[0].match == "NETFLIX"
+
+
+def test_bill_with_neither_envelope_nor_match_is_rejected():
+    with pytest.raises(BudgetConfigError, match="needs either an 'envelope'"):
+        parse_config(_cfg(recurring=[
+            {"name": "Mystery", "amount": 10, "cadence": "monthly", "day": 5}
+        ]))
+
+
 def test_bill_amount_must_be_positive():
     with pytest.raises(BudgetConfigError, match="greater than zero"):
         parse_config(_cfg(recurring=[

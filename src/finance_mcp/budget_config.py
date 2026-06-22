@@ -53,20 +53,26 @@ class Envelope:
 
 @dataclass(frozen=True)
 class RecurringBill:
-    """One recurring outflow (a bill) due from an envelope each cycle.
+    """One recurring outflow (a bill), optionally tied to a paying envelope.
 
     ``envelope`` is the canonical name of the paying envelope, resolved at parse
-    time. ``day`` is the nominal day-of-month it is due (1–31); the projector
-    clamps it to each month's actual length. ``amount_cents`` is positive.
-    ``match`` is an optional keyword (normalized to tokens and matched as a
-    token-subset against a transaction's merchant identity — description and
-    payee only; ``memo`` is excluded except as a sole fallback when both are
-    empty) that pins the bill to its merchant so the subscription audit can
-    reliably tell whether the charge posted.
+    time, or ``None`` for a standalone subscription that is only watched for
+    posting and is not attributed to any budget envelope. ``day`` is the nominal
+    day-of-month it is due (1–31); the projector clamps it to each month's
+    actual length. ``amount_cents`` is positive. ``match`` is a keyword
+    (normalized to tokens and matched as a token-subset against a transaction's
+    merchant identity — description and payee only; ``memo`` is excluded except
+    as a sole fallback when both are empty) that pins the bill to its merchant so
+    the subscription audit can reliably tell whether the charge posted.
+
+    A bill must carry at least one of ``envelope`` or ``match``: with neither it
+    could not be matched to any charge. A bill with no ``envelope`` therefore
+    always has a ``match`` keyword (enforced at parse time), so it is matched by
+    merchant and never falls through to an envelope binding that does not exist.
     """
 
     name: str
-    envelope: str
+    envelope: str | None
     amount_cents: int
     cadence: str
     day: int
@@ -348,14 +354,24 @@ def _parse_recurring(
             raise BudgetConfigError(f"{where} must be an object")
         name = _require_name(raw.get("name"), where=where)
         ctx = f"recurring bill {name!r}"
+        match = _optional_match(raw.get("match"), where=ctx)
+        envelope = None
+        if raw.get("envelope") is not None:
+            envelope = resolve(raw.get("envelope"), where=ctx, field="envelope")
+        if envelope is None and match is None:
+            raise BudgetConfigError(
+                f"{ctx}: a recurring bill needs either an 'envelope' (to attribute "
+                "it to a budget and match it by account) or a 'match' keyword (to "
+                "match it by merchant); it has neither"
+            )
         bills.append(
             RecurringBill(
                 name=name,
-                envelope=resolve(raw.get("envelope"), where=ctx, field="envelope"),
+                envelope=envelope,
                 amount_cents=_money_to_cents(raw.get("amount"), where=ctx),
                 cadence=_require_cadence(raw.get("cadence"), where=ctx),
                 day=_require_day(raw.get("day"), where=ctx),
-                match=_optional_match(raw.get("match"), where=ctx),
+                match=match,
             )
         )
     return tuple(bills)

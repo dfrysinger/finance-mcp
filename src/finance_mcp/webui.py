@@ -416,6 +416,7 @@ const TABS = [
 ];
 
 let current = TABS[0];
+let DEFAULTS = {};
 const $ = (id) => document.getElementById(id);
 
 function money(v) {
@@ -459,7 +460,12 @@ function buildFilters() {
       el = document.createElement("input");
       el.type = f.type === "month" ? "month" : f.type;
       if (f.ph) el.placeholder = f.ph;
-      if (f.def !== undefined) el.value = f.def;
+      let def = f.def;
+      // A month filter with no explicit default lands on the archive's latest
+      // month (where the data actually is), so the view loads populated instead
+      // of on an empty month the browser would otherwise pick.
+      if (def === undefined && f.type === "month" && DEFAULTS.month) def = DEFAULTS.month;
+      if (def !== undefined) el.value = def;
     }
     el.id = "f_" + f.k;
     lab.appendChild(el); wrap.appendChild(lab);
@@ -605,6 +611,9 @@ const RENDER = {
       {label:"Last seen",get:r=>r.last_seen||"never"},
     ]);
     out += `<h2>Untracked recurring candidates</h2>`;
+    if (!sm.tracked) {
+      out += `<p class="muted">No saved subscriptions yet &mdash; every recurring charge below was detected from your history. Run <code>finance-mcp subscriptions detect</code> to save them as a tracked list so they aren't re-inferred each time.</p>`;
+    }
     out += table(d.candidate_new||[], [
       {label:"Merchant",get:r=>r.merchant},
       {label:"Amount",num:true,money:true,get:r=>r.amount},
@@ -657,7 +666,13 @@ function init() {
     b.onclick = () => selectTab(t);
     nav.appendChild(b);
   }
-  selectTab(TABS[0]);
+  // Learn the latest month present in the archive so month-filtered views
+  // (burn-down) default to where the data is. Best-effort: any failure just
+  // leaves the browser's own default in place.
+  fetch("/api/stats").then(r => r.json()).then(s => {
+    const latest = s && s.latest_transaction;
+    if (typeof latest === "string" && latest.length >= 7) DEFAULTS.month = latest.slice(0, 7);
+  }).catch(() => {}).finally(() => selectTab(TABS[0]));
 }
 init();
 </script>

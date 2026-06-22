@@ -187,6 +187,97 @@ def test_report_tool_missing_config_returns_error(tmp_path, monkeypatch):
     assert out["ok"] is False
 
 
+def test_subscription_audit_without_config_shows_candidates(tmp_path, monkeypatch):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("n1", "card", "-15.99", on="2026-01-10", desc="NETFLIX"),
+            _txn("n2", "card", "-15.99", on="2026-02-10", desc="NETFLIX"),
+            _txn("n3", "card", "-15.99", on="2026-03-10", desc="NETFLIX"),
+        ]})
+    finally:
+        conn.close()
+    # No budget.json exists. The audit must not error; it shows every detected
+    # recurring merchant as a candidate (tracked = 0).
+    out = server.subscription_audit_report(start="2026-01-01", end="2026-05-31")
+    assert out.get("ok") is not False
+    assert out["summary"]["tracked"] == 0
+    assert any("netflix" in c["merchant_key"] for c in out["candidate_new"])
+
+
+def test_subscriptions_detect_writes_and_then_tracks(tmp_path, monkeypatch):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("n1", "card", "-15.99", on="2026-01-10", desc="NETFLIX"),
+            _txn("n2", "card", "-15.99", on="2026-02-10", desc="NETFLIX"),
+            _txn("n3", "card", "-15.99", on="2026-03-10", desc="NETFLIX"),
+        ]})
+    finally:
+        conn.close()
+    det = server.subscriptions_detect(start="2026-01-01", end="2026-05-31")
+    assert det["ok"] is True
+    assert det["added"] == 1
+    assert config.budget_config_path().exists()
+    # Re-detect is idempotent: the already-tracked merchant is suppressed upstream
+    # (not re-proposed), so nothing is added and the saved bill is not duplicated.
+    again = server.subscriptions_detect(start="2026-01-01", end="2026-05-31")
+    assert again["added"] == 0
+    assert again["tracked_total"] == 1
+    # The audit now counts the saved subscription as tracked.
+    audit = server.subscription_audit_report(start="2026-01-01", end="2026-05-31")
+    assert audit["summary"]["tracked"] == 1
+
+
+def test_subscriptions_detect_accepts_day_tolerance(tmp_path, monkeypatch):
+    # The MCP tool exposes day_tolerance (matching the CLI) and forwards it; a
+    # valid value is accepted and an invalid (negative) one returns a structured
+    # error rather than raising.
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("n1", "card", "-15.99", on="2026-01-10", desc="NETFLIX"),
+            _txn("n2", "card", "-15.99", on="2026-02-10", desc="NETFLIX"),
+            _txn("n3", "card", "-15.99", on="2026-03-10", desc="NETFLIX"),
+        ]})
+    finally:
+        conn.close()
+    det = server.subscriptions_detect(
+        start="2026-01-01", end="2026-05-31", day_tolerance=3
+    )
+    assert det["ok"] is True
+    assert det["added"] == 1
+    bad = server.subscriptions_detect(
+        start="2026-01-01", end="2026-05-31", day_tolerance=-1
+    )
+    assert bad["ok"] is False
+
+
+def test_subscriptions_detect_splits_needs_review_from_unsupported_cadence(tmp_path, monkeypatch):
+    # A monthly merchant whose only shared key is card-network boilerplate
+    # ("VISA PURCHASE") cannot be auto-pinned. It must surface under
+    # needs_review (with a reason), NOT under unsupported_cadence — that key is
+    # reserved for weekly/yearly merchants.
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("v1", "card", "-12.00", on="2026-01-05", desc="VISA PURCHASE"),
+            _txn("v2", "card", "-12.00", on="2026-02-05", desc="VISA PURCHASE"),
+            _txn("v3", "card", "-12.00", on="2026-03-05", desc="VISA PURCHASE"),
+        ]})
+    finally:
+        conn.close()
+    det = server.subscriptions_detect(start="2026-01-01", end="2026-05-31")
+    assert det["ok"] is True
+    assert det["added"] == 0
+    assert det["unsupported_cadence"] == []
+    assert any("generic" in r["reason"] for r in det["needs_review"])
+
+
 # --- bad-input error paths (must return structured errors, not raise) ----------
 
 def test_budget_burndown_out_of_range_month_returns_error(tmp_path, monkeypatch):

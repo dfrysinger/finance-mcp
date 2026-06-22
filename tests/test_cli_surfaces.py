@@ -207,3 +207,46 @@ def test_subscriptions_bad_min_occurrences_errors(tmp_path, monkeypatch, capsys)
     rc = cli.main(["subscriptions", "--min-occurrences", "1", "--config", str(cfg)])
     assert rc == 1
     assert "Subscription audit error" in capsys.readouterr().err
+
+
+def test_subscriptions_detect_honors_day_tolerance(tmp_path, monkeypatch, capsys):
+    # An envelope-only bill due on day 1 should suppress same-merchant charges
+    # that post on day 10 only when --day-tolerance is wide enough to cover the
+    # 9-day drift. This pins the CLI wiring: detect must forward --day-tolerance,
+    # or suppression silently uses the default 7 and re-proposes a tracked bill.
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("n1", "card", "-15.99", on="2026-01-10", desc="NETFLIX"),
+            _txn("n2", "card", "-15.99", on="2026-02-10", desc="NETFLIX"),
+            _txn("n3", "card", "-15.99", on="2026-03-10", desc="NETFLIX"),
+            _txn("n4", "card", "-15.99", on="2026-04-10", desc="NETFLIX"),
+        ]})
+    finally:
+        conn.close()
+    budget = {
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [{"name": "Streaming", "envelope": "Card", "amount": 15.99,
+                       "cadence": "monthly", "day": 1}],
+    }
+
+    # Default tolerance (7d): the day-10 charges sit outside the day-1 bill's
+    # window, so they are NOT suppressed and detect proposes a duplicate.
+    narrow_cfg = tmp_path / "narrow.json"
+    narrow_cfg.write_text(json.dumps(budget), encoding="utf-8")
+    rc = cli.main(["subscriptions", "detect", "--start", "2026-01-01",
+                   "--end", "2026-05-31", "--config", str(narrow_cfg), "--json"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["added"] == 1
+
+    # Wide tolerance (10d): the 9-day drift is now within the bill's window, so
+    # the charges are suppressed and detect proposes nothing.
+    wide_cfg = tmp_path / "wide.json"
+    wide_cfg.write_text(json.dumps(budget), encoding="utf-8")
+    rc = cli.main(["subscriptions", "detect", "--start", "2026-01-01",
+                   "--end", "2026-05-31", "--day-tolerance", "10",
+                   "--config", str(wide_cfg), "--json"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["added"] == 0

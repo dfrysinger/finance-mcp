@@ -363,10 +363,19 @@ def subscription_audit_report(
         s, e = _parse_iso(start), _parse_iso(end)
     except ValueError as exc:
         return {"ok": False, "error": f"invalid date: {exc}"}
-    try:
-        cfg = _load_budget_config()
-    except budget_config.BudgetConfigError as exc:
-        return {"ok": False, "error": str(exc)}
+    # Subscriptions degrade gracefully: with no budget config there are no
+    # tracked bills, but the audit still surfaces every untracked recurring
+    # merchant it finds, so the view shows all detected subscriptions by default.
+    cfg_path = config.budget_config_path()
+    if cfg_path.exists():
+        try:
+            cfg = budget_config.load_config(cfg_path)
+        except budget_config.BudgetConfigError as exc:
+            return {"ok": False, "error": str(exc)}
+    else:
+        cfg = budget_config.BudgetConfig(
+            version=budget_config.SUPPORTED_VERSION, envelopes=()
+        )
     try:
         return subscription.subscription_report(
             cfg, start=s, end=e,
@@ -374,6 +383,66 @@ def subscription_audit_report(
         )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+def subscriptions_detect(
+    start: str | None = None,
+    end: str | None = None,
+    min_occurrences: int = 3,
+    day_tolerance: int = 7,
+) -> dict[str, Any]:
+    """Detect recurring charges from history and save them as tracked bills.
+
+    Scans the archive for merchants with repeated, same-amount, monthly-spaced
+    debits and writes each as a ``recurring`` bill in the budget config (creating
+    the config if absent), so your subscriptions become a saved list rather than
+    something re-inferred on every audit. Idempotent: a merchant already tracked
+    is skipped. Dates are YYYY-MM-DD; ``end`` defaults to today and ``start`` to
+    a year back. ``day_tolerance`` (default 7) is the day-of-month drift allowed
+    when deciding whether a charge is already covered by an existing bill.
+    Weekly/yearly merchants are reported under ``unsupported_cadence`` (only
+    monthly bills are tracked). Monthly merchants that could not be auto-tracked
+    — text too generic/variable to pin, or a recurring charge at a different
+    price from an already-tracked subscription — are reported under
+    ``needs_review`` (each with a ``reason``) rather than written.
+    """
+    from datetime import date, timedelta
+
+    from . import budget_config, store, subscription
+
+    try:
+        s, e = _parse_iso(start), _parse_iso(end)
+    except ValueError as exc:
+        return {"ok": False, "error": f"invalid date: {exc}"}
+    e = e or date.today()
+    s = s or (e - timedelta(days=subscription.DEFAULT_WINDOW_DAYS))
+    if e < s:
+        return {"ok": False, "error": f"end {e} is before start {s}"}
+    try:
+        view = store.load_archive_view()
+        cfg_path = config.budget_config_path()
+        existing_cfg = (
+            budget_config.load_config(cfg_path) if cfg_path.exists() else None
+        )
+        detected = subscription.detect_subscriptions(
+            view["transactions"], start=s, end=e, min_occurrences=min_occurrences,
+            day_tolerance=day_tolerance, config=existing_cfg,
+        )
+        summary = subscription.merge_subscriptions_into_file(
+            cfg_path, detected["bills"]
+        )
+    except (ValueError, budget_config.BudgetConfigError) as exc:
+        return {"ok": False, "error": str(exc)}
+    summary["ok"] = True
+    summary["unsupported_cadence"] = [
+        sk for sk in detected["skipped"] if sk.get("kind") == "unsupported_cadence"
+    ]
+    summary["needs_review"] = [
+        sk for sk in detected["skipped"] if sk.get("kind") == "needs_review"
+    ]
+    summary["window"] = {"start": s.isoformat(), "end": e.isoformat()}
+    return summary
 
 
 @mcp.tool()

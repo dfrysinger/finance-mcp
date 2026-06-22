@@ -140,10 +140,12 @@ when is it at risk." A deterministic running-balance projection over the calenda
 
 - **Recurring calendar in the config** (`budget_config.py`, same file). Two new
   sections, both forward-compatible (older readers ignore them):
-  - `recurring`: bills. Each binds a `name`, a paying `envelope` (must match an
-    existing envelope), a positive `amount` (whole cents), a `cadence`
-    (`monthly`), and a `day` (1–31, due day-of-month, clamped to each month's
-    length so 31 → Feb 28/29).
+  - `recurring`: bills. Each binds a `name`, an **optional** paying `envelope`
+    (when present it must match an existing envelope), a positive `amount` (whole
+    cents), a `cadence` (`monthly`), and a `day` (1–31, due day-of-month, clamped
+    to each month's length so 31 → Feb 28/29). The `envelope` is optional so a
+    pure subscription (tracked via a `match` keyword) needs no envelope budget;
+    parse rejects a bill that has neither an `envelope` nor a `match`.
   - `scheduled_transfers`: inflows into envelopes. Each has a `to` envelope, an
     optional `from` envelope, an `amount`, a `cadence`, and a `day`. **When
     `from` is set the transfer is internal** (e.g. paycheck hub → category
@@ -248,6 +250,29 @@ merchant. The keyword must contain at least one letter (a digits-only keyword
 like `"76"` normalizes to no token and would match nothing, so it is rejected at
 config-parse time).
 
+A subscription is not the same thing as an envelope budget. A recurring bill's
+`envelope` is therefore **optional**: a bill that carries a `match` keyword
+needs no envelope at all, so simply tracking "did Spotify post this month?"
+requires no envelope-budgeting setup. Config-parse enforces that every bill has
+at least one of `envelope` or `match` — a bill with neither could match nothing
+and is rejected loudly. This keeps the budget config the single source of truth:
+subscriptions and envelope bills live in the same `recurring` list rather than a
+second file.
+
+**Seeding the list (`subscriptions detect`).** Rather than re-inferring the
+subscription list on every audit, `detect_subscriptions` scans the archive for
+recurring **monthly** charges and `merge_subscriptions_into_file` saves them into
+the budget config as envelope-less bills. The saved `match` keyword is derived
+from the merchant's stable display name (not the volatile per-transaction token
+set used for grouping), so it keeps matching future charges. The merge is
+idempotent — a merchant already tracked by name or normalized match-key is
+skipped, existing bills are preserved — and the merged config is re-parsed before
+it is written, so a malformed result is never persisted. Only monthly cadence is
+saved; weekly/yearly candidates are returned as `skipped`/`unsupported_cadence`
+and still surface in the audit's candidate list. Detection is a heuristic
+starting point: it can propose false positives, so the saved list is meant to be
+reviewed and pruned.
+
 1. **Expected-but-missing** (deterministic). Each bill's monthly cadence is
    expanded over the window via the shared `budget_config.monthly_dates`. An
    occurrence is *matched* when a debit lands within `day_tolerance` days for the
@@ -275,7 +300,12 @@ config-parse time).
    the assistant an auditable candidate list to reason over.
 
 - **Window.** `subscription_report` defaults to a 365-day lookback so a monthly
-  subscription reliably clears `min_occurrences`. **Limitation:** an annual
+  subscription reliably clears `min_occurrences`. The window start is clamped
+  forward to the earliest transaction in the archive when the archive has data,
+  so a tracked bill is never reported `missing` for months that predate any
+  history (the audit would otherwise cry wolf on every cycle before the archive
+  began). With an empty archive there is no earliest date and a tracked bill is
+  still reported overdue. **Limitation:** an annual
   subscription posts at most once in that window and so will not surface as a
   candidate (it needs multiple years of history); a tracked annual bill is still
   checked for expected-but-missing normally.
@@ -403,9 +433,11 @@ A single user-supplied JSON file (default `~/.finance-mcp/budget.json`,
 
 - **Envelopes**: each binds a human name to one or more stable account ids and an
   optional monthly target. One account belongs to exactly one envelope.
-- **Recurring calendar** (added in Piece C): `recurring` bills (paying envelope,
-  amount, cadence, due day-of-month) and `scheduled_transfers` (an optional
-  source envelope, a destination envelope, amount, cadence, day). An internal
+- **Recurring calendar** (added in Piece C): `recurring` bills (an **optional**
+  paying envelope, amount, cadence, due day-of-month, and an optional `match`
+  keyword) and `scheduled_transfers` (an optional source envelope, a destination
+  envelope, amount, cadence, day). A bill needs at least one of an envelope or a
+  `match` keyword; an envelope-less bill is a tracked subscription. An internal
   transfer (with a source) is conserved as a paired debit/credit.
 
 This file is the SSOT for budget *intent*. It lives outside the repo (it is

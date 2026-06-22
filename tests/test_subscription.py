@@ -802,3 +802,501 @@ def test_e2e_report_no_archive_is_empty(tmp_path, monkeypatch):
     # No transactions at all -> the one March occurrence is overdue and missing.
     assert _names(report["expected_missing"], "expected_date") == ["2026-03-10"]
     assert report["candidate_new"] == []
+
+
+# --- detect_subscriptions + merge_subscriptions_into_file --------------------
+
+def _monthly(tid_prefix, account, amount, *, day, months, desc):
+    """Build one debit per month on the given day-of-month."""
+    out = []
+    for i, m in enumerate(months):
+        out.append(_txn(f"{tid_prefix}{i}", account, amount,
+                        on=f"2026-{m:02d}-{day:02d}", desc=desc))
+    return out
+
+
+def test_detect_subscriptions_proposes_monthly_bill():
+    txns = _monthly("nf", "card", "-15.99", day=10, months=[1, 2, 3, 4], desc="NETFLIX")
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    assert len(out["bills"]) == 1
+    bill = out["bills"][0]
+    assert bill["cadence"] == "monthly"
+    assert bill["amount"] == "15.99"
+    assert bill["day"] == 10
+    assert "netflix" in bill["match"]
+    # A proposed bill, having a match keyword, parses without any envelope.
+    cfg = _config([], [bill])
+    assert cfg.recurring[0].envelope is None
+
+
+def test_detect_does_not_repropose_merchant_covered_by_envelope_only_bill():
+    # An existing envelope-only bill (no match keyword, user-chosen name) already
+    # covers the NETFLIX charges via its envelope->account binding. Detect must
+    # NOT propose a second keyword bill for the same merchant, which would leave
+    # two bills competing for one charge and cry a false "missing" every cycle.
+    cfg = _config([CARD], [_bill("Streaming bundle", "Card", 15.99, 10)])
+    txns = _monthly("nf", "card", "-15.99", day=10, months=[1, 2, 3, 4],
+                    desc="NETFLIX")
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31), config=cfg
+    )
+    assert out["bills"] == []
+
+
+def test_detect_does_not_repropose_merchant_tracked_by_keyword_bill():
+    # Same merchant already tracked by a keyword bill on a different account is
+    # suppressed too (token-set suppression), regardless of where it posts.
+    cfg = _config([], [_bill("Netflix", None, 15.99, 10, match="netflix")])
+    txns = _monthly("nf", "card", "-15.99", day=10, months=[1, 2, 3, 4],
+                    desc="NETFLIX")
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31), config=cfg
+    )
+    assert out["bills"] == []
+
+
+def test_detect_skips_non_monthly_cadence():
+    # Weekly charges recur but are not a monthly bill the schema can track.
+    weekly = [
+        _txn(f"w{i}", "card", "-9.00", on=d, desc="GYM")
+        for i, d in enumerate(
+            ["2026-01-05", "2026-01-12", "2026-01-19", "2026-01-26", "2026-02-02"]
+        )
+    ]
+    out = subscription.detect_subscriptions(
+        weekly, start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    assert out["bills"] == []
+    assert any(s["cadence"] == "weekly" for s in out["skipped"])
+
+
+def test_merge_creates_file_when_absent(tmp_path):
+    path = tmp_path / "budget.json"
+    bills = [{"name": "Netflix", "match": "netflix", "amount": "15.99",
+              "cadence": "monthly", "day": 10}]
+    summary = subscription.merge_subscriptions_into_file(path, bills)
+    assert summary["added"] == 1
+    assert path.exists()
+    cfg = budget_config.load_config(path)
+    assert cfg.envelopes == ()
+    assert cfg.recurring[0].name == "Netflix"
+
+
+def test_merge_is_idempotent_on_match_keyword(tmp_path):
+    path = tmp_path / "budget.json"
+    bills = [{"name": "Netflix", "match": "netflix", "amount": "15.99",
+              "cadence": "monthly", "day": 10}]
+    subscription.merge_subscriptions_into_file(path, bills)
+    # Re-running with the same merchant (different display name) adds nothing.
+    again = subscription.merge_subscriptions_into_file(
+        path, [{"name": "NETFLIX.COM", "match": "netflix", "amount": "15.99",
+                "cadence": "monthly", "day": 10}]
+    )
+    assert again["added"] == 0
+    assert again["already_tracked"] == 1
+    assert again["tracked_total"] == 1
+
+
+def test_merge_dedup_is_subset_aware(tmp_path):
+    # The audit matcher treats a keyword as the same merchant when its token set
+    # is a subset OR superset of another's. Merge must dedup the same way, or a
+    # later run with a slightly different keyword would double-track the merchant
+    # and cry a false "missing-charge" alert every cycle.
+    path = tmp_path / "budget.json"
+    subscription.merge_subscriptions_into_file(
+        path, [{"name": "Netflix", "match": "netflix com", "amount": "15.99",
+                "cadence": "monthly", "day": 10}]
+    )
+    # A subset of the tracked keyword is the same merchant -> not added.
+    subset_run = subscription.merge_subscriptions_into_file(
+        path, [{"name": "Netflix monthly", "match": "netflix", "amount": "15.99",
+                "cadence": "monthly", "day": 10}]
+    )
+    assert subset_run["added"] == 0
+    assert subset_run["tracked_total"] == 1
+
+
+def test_merge_dedup_is_superset_aware(tmp_path):
+    # Reverse direction: a tracked minimal keyword suppresses a detected superset.
+    path = tmp_path / "budget.json"
+    subscription.merge_subscriptions_into_file(
+        path, [{"name": "Netflix", "match": "netflix", "amount": "15.99",
+                "cadence": "monthly", "day": 10}]
+    )
+    superset_run = subscription.merge_subscriptions_into_file(
+        path, [{"name": "NETFLIX.COM", "match": "netflix com", "amount": "15.99",
+                "cadence": "monthly", "day": 10}]
+    )
+    assert superset_run["added"] == 0
+    assert superset_run["tracked_total"] == 1
+
+
+def test_detect_match_key_is_group_intersection_not_widened_by_sibling():
+    # A merchant that recurs as the fuller "NETFLIX COM" (3x) plus a single
+    # sub-threshold "NETFLIX" charge: the saved keyword is the recurring group's
+    # own shared tokens ("com netflix"), NOT widened by the one-off sibling.
+    # Widening to "netflix" was tried and reverted: it collapses distinct
+    # same-amount merchants that share a generic prefix and can pin a keyword to a
+    # sibling on a different billing day. The bill matches all of its own grouped
+    # charges; a genuine descriptor change resurfaces as a new audit candidate.
+    txns = _monthly("nf", "card", "-15.99", day=10, months=[1, 2, 3],
+                    desc="NETFLIX COM")
+    txns += [_txn("nfx", "card", "-15.99", on="2026-04-10", desc="NETFLIX")]
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    assert len(out["bills"]) == 1
+    assert set(out["bills"][0]["match"].split()) == {"com", "netflix"}
+
+
+def test_detect_keyword_unaffected_by_disjoint_same_amount_oneoffs():
+    # Coincidental same-amount one-offs that share no token with the merchant's
+    # recurring form (a recurring "NETFLIX COM" plus disjoint one-offs "NETFLIX"
+    # and "COM") must not corrupt the saved keyword. It stays the recurring
+    # group's own shared tokens, and the merchant stays tracked.
+    txns = _monthly("nf", "card", "-15.99", day=10, months=[1, 2, 3],
+                    desc="NETFLIX COM")
+    txns += [
+        _txn("a", "card", "-15.99", on="2026-04-10", desc="NETFLIX"),
+        _txn("b", "card", "-15.99", on="2026-04-20", desc="COM"),
+    ]
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    assert len(out["bills"]) == 1
+    assert set(out["bills"][0]["match"].split()) == {"com", "netflix"}
+
+
+def test_detect_keeps_distinctive_token_when_generic_stray_shares_amount():
+    # Two distinct same-amount merchants ("POS PURCHASE / HULU" and
+    # "POS PURCHASE / DISNEY", both $9.99) plus a bare "POS PURCHASE" stray at the
+    # same amount. Each detected keyword must keep its own distinctive token and
+    # never collapse to the shared generic "pos purchase" — that keyword would
+    # false-match any $9.99 POS charge in the audit, and would make the two bills
+    # identical so amount-aware dedup silently drops the second. Both merchants
+    # must stay tracked with distinctive keywords.
+    txns = []
+    for i in (1, 2, 3):
+        h = _txn(f"h{i}", "card", "-9.99", on=f"2026-0{i}-05", desc="POS PURCHASE")
+        h["payee"] = "HULU"
+        d = _txn(f"d{i}", "card", "-9.99", on=f"2026-0{i}-20", desc="POS PURCHASE")
+        d["payee"] = "DISNEY"
+        txns += [h, d]
+    stray = _txn("g1", "card", "-9.99", on="2026-02-15", desc="POS PURCHASE")
+    txns.append(stray)
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    matches = sorted(b["match"] for b in out["bills"])
+    # Both merchants tracked, each keyword carries its distinctive token.
+    assert len(out["bills"]) == 2
+    assert any("hulu" in m.split() for m in matches)
+    assert any("disney" in m.split() for m in matches)
+    # Neither bill is pinned to the bare generic prefix.
+    assert all(set(m.split()) != {"pos", "purchase"} for m in matches)
+
+
+def test_merge_keeps_same_merchant_at_different_amounts(tmp_path):
+    # Two genuinely distinct subscriptions billed under one descriptor at
+    # different prices (e.g. two Apple plans) must both be tracked. The audit
+    # matches a charge by keyword AND amount, so same-keyword bills at different
+    # amounts do not compete; deduping them on keyword alone would silently drop
+    # the second and then hide it from future detection.
+    path = tmp_path / "budget.json"
+    subscription.merge_subscriptions_into_file(
+        path, [{"name": "Apple", "match": "apple bill", "amount": "0.99",
+                "cadence": "monthly", "day": 10}]
+    )
+    second = subscription.merge_subscriptions_into_file(
+        path, [{"name": "Apple", "match": "apple bill", "amount": "9.99",
+                "cadence": "monthly", "day": 10}]
+    )
+    assert second["added"] == 1
+    assert second["tracked_total"] == 2
+    # ...but re-running the same price stays idempotent (no duplicate).
+    third = subscription.merge_subscriptions_into_file(
+        path, [{"name": "Apple", "match": "apple bill", "amount": "9.99",
+                "cadence": "monthly", "day": 10}]
+    )
+    assert third["added"] == 0
+    assert third["tracked_total"] == 2
+
+
+def test_merge_keeps_distinct_keywords_under_same_generic_name(tmp_path):
+    # When the merchant lives in the payee under a generic description, detect
+    # names both bills by that generic display ("POS PURCHASE") but gives them
+    # distinct keywords. Same name + same amount must NOT dedup them away: the
+    # disjoint keywords prove they are different merchants. The display name is
+    # only a tie-break for a keyword-less (envelope-only) existing bill.
+    path = tmp_path / "budget.json"
+    subscription.merge_subscriptions_into_file(
+        path, [{"name": "POS PURCHASE", "match": "disney pos purchase",
+                "amount": "9.99", "cadence": "monthly", "day": 20}]
+    )
+    second = subscription.merge_subscriptions_into_file(
+        path, [{"name": "POS PURCHASE", "match": "hulu pos purchase",
+                "amount": "9.99", "cadence": "monthly", "day": 5}]
+    )
+    assert second["added"] == 1
+    assert second["tracked_total"] == 2
+    # An existing keyword-less (envelope-only) bill still dedups by name+amount.
+    env_path = tmp_path / "env.json"
+    env_path.write_text(json.dumps({
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [{"name": "Streaming", "envelope": "Card", "amount": 9.99,
+                       "cadence": "monthly", "day": 5}],
+    }), encoding="utf-8")
+    env_run = subscription.merge_subscriptions_into_file(
+        env_path, [{"name": "Streaming", "match": "netflix", "amount": "9.99",
+                    "cadence": "monthly", "day": 5}]
+    )
+    assert env_run["added"] == 0
+    assert env_run["tracked_total"] == 1
+
+
+def test_detect_match_key_includes_payee_merchant():
+    # Real-world shape: a generic description ("POS PURCHASE") with the merchant
+    # in the payee. The saved match must include the distinctive merchant token,
+    # not just the generic description tokens (which would match any same-amount
+    # POS purchase and hide a genuinely-missing charge).
+    txns = []
+    for i, m in enumerate([1, 2, 3, 4]):
+        t = _txn(f"nf{i}", "card", "-15.99", on=f"2026-{m:02d}-10",
+                 desc="POS PURCHASE")
+        t["payee"] = "NETFLIX"
+        txns.append(t)
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    assert len(out["bills"]) == 1
+    match_tokens = set(out["bills"][0]["match"].split())
+    assert "netflix" in match_tokens
+    # The saved bill is not the over-broad generic-only keyword.
+    assert match_tokens != {"pos", "purchase"}
+
+
+def test_detect_skips_merchant_with_no_common_token():
+    # A cluster whose charges share no token common to *all* of them (full-text
+    # "ALPHA BETA" one month, truncated "ALPHA" the next, "BETA" the next) cannot
+    # be pinned by any single keyword that still matches every one of its charges.
+    # Detect must skip auto-tracking it (with a reason) rather than fabricate a
+    # keyword that would miss the merchant's own charges and cry "missing".
+    txns = [
+        _txn("ab0", "card", "-5.00", on="2026-01-15", desc="ALPHA BETA"),
+        _txn("ab1", "card", "-5.00", on="2026-02-15", desc="ALPHA"),
+        _txn("ab2", "card", "-5.00", on="2026-03-15", desc="BETA"),
+    ]
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    assert out["bills"] == []
+    assert any("vary" in s["reason"] or "varies" in s["reason"]
+               for s in out["skipped"])
+
+
+def test_merge_wraps_filesystem_errors_as_config_error(tmp_path):
+    # A missing/unwritable parent directory must surface as BudgetConfigError so
+    # the CLI/server report a structured error, not an unhandled traceback.
+    path = tmp_path / "no-such-dir" / "budget.json"
+    with pytest.raises(budget_config.BudgetConfigError):
+        subscription.merge_subscriptions_into_file(
+            path, [{"name": "Netflix", "match": "netflix", "amount": "15.99",
+                    "cadence": "monthly", "day": 10}]
+        )
+
+
+def test_merge_write_is_atomic_no_temp_leftover(tmp_path):
+    path = tmp_path / "budget.json"
+    subscription.merge_subscriptions_into_file(
+        path, [{"name": "Netflix", "match": "netflix", "amount": "15.99",
+                "cadence": "monthly", "day": 10}]
+    )
+    # The atomic temp file is renamed into place, never left behind.
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "budget.json"]
+    assert leftovers == []
+
+
+def test_merge_preserves_existing_envelopes_and_bills(tmp_path):
+    path = tmp_path / "budget.json"
+    path.write_text(json.dumps({
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [{"name": "Spotify", "envelope": "Card", "amount": 9.99,
+                       "cadence": "monthly", "day": 3, "match": "spotify"}],
+    }), encoding="utf-8")
+    subscription.merge_subscriptions_into_file(
+        path, [{"name": "Netflix", "match": "netflix", "amount": "15.99",
+                "cadence": "monthly", "day": 10}]
+    )
+    cfg = budget_config.load_config(path)
+    assert {e.name for e in cfg.envelopes} == {"Card"}
+    assert {b.name for b in cfg.recurring} == {"Spotify", "Netflix"}
+
+
+def test_merge_rejects_malformed_existing_file_without_writing(tmp_path):
+    path = tmp_path / "budget.json"
+    path.write_text("not json", encoding="utf-8")
+    with pytest.raises(budget_config.BudgetConfigError):
+        subscription.merge_subscriptions_into_file(
+            path, [{"name": "X", "match": "x", "amount": "1.00",
+                    "cadence": "monthly", "day": 1}]
+        )
+    # The bad file is left untouched, not half-rewritten.
+    assert path.read_text(encoding="utf-8") == "not json"
+
+
+def test_report_clamps_window_to_earliest_transaction(tmp_path, monkeypatch):
+    # Archive data starts 2026-03-01, but the audit window opens 2026-01-01. The
+    # Jan/Feb occurrences predate all data and must NOT be reported missing
+    # (noise), while a genuine in-data gap still surfaces.
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("n1", "card", "-15.99", on="2026-03-10", desc="NETFLIX"),
+            # April is genuinely missing (data exists around it, charge does not).
+            _txn("n2", "card", "-15.99", on="2026-05-10", desc="NETFLIX"),
+            _txn("x1", "card", "-1.00", on="2026-04-15", desc="OTHER"),
+        ]})
+    finally:
+        conn.close()
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
+    report = subscription.subscription_report(
+        cfg, start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    missing = _names(report["expected_missing"], "expected_date")
+    # No pre-data Jan/Feb misses; the in-data April gap is still reported.
+    assert all(d >= "2026-03" for d in missing)
+    assert "2026-04-10" in missing
+    assert report["window"]["start"] == "2026-03-10"
+
+
+def test_detect_skips_subthreshold_merchant_that_only_recurs_via_generic_strays():
+    # A single distinctive charge ("POS PURCHASE / HULU", $9.99) plus two bare
+    # same-amount "POS PURCHASE" strays. The distinctive bucket is sub-threshold
+    # on its own and would only reach the occurrence threshold by folding the
+    # generic strays in -- but the resulting shared key collapses to the bare
+    # "pos purchase", which would false-match any $9.99 POS charge. Detect must
+    # NOT auto-pin a purely-generic keyword: it surfaces the cluster for review.
+    hulu = _txn("h0", "card", "-9.99", on="2026-01-05", desc="POS PURCHASE")
+    hulu["payee"] = "HULU"
+    strays = [
+        _txn("g0", "card", "-9.99", on="2026-02-05", desc="POS PURCHASE"),
+        _txn("g1", "card", "-9.99", on="2026-03-05", desc="POS PURCHASE"),
+    ]
+    out = subscription.detect_subscriptions(
+        [hulu, *strays], start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    # No bill is auto-pinned to the generic key.
+    assert all(set(b["match"].split()) != {"pos", "purchase"} for b in out["bills"])
+    assert out["bills"] == []
+    assert any("generic" in s["reason"] for s in out["skipped"])
+
+
+def test_detect_tracks_subthreshold_defrag_with_distinctive_token():
+    # The same structural shape as the generic-stray case, but the folded subset
+    # carries a distinctive token: a bare "NETFLIX" charge (sub-threshold) plus
+    # two "NETFLIX COM" charges defragment into one Netflix subscription. The
+    # shared key keeps the distinctive "netflix" token, so it pins reliably and
+    # IS tracked (the generic guard only rejects an all-boilerplate key).
+    bare = _txn("n0", "card", "-9.99", on="2026-01-10", desc="NETFLIX")
+    com = [
+        _txn("n1", "card", "-9.99", on="2026-02-10", desc="NETFLIX COM"),
+        _txn("n2", "card", "-9.99", on="2026-03-10", desc="NETFLIX COM"),
+    ]
+    out = subscription.detect_subscriptions(
+        [bare, *com], start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    assert len(out["bills"]) == 1
+    assert "netflix" in out["bills"][0]["match"].split()
+
+
+def test_detect_skips_card_network_boilerplate_key():
+    # "VISA PURCHASE" recurs monthly but its only shared token is the card
+    # network plus generic boilerplate -- pinning "purchase visa" would
+    # false-match unrelated $12 card charges. Detect must skip it for review,
+    # not auto-track, and tag it needs_review (it is monthly, not a cadence skip).
+    txns = _monthly("v", "card", "-12.00", day=5, months=[1, 2, 3, 4],
+                    desc="VISA PURCHASE")
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    assert out["bills"] == []
+    review = [s for s in out["skipped"] if s["kind"] == "needs_review"]
+    assert len(review) == 1
+    assert "generic" in review[0]["reason"]
+
+
+def test_detect_tags_unsupported_cadence_kind():
+    # Non-monthly (weekly) recurrence is a cadence the schema cannot track and is
+    # tagged unsupported_cadence -- distinct from monthly-but-unpinnable skips.
+    weekly = [
+        _txn(f"w{i}", "card", "-9.00", on=d, desc="GYM")
+        for i, d in enumerate(
+            ["2026-01-05", "2026-01-12", "2026-01-19", "2026-01-26", "2026-02-02"]
+        )
+    ]
+    out = subscription.detect_subscriptions(
+        weekly, start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    assert out["skipped"]
+    assert all(s["kind"] == "unsupported_cadence" for s in out["skipped"])
+
+
+def test_detect_surfaces_recurring_charge_at_different_price_for_review():
+    # An Apple sub is already tracked at $0.99. A *second* recurring run of Apple
+    # charges posts monthly at $9.99 (a price change, or a distinct second plan).
+    # It shares the tracked "apple" keyword, so it is suppressed from candidates
+    # and must NOT be auto-written (that would create a second competing bill).
+    # But silently dropping it would hide a real recurring charge -- so detect
+    # surfaces it under needs_review with the different-price reason.
+    cfg = _config([], [_bill("Apple iCloud", None, 0.99, 10, match="apple")])
+    txns = _monthly("ap", "card", "-9.99", day=10, months=[1, 2, 3, 4],
+                    desc="APPLE")
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31), config=cfg
+    )
+    assert out["bills"] == []
+    review = [s for s in out["skipped"] if s["kind"] == "needs_review"]
+    assert len(review) == 1
+    assert "different price" in review[0]["reason"]
+    assert "9.99" in review[0]["reason"]
+
+
+def test_detect_same_price_tracked_sub_not_flagged_for_review():
+    # The idempotent case: the recurring Apple charges post at the SAME $0.99 the
+    # tracked bill expects. They are consumed by the existing bill, so there is
+    # no price mismatch and nothing is surfaced for review.
+    cfg = _config([], [_bill("Apple iCloud", None, 0.99, 10, match="apple")])
+    txns = _monthly("ap", "card", "-0.99", day=10, months=[1, 2, 3, 4],
+                    desc="APPLE")
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31), config=cfg
+    )
+    assert out["bills"] == []
+    assert [s for s in out["skipped"] if s["kind"] == "needs_review"] == []
+
+
+def test_detect_surfaces_different_price_run_despite_descriptor_variation():
+    # The different-price run posts under two descriptors ("APPLE COM BILL" /
+    # "APPLE ICLOUD") that share the tracked "apple" keyword but differ in their
+    # other tokens. Grouping must key on the matched tracked keyword, not the raw
+    # token set -- otherwise the run fragments into sub-threshold buckets and the
+    # needs_review signal is silently dropped.
+    cfg = _config([], [_bill("Apple iCloud", None, 0.99, 10, match="apple")])
+    txns = [
+        _txn("a0", "card", "-9.99", on="2026-01-10", desc="APPLE COM BILL"),
+        _txn("a1", "card", "-9.99", on="2026-02-10", desc="APPLE ICLOUD"),
+        _txn("a2", "card", "-9.99", on="2026-03-10", desc="APPLE COM BILL"),
+        _txn("a3", "card", "-9.99", on="2026-04-10", desc="APPLE ICLOUD"),
+    ]
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31), config=cfg
+    )
+    assert out["bills"] == []
+    review = [s for s in out["skipped"] if s["kind"] == "needs_review"]
+    assert len(review) == 1
+    assert "9.99" in review[0]["reason"]

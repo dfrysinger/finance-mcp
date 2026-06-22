@@ -210,7 +210,12 @@ def _matches_bill(
         # genuinely-missing bill. An empty token set (a keyword that normalized
         # away) matches nothing rather than everything.
         return bool(match_tokens) and match_tokens <= charge.match_tokens
-    # No merchant keyword: fall back to the envelope the charge landed in.
+    # No merchant keyword: fall back to the envelope the charge landed in. A
+    # bill with no envelope and no keyword cannot match anything (parse rejects
+    # that combination), and a charge on no envelope (None) must not match a
+    # bill whose envelope is likewise None.
+    if bill.envelope is None:
+        return False
     return charge.envelope == bill.envelope
 
 
@@ -235,6 +240,109 @@ def _dollars(cents: int) -> str:
     sign = "-" if cents < 0 else ""
     whole, frac = divmod(abs(cents), 100)
     return f"{sign}{whole}.{frac:02d}"
+
+
+def _bill_token_sets(
+    config: BudgetConfig,
+) -> tuple[list[frozenset[str] | None], list[frozenset[str]], list[int]]:
+    """Per-bill keyword token sets, plus the keyword sets and amounts for review.
+
+    Returns ``(bill_token_sets, tracked_token_sets, tracked_amounts)``.
+    ``bill_token_sets`` is aligned with ``config.recurring`` and holds ``None``
+    for an envelope-only bill (no ``match`` keyword). ``tracked_token_sets`` is
+    the non-empty keyword sets, reused to keep a tracked subscription from
+    resurfacing as a "new" candidate. ``tracked_amounts`` is the parallel list of
+    those bills' amounts (in cents), used only to tell apart a charge that is the
+    *same* tracked subscription from one that shares the keyword at a *different*
+    price (a price change or a separate plan) — the latter is surfaced for review
+    rather than silently dropped. Suppression itself stays amount-blind: a
+    keyword-tracked merchant whose price changed must not be auto-written as a
+    second bill competing with the first. Token-anchored (not raw substring) so a
+    short keyword like "ATT" neither satisfies nor suppresses an unrelated
+    "BATTERY WORLD" charge.
+    """
+    bill_token_sets: list[frozenset[str] | None] = []
+    tracked_token_sets: list[frozenset[str]] = []
+    tracked_amounts: list[int] = []
+    for bill in config.recurring:
+        tokens = (
+            frozenset(_merchant_key(bill.match).split())
+            if bill.match is not None
+            else None
+        )
+        bill_token_sets.append(tokens)
+        if tokens:
+            tracked_token_sets.append(tokens)
+            tracked_amounts.append(bill.amount_cents)
+    return bill_token_sets, tracked_token_sets, tracked_amounts
+
+
+def _match_tracked_bills(
+    config: BudgetConfig,
+    charges: list[_Charge],
+    bill_token_sets: list[frozenset[str] | None],
+    *,
+    start: date,
+    end: date,
+    day_tolerance: int,
+    amount_tolerance_cents: int,
+    grace: int,
+) -> tuple[set[str], list[dict]]:
+    """Greedy-match each recurring bill's monthly occurrences against charges.
+
+    Returns ``(consumed, expected_missing)``. A charge is *consumed* by the
+    closest unconsumed in-tolerance occurrence (exact amount preferred, then
+    least date drift). An occurrence with no match is reported missing only once
+    it is genuinely overdue (outside the ``grace`` window). ``consumed`` does not
+    depend on ``grace`` — it is the set of charges already covered by a tracked
+    bill, which both the audit and detect use to avoid re-surfacing them.
+    """
+    consumed: set[str] = set()
+    expected_missing: list[dict] = []
+    for bill, bill_tokens in zip(config.recurring, bill_token_sets):
+        last_seen: date | None = None
+        for occ in monthly_dates(bill.day, start, end):
+            # Greedy earliest-first match: the closest unconsumed charge within
+            # tolerance, preferring an exact amount, then least date drift.
+            best: _Charge | None = None
+            best_key: tuple = ()
+            for charge in charges:
+                if charge.tid in consumed:
+                    continue
+                drift = abs((charge.on - occ).days)
+                if drift > day_tolerance:
+                    continue
+                if not _matches_bill(
+                    charge,
+                    bill,
+                    amount_tolerance_cents=amount_tolerance_cents,
+                    match_tokens=bill_tokens,
+                ):
+                    continue
+                exact = charge.amount_cents == bill.amount_cents
+                cand_key = (not exact, drift, charge.tid)
+                if best is None or cand_key < best_key:
+                    best, best_key = charge, cand_key
+            if best is not None:
+                consumed.add(best.tid)
+                if last_seen is None or best.on > last_seen:
+                    last_seen = best.on
+                continue
+            # No charge matched. Only call it missing once it is genuinely
+            # overdue; an occurrence still inside the grace window may post late.
+            if (end - occ).days < grace:
+                continue
+            expected_missing.append(
+                {
+                    "name": bill.name,
+                    "envelope": bill.envelope,
+                    "expected_amount": _dollars(bill.amount_cents),
+                    "expected_date": occ.isoformat(),
+                    "match": bill.match,
+                    "last_seen": last_seen.isoformat() if last_seen is not None else None,
+                }
+            )
+    return consumed, expected_missing
 
 
 def subscription_audit(
@@ -280,60 +388,18 @@ def subscription_audit(
     expected_missing: list[dict] = []
     # Per-bill keyword token sets (None for an envelope-only bill). The non-None
     # sets are reused as `tracked_token_sets` to keep a tracked subscription from
-    # resurfacing as a "new" candidate. Token-anchored (not raw substring) in
-    # BOTH directions so a short keyword like "ATT" neither satisfies nor
-    # suppresses an unrelated "BATTERY WORLD" charge.
-    bill_token_sets: list[frozenset[str] | None] = []
-    tracked_token_sets: list[frozenset[str]] = []
-    for bill in config.recurring:
-        tokens = frozenset(_merchant_key(bill.match).split()) if bill.match is not None else None
-        bill_token_sets.append(tokens)
-        if tokens:
-            tracked_token_sets.append(tokens)
-
-    for bill, bill_tokens in zip(config.recurring, bill_token_sets):
-        last_seen: date | None = None
-        for occ in monthly_dates(bill.day, start, end):
-            # Greedy earliest-first match: the closest unconsumed charge within
-            # tolerance, preferring an exact amount, then least date drift.
-            best: _Charge | None = None
-            best_key: tuple = ()
-            for charge in charges:
-                if charge.tid in consumed:
-                    continue
-                drift = abs((charge.on - occ).days)
-                if drift > day_tolerance:
-                    continue
-                if not _matches_bill(
-                    charge,
-                    bill,
-                    amount_tolerance_cents=amount_tolerance_cents,
-                    match_tokens=bill_tokens,
-                ):
-                    continue
-                exact = charge.amount_cents == bill.amount_cents
-                cand_key = (not exact, drift, charge.tid)
-                if best is None or cand_key < best_key:
-                    best, best_key = charge, cand_key
-            if best is not None:
-                consumed.add(best.tid)
-                if last_seen is None or best.on > last_seen:
-                    last_seen = best.on
-                continue
-            # No charge matched. Only call it missing once it is genuinely
-            # overdue; an occurrence still inside the grace window may post late.
-            if (end - occ).days < grace:
-                continue
-            expected_missing.append(
-                {
-                    "name": bill.name,
-                    "envelope": bill.envelope,
-                    "expected_amount": _dollars(bill.amount_cents),
-                    "expected_date": occ.isoformat(),
-                    "match": bill.match,
-                    "last_seen": last_seen.isoformat() if last_seen is not None else None,
-                }
-            )
+    # resurfacing as a "new" candidate.
+    bill_token_sets, tracked_token_sets, _ = _bill_token_sets(config)
+    consumed, expected_missing = _match_tracked_bills(
+        config,
+        charges,
+        bill_token_sets,
+        start=start,
+        end=end,
+        day_tolerance=day_tolerance,
+        amount_tolerance_cents=amount_tolerance_cents,
+        grace=grace,
+    )
 
     candidate_new = _candidate_new(
         charges,
@@ -412,6 +478,31 @@ def _merge_subset_buckets(
     return merged
 
 
+# Structural payment/banking tokens that are never a merchant identity on their
+# own — bank-printed boilerplate like "POS PURCHASE", "DEBIT CARD", "ACH". A
+# detected keyword built ONLY from these would false-match unrelated charges at
+# the same price, so a candidate whose entire shared key is generic is surfaced
+# for manual review instead of auto-pinned. Only an all-generic key is rejected:
+# a key that still carries a distinctive token (e.g. {"pos","purchase","hulu"})
+# pins reliably and is kept.
+_GENERIC_MERCHANT_TOKENS = frozenset(
+    {
+        "pos", "purchase", "debit", "credit", "card", "checkcard", "ckcd",
+        "payment", "pmt", "bill", "billpay", "autopay", "auth", "preauth",
+        "authorized", "transaction", "trans", "txn", "ach", "eft", "dda",
+        "withdrawal", "deposit", "recurring", "www", "com",
+        # Card-network names are boilerplate too: a key like "visa purchase" is
+        # no more pinnable than "pos purchase".
+        "visa", "mastercard", "mc", "amex", "discover",
+    }
+)
+
+
+def _all_generic(tokens: frozenset[str] | set[str]) -> bool:
+    """True when every token is structural banking boilerplate (no merchant identity)."""
+    return bool(tokens) and tokens <= _GENERIC_MERCHANT_TOKENS
+
+
 def _candidate_new(
     charges: list[_Charge],
     *,
@@ -442,10 +533,12 @@ def _candidate_new(
             continue
         # A charge already covered by a tracked bill keyword is not "new" — even
         # if its amount drifted out of match tolerance and it wasn't consumed.
-        # Tested against the charge's merchant-identity tokens (description +
-        # payee) so a keyword living in the payee still suppresses it, and
-        # token-subset (not raw substring) so only a genuine merchant overlap
-        # suppresses it.
+        # Suppression is amount-blind on purpose: a keyword-tracked merchant
+        # whose price changed must not resurface as a new candidate (which detect
+        # would write as a second bill competing with the first). Tested against
+        # the charge's merchant-identity tokens (description + payee) so a keyword
+        # living in the payee still suppresses it, and token-subset (not raw
+        # substring) so only a genuine merchant overlap suppresses it.
         if any(ts <= charge.match_tokens for ts in tracked_token_sets):
             continue
         buckets.setdefault((charge.amount_cents, charge.match_tokens), []).append(charge)
@@ -473,10 +566,31 @@ def _candidate_new(
     for (amount_cents, tokens), members in groups.items():
         dates, median_gap, cadence = _summarize_group(members)
         merchant_key = " ".join(sorted(tokens))
+        # The stable match key is the identity tokens shared by *every* charge in
+        # the group: it is a subset of each member, so it is guaranteed to match
+        # every grouped charge (the audit matches a keyword by token-subset) on
+        # the group's own billing day, and it drops per-charge volatile tokens
+        # (auth codes, store ids) that appear on only some rows. It is derived
+        # only from the group's own recurring members — never widened by a
+        # sub-threshold sibling at the same amount, because doing so can (a)
+        # collapse two distinct same-amount merchants that share a generic prefix
+        # (e.g. "POS PURCHASE / HULU" and "POS PURCHASE / DISNEY") down to the
+        # bare "pos purchase", which then false-matches unrelated charges, and (b)
+        # pin a keyword to a sibling charge that posts on a different day than the
+        # group, producing a false "missing" the keyword-suppression would then
+        # hide. A merchant that genuinely changes its descriptor surfaces as a new
+        # candidate in the audit rather than being mis-pinned here. When the group
+        # itself has no token common to all members (a genuinely disjoint cluster),
+        # this is empty and the merchant cannot be pinned by any single subset
+        # keyword — the caller skips auto-tracking it rather than fabricate a
+        # keyword that would miss the merchant's own charges and cry "missing".
+        shared = frozenset.intersection(*(m.match_tokens for m in members))
+        match_key = " ".join(sorted(shared))
         candidates.append(
             {
                 "merchant": _representative_merchant(members),
                 "merchant_key": merchant_key,
+                "match_key": match_key,
                 "amount": _dollars(amount_cents),
                 "occurrences": len(members),
                 "first_seen": dates[0].isoformat(),
@@ -496,6 +610,73 @@ def _candidate_new(
         )
     )
     return candidates
+
+
+def _tracked_amount_mismatch(
+    charges: list[_Charge],
+    *,
+    consumed: set[str],
+    tracked_token_sets: list[frozenset[str]],
+    tracked_amounts: list[int],
+    min_occurrences: int,
+    window_start: date,
+) -> list[dict]:
+    """Recurring charges that share a tracked keyword but post at a *different* price.
+
+    A charge whose merchant tokens match an existing keyword bill is suppressed
+    from the "new merchant" candidates (so detect never auto-writes a second bill
+    competing with the tracked one). But a *recurring* run of such charges at a
+    price that matches NONE of the same-keyword tracked bills is a real signal —
+    either the tracked subscription's price changed, or the user has a distinct
+    second plan under the same merchant. Rather than silently drop it, surface it
+    for the user to resolve. Returns one entry per recurring monthly group; never
+    written automatically. A charge at the *same* price as a tracked bill (just
+    off-cadence) is not a mismatch and is left out.
+    """
+    if not tracked_token_sets:
+        return []
+    buckets: dict[tuple[int, frozenset[str]], list[_Charge]] = {}
+    for charge in charges:
+        if charge.tid in consumed:
+            continue
+        if charge.on < window_start:
+            continue
+        if not charge.match_tokens:
+            continue
+        matched = [
+            (tokens, amount)
+            for tokens, amount in zip(tracked_token_sets, tracked_amounts)
+            if tokens <= charge.match_tokens
+        ]
+        if not matched:
+            continue  # not a tracked merchant — handled by normal candidate path
+        if any(amount == charge.amount_cents for _tokens, amount in matched):
+            continue  # same price as a tracked bill — the tracked sub, not a mismatch
+        # Group by the matched tracked keyword(s), not the full charge token set:
+        # the descriptor varies between postings of one merchant ("APPLE COM BILL"
+        # vs "APPLE ICLOUD"), and keying on the raw tokens would fragment a single
+        # recurring run into sub-threshold buckets and silently drop the signal.
+        # The tracked keyword is the merchant identity we already matched on.
+        matched_key = frozenset().union(*(tokens for tokens, _amount in matched))
+        buckets.setdefault((charge.amount_cents, matched_key), []).append(charge)
+
+    out: list[dict] = []
+    for (amount_cents, _tokens), members in buckets.items():
+        if not _recurs(members, min_occurrences):
+            continue
+        _, _, cadence = _summarize_group(members)
+        if cadence != "monthly":
+            continue
+        out.append(
+            {
+                "merchant": _representative_merchant(members),
+                "amount": _dollars(amount_cents),
+                "cadence": cadence,
+                "occurrences": len(members),
+            }
+        )
+    out.sort(key=lambda m: (m["merchant"], m["amount"]))
+    return out
 
 
 def _representative_merchant(members: list[_Charge]) -> str:
@@ -533,6 +714,13 @@ def subscription_report(
     subscription reliably clears ``min_occurrences``. The categorized
     transactions are read from the durable archive (falling back to the JSON
     cache when no archive exists yet).
+
+    When the archive holds transactions, the audit start is clamped forward to
+    the earliest transaction date: occurrences before any data exists could only
+    ever be reported "missing" because there is nothing to match them, which is
+    noise, not a billing signal. (With an empty archive there is no earliest
+    date, so a tracked bill is still reported overdue — the absence of the charge
+    is the signal in that case.)
     """
     from . import store
 
@@ -540,9 +728,13 @@ def subscription_report(
     start = start or (end - timedelta(days=DEFAULT_WINDOW_DAYS))
 
     view = store.load_archive_view()
+    transactions = view["transactions"]
+    earliest = _earliest_txn_date(transactions)
+    if earliest is not None and earliest > start:
+        start = min(earliest, end)
     return subscription_audit(
         config,
-        view["transactions"],
+        transactions,
         start=start,
         end=end,
         day_tolerance=day_tolerance,
@@ -550,3 +742,350 @@ def subscription_report(
         min_occurrences=min_occurrences,
         grace_days=grace_days,
     )
+
+
+def _earliest_txn_date(transactions: list[dict]) -> date | None:
+    """The earliest parseable posted date across ``transactions`` (or None)."""
+    earliest: date | None = None
+    for txn in transactions:
+        on = _txn_date(txn)
+        if on is not None and (earliest is None or on < earliest):
+            earliest = on
+    return earliest
+
+
+def detect_subscriptions(
+    transactions: list[dict],
+    *,
+    start: date,
+    end: date,
+    min_occurrences: int = DEFAULT_MIN_OCCURRENCES,
+    day_tolerance: int = DEFAULT_DAY_TOLERANCE,
+    config: BudgetConfig | None = None,
+) -> dict:
+    """Propose tracked recurring bills from observed history.
+
+    Runs the same untracked-candidate detection the audit uses, then shapes each
+    monthly-cadence candidate into a ``recurring`` bill dict ready to drop into a
+    budget config: ``name`` (the representative merchant), ``match`` (the tokens
+    shared by every observed charge, so the bill is pinned by merchant and needs
+    no envelope), ``amount`` (the group's stable price), ``cadence`` (always
+    ``"monthly"`` here), and ``day`` (the nominal day-of-month, taken from the
+    most recent occurrence so it reflects the current billing date).
+
+    When ``config`` is supplied, a merchant already covered by an existing bill
+    is NOT re-proposed: charges consumed by the existing recurring bills (whether
+    pinned by a ``match`` keyword *or* by an envelope→account binding) are
+    excluded exactly as the audit excludes them, and existing keyword token sets
+    suppress their merchant from the candidate list. This keeps detect from
+    adding a second, differently-named bill for a merchant the user already
+    tracks — which would leave two bills competing for one charge and cry a false
+    "missing" alert every cycle.
+
+    Only monthly merchants become bills because ``monthly`` is the one cadence
+    the budget's recurring schema and projector support today; weekly/yearly
+    merchants are returned under ``"skipped"`` (each tagged ``kind:
+    "unsupported_cadence"``) so the caller can report them rather than write an
+    unsupported cadence that parsing would reject. A monthly merchant whose
+    charges share no common identity token, or whose only shared key is
+    structural banking boilerplate (e.g. "pos purchase") that would false-match
+    unrelated charges, is also skipped (``kind: "needs_review"``) rather than
+    auto-tracked under a keyword that cannot reliably pin it. Finally, a recurring
+    run of charges that shares a tracked bill's keyword but posts at a *different*
+    price (a price change, or a distinct second plan under the same merchant) is
+    surfaced under ``kind: "needs_review"`` instead of being silently dropped —
+    detect never auto-writes it (that would create a second competing bill), but
+    the user is told so they can update the amount or add a separate bill. Pure:
+    all evidence is supplied; nothing is read from disk or written.
+    """
+    if end < start:
+        raise ValueError(f"end {end} is before start {start}")
+    if day_tolerance < 0:
+        raise ValueError(f"day_tolerance must be >= 0, got {day_tolerance}")
+    cfg = config if config is not None else BudgetConfig(
+        version=0, envelopes=(), recurring=(), scheduled_transfers=()
+    )
+    # Build charges over the audit's leading-edge-widened window so a charge near
+    # the window start still groups with its merchant. Account identity comes from
+    # the existing config so an envelope-only bill can consume a charge that posted
+    # to one of its accounts.
+    charges = _charges(
+        transactions,
+        cfg.account_index(),
+        start=start - timedelta(days=day_tolerance),
+        end=end,
+    )
+    # Exclude charges already covered by an existing tracked bill (keyword- OR
+    # envelope-pinned), and suppress those merchants from the candidate list, so
+    # an already-tracked subscription is never proposed a second time. consumed is
+    # grace-independent, so grace_days is immaterial here.
+    bill_token_sets, tracked_token_sets, tracked_amounts = _bill_token_sets(cfg)
+    consumed, _ = _match_tracked_bills(
+        cfg,
+        charges,
+        bill_token_sets,
+        start=start,
+        end=end,
+        day_tolerance=day_tolerance,
+        amount_tolerance_cents=0,
+        grace=day_tolerance,
+    )
+    candidates = _candidate_new(
+        charges,
+        consumed=consumed,
+        tracked_token_sets=tracked_token_sets,
+        min_occurrences=min_occurrences,
+        window_start=start,
+    )
+    bills: list[dict] = []
+    skipped: list[dict] = []
+    for cand in candidates:
+        if cand["cadence"] != "monthly":
+            skipped.append(
+                {
+                    "merchant": cand["merchant"],
+                    "cadence": cand["cadence"],
+                    "kind": "unsupported_cadence",
+                    "reason": "only monthly bills can be tracked in the budget config",
+                }
+            )
+            continue
+        if not cand["match_key"]:
+            # No token is common to all of this merchant's observed charges, so no
+            # single keyword can pin it without missing some of its own charges.
+            # Surface it for the user to handle rather than auto-track unreliably.
+            skipped.append(
+                {
+                    "merchant": cand["merchant"],
+                    "cadence": cand["cadence"],
+                    "kind": "needs_review",
+                    "reason": "merchant text varies too much to pin with one keyword",
+                }
+            )
+            continue
+        if _all_generic(frozenset(cand["match_key"].split())):
+            # The only key common to every charge is structural banking
+            # boilerplate (e.g. "pos purchase") — pinning it would false-match
+            # unrelated charges at the same price. Surface for manual review
+            # rather than auto-track an over-broad keyword.
+            skipped.append(
+                {
+                    "merchant": cand["merchant"],
+                    "cadence": cand["cadence"],
+                    "kind": "needs_review",
+                    "reason": "merchant text is too generic to pin with one keyword",
+                }
+            )
+            continue
+        bills.append(
+            {
+                "name": cand["merchant"],
+                "match": cand["match_key"],
+                "amount": cand["amount"],
+                "cadence": "monthly",
+                "day": date.fromisoformat(cand["last_seen"]).day,
+            }
+        )
+    # A recurring charge that shares a tracked keyword but posts at a different
+    # price is not a "new merchant" (it's suppressed above) yet must not vanish:
+    # surface it for review so the user can update the bill amount or add a second
+    # bill. Never auto-written here.
+    for mismatch in _tracked_amount_mismatch(
+        charges,
+        consumed=consumed,
+        tracked_token_sets=tracked_token_sets,
+        tracked_amounts=tracked_amounts,
+        min_occurrences=min_occurrences,
+        window_start=start,
+    ):
+        skipped.append(
+            {
+                "merchant": mismatch["merchant"],
+                "cadence": mismatch["cadence"],
+                "kind": "needs_review",
+                "reason": (
+                    f"a recurring charge of ${mismatch['amount']} matches an "
+                    "already-tracked subscription's keyword but at a different "
+                    "price — review whether this is a price change or a separate "
+                    "subscription"
+                ),
+            }
+        )
+    return {"bills": bills, "skipped": skipped}
+
+
+def _recurring_match_key(match_text: object) -> frozenset[str]:
+    """Normalized token set for a recurring bill's ``match`` keyword.
+
+    Reuses the same merchant normalization the audit matches with, so two
+    spellings of one merchant collapse to one key and re-running detect is
+    idempotent. A non-string or empty keyword yields an empty set (never tracked
+    as a duplicate of a real keyword)."""
+    if not isinstance(match_text, str):
+        return frozenset()
+    return frozenset(_merchant_key(match_text).split())
+
+
+def _amount_to_cents_or_none(value: object) -> int | None:
+    """Best-effort parse of a recurring-bill amount to integer cents.
+
+    Used only to decide whether two bills target the same price (and so would
+    compete for one charge). Returns ``None`` for anything that is not a finite
+    whole number of cents; a ``None`` amount never counts as equal to another, so
+    an unparseable amount is treated as a distinct price rather than silently
+    deduped. The final :func:`budget_config.parse_config` validation, not this
+    helper, is what rejects a genuinely bad amount before the file is written.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        cents = Decimal(str(value)) * 100
+    except InvalidOperation:
+        return None
+    if not cents.is_finite() or cents != cents.to_integral_value():
+        return None
+    return int(cents)
+
+
+def merge_subscriptions_into_file(path, bills: list[dict]) -> dict:
+    """Append proposed recurring bills to the budget file at ``path``.
+
+    Creates the file (with an empty ``envelopes`` list) when absent, so tracking
+    subscriptions needs no prior budget setup. A proposed bill is skipped only
+    when an existing recurring entry would compete with it for the *same* charge —
+    judged the way the audit's matcher judges it: the proposed ``match`` token set
+    overlaps an existing entry's by subset *or* superset (so ``"netflix"`` and
+    ``"netflix com"`` are recognized as one merchant, not two), or the name
+    matches case-insensitively, *and* the two amounts are equal. The amount guard
+    matters because the audit matches a charge to a bill by keyword **and** amount
+    (exact by default), so two same-merchant subscriptions at different prices
+    (e.g. two Apple plans) are genuinely distinct bills and must both be kept;
+    deduping them on keyword alone would silently drop the second and then hide it
+    from future detection. Re-running detect on unchanged data still finds the
+    same amounts, so it remains idempotent. The merged config is re-validated with
+    :func:`budget_config.parse_config` before anything is written, and the write is
+    atomic (temp file + ``os.replace``), so a malformed or interrupted merge never
+    overwrites a working config. Filesystem errors are raised as
+    :class:`budget_config.BudgetConfigError`. Returns a summary of what changed.
+    """
+    import json
+    import os
+    import tempfile
+
+    from . import budget_config
+
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise budget_config.BudgetConfigError(
+                f"budget config {path} is not valid JSON: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise budget_config.BudgetConfigError(
+                f"cannot read budget config {path}: {exc}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise budget_config.BudgetConfigError("budget config must be a JSON object")
+    else:
+        raw = {}
+    raw.setdefault("version", budget_config.SUPPORTED_VERSION)
+    raw.setdefault("envelopes", [])
+    existing = raw.setdefault("recurring", [])
+    if not isinstance(existing, list):
+        raise budget_config.BudgetConfigError(
+            "budget config 'recurring' must be a list"
+        )
+
+    # Each tracked bill recorded as (keyword tokens, lowercased name, amount in
+    # cents) so a proposal is only treated as a duplicate of one at the same price.
+    seen: list[tuple[frozenset[str], str, int | None]] = []
+    for entry in existing:
+        if isinstance(entry, dict):
+            key = _recurring_match_key(entry.get("match"))
+            name = entry.get("name")
+            name_l = name.strip().lower() if isinstance(name, str) else ""
+            seen.append((key, name_l, _amount_to_cents_or_none(entry.get("amount"))))
+
+    def _already_tracked(key: frozenset[str], name_l: str, amount: int | None) -> bool:
+        # A proposal duplicates an existing bill only when both would match the
+        # same charge: same price AND keyword overlap (subset/superset, mirroring
+        # the audit's ``match_tokens <= charge tokens`` rule). A keyword match at a
+        # *different* amount is a distinct subscription (e.g. a second Apple plan)
+        # and must be kept; an unparseable amount (None) never compares equal, so
+        # it is never deduped away here — the final parse_config validation is what
+        # rejects a truly bad amount. The display name is only a *fallback* tie
+        # break, used when at least one side has no usable keyword (e.g. an
+        # existing envelope-only bill): two keyword-backed bills with disjoint
+        # keywords are distinct merchants even when their display names collide,
+        # which is common when the merchant lives in the payee under a generic
+        # description like "POS PURCHASE" — deduping those on name would silently
+        # drop a real second subscription.
+        for skey, sname, samount in seen:
+            if amount is None or samount is None or amount != samount:
+                continue
+            if key and skey:
+                if key <= skey or skey <= key:
+                    return True
+                continue  # two distinct keywords -> distinct merchants, never dedup
+            if name_l and sname and name_l == sname:
+                return True
+        return False
+
+    added: list[dict] = []
+    skipped: list[dict] = []
+    for bill in bills:
+        key = _recurring_match_key(bill.get("match"))
+        name_l = str(bill.get("name", "")).strip().lower()
+        amount = _amount_to_cents_or_none(bill.get("amount"))
+        if _already_tracked(key, name_l, amount):
+            skipped.append(bill)
+            continue
+        existing.append(bill)
+        seen.append((key, name_l, amount))
+        added.append(bill)
+
+    # Fail loud before persisting: a merged file that would not parse must never
+    # overwrite a working one.
+    budget_config.parse_config(raw)
+    payload = json.dumps(raw, indent=2) + "\n"
+    # Atomic publish: write a sibling temp file then rename over the target, so an
+    # interrupted or partial write can never truncate the budget config (the
+    # single source of truth) — the file is always either the old or the new whole.
+    # Filesystem errors (e.g. an unwritable or missing parent for --config) are
+    # surfaced as BudgetConfigError so callers report a structured error, not a
+    # raw traceback.
+    directory = path.parent if str(path.parent) else "."
+    try:
+        fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=path.name, suffix=".tmp")
+    except OSError as exc:
+        raise budget_config.BudgetConfigError(
+            f"cannot write budget config to {path}: {exc}"
+        ) from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp_name, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise budget_config.BudgetConfigError(
+            f"cannot write budget config to {path}: {exc}"
+        ) from exc
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return {
+        "path": str(path),
+        "added": len(added),
+        "already_tracked": len(skipped),
+        "tracked_total": len(existing),
+        "added_bills": added,
+    }
