@@ -7,10 +7,11 @@ report loading, rendering, error handling) the unit tests do not.
 """
 
 import json
+from datetime import date
 
 import pytest
 
-from finance_mcp import archive, categories, cli
+from finance_mcp import archive, budget_config, categories, cli
 
 
 # --- helpers ------------------------------------------------------------------
@@ -207,6 +208,75 @@ def test_subscriptions_bad_min_occurrences_errors(tmp_path, monkeypatch, capsys)
     rc = cli.main(["subscriptions", "--min-occurrences", "1", "--config", str(cfg)])
     assert rc == 1
     assert "Subscription audit error" in capsys.readouterr().err
+
+
+def test_subscriptions_mark_canceled_persists(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    archive.connect().close()
+    cfg = _write_budget(tmp_path, {
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [{"name": "Sketch", "envelope": "Card", "amount": 5.00,
+                       "cadence": "monthly", "day": 10, "match": "sketch"}],
+    })
+    rc = cli.main(["subscriptions", "mark", "--name", "Sketch",
+                   "--lifecycle", "canceled", "--effective", "2026-04-01",
+                   "--config", str(cfg)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Sketch" in out and "canceled" in out
+    reloaded = budget_config.load_config(cfg)
+    assert reloaded.recurring[0].lifecycle == "canceled"
+    assert reloaded.recurring[0].cancel_effective == date(2026, 4, 1)
+
+
+def test_subscriptions_mark_requires_name_and_lifecycle(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    archive.connect().close()
+    cfg = _write_budget(tmp_path, {
+        "version": 1, "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [],
+    })
+    rc = cli.main(["subscriptions", "mark", "--name", "Sketch", "--config", str(cfg)])
+    assert rc == 1
+    assert "requires --name and --lifecycle" in capsys.readouterr().err
+
+
+def test_subscriptions_mark_unknown_name_errors(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    archive.connect().close()
+    cfg = _write_budget(tmp_path, {
+        "version": 1, "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [],
+    })
+    rc = cli.main(["subscriptions", "mark", "--name", "Ghost",
+                   "--lifecycle", "canceled", "--effective", "2026-04-01",
+                   "--config", str(cfg)])
+    assert rc == 1
+    assert "Subscription mark error" in capsys.readouterr().err
+
+
+def test_subscriptions_audit_warns_when_canceled_bill_comes_back(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("r1", "card", "-20.00", on="2026-04-10", desc="REPLIT"),
+        ]})
+    finally:
+        conn.close()
+    cfg = _write_budget(tmp_path, {
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [{"name": "Replit", "envelope": "Card", "amount": 20.00,
+                       "cadence": "monthly", "day": 10, "match": "replit",
+                       "lifecycle": "canceled", "cancel_effective": "2026-03-01"}],
+    })
+    rc = cli.main(["subscriptions", "--start", "2026-01-01", "--end", "2026-05-31",
+                   "--config", str(cfg)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "CAME BACK" in out and "Replit" in out
 
 
 def test_subscriptions_detect_honors_day_tolerance(tmp_path, monkeypatch, capsys):

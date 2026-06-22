@@ -176,6 +176,33 @@ def test_subscriptions_endpoint_without_config_shows_candidates(tmp_path, monkey
     assert any("spotify" in c["merchant_key"] for c in body["candidate_new"])
 
 
+def test_subscriptions_endpoint_surfaces_came_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("r1", "card", "-20.00", on="2026-04-10", desc="REPLIT"),
+        ]})
+    finally:
+        conn.close()
+    _write_budget(monkeypatch, tmp_path, {
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [
+            {"name": "Replit", "envelope": "Card", "amount": 20.00,
+             "cadence": "monthly", "day": 10, "match": "replit",
+             "lifecycle": "canceled", "cancel_effective": "2026-03-01"},
+        ],
+    })
+    status, body = webui.handle_api(
+        "subscriptions", {"start": ["2026-01-01"], "end": ["2026-05-31"]}
+    )
+    assert status == 200
+    assert body["summary"]["came_back"] == 1
+    assert body["came_back"][0]["name"] == "Replit"
+    assert body["tracked"][0]["lifecycle"] == "canceled"
+
+
 def test_unknown_param_is_ignored(tmp_path, monkeypatch):
     _seed_basic(monkeypatch, tmp_path)
     status, body = webui.handle_api("accounts", {"bogus": ["x"]})

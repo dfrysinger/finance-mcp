@@ -1,6 +1,7 @@
 """Tests for budget config parsing and validation."""
 
 import json
+from datetime import date
 
 import pytest
 
@@ -352,6 +353,84 @@ def test_bill_name_required():
 def test_recurring_must_be_list():
     with pytest.raises(BudgetConfigError, match="'recurring' must be a list"):
         parse_config(_cfg(recurring={"not": "a list"}))
+
+
+# --- Recurring calendar: lifecycle (cancellation watch) -----------------------
+
+
+def test_lifecycle_defaults_to_active():
+    cfg = parse_config(_cfg(recurring=[
+        {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly", "day": 5}
+    ]))
+    b = cfg.recurring[0]
+    assert b.lifecycle == "active"
+    assert b.cancel_effective is None
+
+
+def test_lifecycle_canceled_parses_with_effective_date():
+    cfg = parse_config(_cfg(recurring=[
+        {"name": "Sketch", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+         "day": 5, "lifecycle": "canceled", "cancel_effective": "2026-04-01"}
+    ]))
+    b = cfg.recurring[0]
+    assert b.lifecycle == "canceled"
+    assert b.cancel_effective == date(2026, 4, 1)
+
+
+def test_lifecycle_canceling_parses_with_effective_date():
+    cfg = parse_config(_cfg(recurring=[
+        {"name": "Replit", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+         "day": 5, "lifecycle": "canceling", "cancel_effective": "2026-04-01"}
+    ]))
+    assert cfg.recurring[0].lifecycle == "canceling"
+
+
+def test_lifecycle_normalizes_case():
+    cfg = parse_config(_cfg(recurring=[
+        {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+         "day": 5, "lifecycle": "Canceled", "cancel_effective": "2026-04-01"}
+    ]))
+    assert cfg.recurring[0].lifecycle == "canceled"
+
+
+def test_invalid_lifecycle_rejected():
+    with pytest.raises(BudgetConfigError, match="lifecycle must be one of"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+             "day": 5, "lifecycle": "paused", "cancel_effective": "2026-04-01"}
+        ]))
+
+
+def test_canceled_requires_cancel_effective():
+    with pytest.raises(BudgetConfigError, match="needs a 'cancel_effective'"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+             "day": 5, "lifecycle": "canceled"}
+        ]))
+
+
+def test_active_must_not_set_cancel_effective():
+    with pytest.raises(BudgetConfigError, match="only meaningful for"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+             "day": 5, "cancel_effective": "2026-04-01"}
+        ]))
+
+
+def test_cancel_effective_must_be_iso_date():
+    with pytest.raises(BudgetConfigError, match="not a valid ISO date"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+             "day": 5, "lifecycle": "canceled", "cancel_effective": "04/01/2026"}
+        ]))
+
+
+def test_cancel_effective_must_be_string():
+    with pytest.raises(BudgetConfigError, match="must be an ISO date string"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+             "day": 5, "lifecycle": "canceled", "cancel_effective": 20260401}
+        ]))
 
 
 # --- Recurring calendar: scheduled transfers ----------------------------------

@@ -188,6 +188,41 @@ def test_subscription_audit_report_tool(tmp_path, monkeypatch):
     assert netflix["status"] in {"active", "overdue", "unseen"}
 
 
+def test_subscriptions_mark_tool_persists_and_audit_warns(tmp_path, monkeypatch):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("r1", "card", "-20.00", on="2026-04-10", desc="REPLIT"),
+        ]})
+    finally:
+        conn.close()
+    _write_budget(monkeypatch, tmp_path, {
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [
+            {"name": "Replit", "envelope": "Card", "amount": 20.00,
+             "cadence": "monthly", "day": 10, "match": "replit"},
+        ],
+    })
+    marked = server.subscriptions_mark("Replit", "canceled", cancel_effective="2026-03-01")
+    assert marked["ok"] is True
+    assert marked["lifecycle"] == "canceled"
+    out = server.subscription_audit_report(start="2026-01-01", end="2026-05-31")
+    assert out["summary"]["came_back"] == 1
+    assert out["came_back"][0]["name"] == "Replit"
+
+
+def test_subscriptions_mark_tool_unknown_name_errors(tmp_path, monkeypatch):
+    _write_budget(monkeypatch, tmp_path, {
+        "version": 1, "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [],
+    })
+    out = server.subscriptions_mark("Ghost", "canceled", cancel_effective="2026-03-01")
+    assert out["ok"] is False
+    assert "no recurring bill named" in out["error"]
+
+
 def test_report_tool_missing_config_returns_error(tmp_path, monkeypatch):
     monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
     out = server.allocation_audit_report()

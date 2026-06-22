@@ -597,11 +597,24 @@ const RENDER = {
   },
   subscriptions(d) {
     const sm = d.summary||{};
+    const cameBack = d.came_back||[];
     let out = `<div class="cards">
       <div class="card"><div class="k">tracked</div><div class="v">${sm.tracked||0}</div></div>
       <div class="card"><div class="k">missing</div><div class="v">${sm.missing_occurrences||0}</div></div>
+      <div class="card"><div class="k">came back</div><div class="v">${sm.came_back||0}</div></div>
       <div class="card"><div class="k">candidates</div><div class="v">${sm.candidates||0}</div></div>
     </div>`;
+    if (cameBack.length) {
+      out += `<h2>⚠ Canceled bills that came back</h2>`;
+      out += `<p class="muted">You marked these canceling or canceled, but a charge posted on or after the cancellation date &mdash; the cancellation may not have taken.</p>`;
+      out += table(cameBack, [
+        {label:"Subscription",get:r=>r.name},
+        {label:"Amount",num:true,money:true,get:r=>r.amount},
+        {label:"Marked",html:true,get:r=>pill(r.lifecycle,"bad")},
+        {label:"Effective",get:r=>r.cancel_effective||""},
+        {label:"Charged again",get:r=>r.came_back_on||r.last_seen||"?"},
+      ]);
+    }
     out += `<h2>Tracked subscriptions</h2>`;
     if (!sm.tracked) {
       out += `<p class="muted">No saved subscriptions yet &mdash; run <code>finance-mcp subscriptions detect</code> to save your recurring charges as a tracked list.</p>`;
@@ -613,7 +626,14 @@ const RENDER = {
       {label:"Due day",num:true,get:r=>r.day},
       {label:"Next due",get:r=>r.next_due||""},
       {label:"Last seen",get:r=>r.last_seen||"never"},
-      {label:"Status",html:true,get:r=>pill(r.status, r.status==="overdue"?"bad":r.status==="active"?"good":"warn")},
+      {label:"Status",html:true,get:r=>{
+        const lc = r.lifecycle||"active";
+        if (lc !== "active") {
+          if (r.came_back) return pill("came back","bad");
+          return pill(lc, lc==="canceling"?"warn":"");
+        }
+        return pill(r.status, r.status==="overdue"?"bad":r.status==="active"?"good":"warn");
+      }},
     ]);
     out += `<h2>Missing expected charges</h2>`;
     out += table(d.expected_missing||[], [

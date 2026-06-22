@@ -30,7 +30,7 @@ def _txn(tid, account, amount, *, on, desc="", is_transfer=False):
     }
 
 
-def _bill(name, envelope, amount, day, *, match=None):
+def _bill(name, envelope, amount, day, *, match=None, lifecycle=None, cancel_effective=None):
     raw = {
         "name": name,
         "envelope": envelope,
@@ -40,6 +40,10 @@ def _bill(name, envelope, amount, day, *, match=None):
     }
     if match is not None:
         raw["match"] = match
+    if lifecycle is not None:
+        raw["lifecycle"] = lifecycle
+    if cancel_effective is not None:
+        raw["cancel_effective"] = cancel_effective
     return raw
 
 
@@ -1562,3 +1566,258 @@ def test_detect_surfaces_different_price_run_despite_descriptor_variation():
     review = [s for s in out["skipped"] if s["kind"] == "needs_review"]
     assert len(review) == 1
     assert "9.99" in review[0]["reason"]
+
+
+# --- Cancellation watch: lifecycle audit behavior -----------------------------
+
+
+def test_canceled_bill_absence_is_not_reported_missing():
+    # A bill canceled effective March 1: its March/April/May occurrences are
+    # expected to be absent and must NOT surface as missing.
+    cfg = _config([CARD], [_bill("Sketch", "Card", 5.00, 10, match="SKETCH",
+                                 lifecycle="canceled", cancel_effective="2026-03-01")])
+    report = subscription.subscription_audit(cfg, [], start=WIN_START, end=WIN_END)
+    missing_dates = _names(report["expected_missing"], "expected_date")
+    # Jan/Feb (pre-cancel) may still be missing; March onward must be suppressed.
+    assert "2026-03-10" not in missing_dates
+    assert "2026-04-10" not in missing_dates
+    assert "2026-05-10" not in missing_dates
+
+
+def test_canceled_bill_charge_before_effective_does_not_come_back():
+    cfg = _config([CARD], [_bill("Sketch", "Card", 5.00, 10, match="SKETCH",
+                                 lifecycle="canceled", cancel_effective="2026-03-01")])
+    txns = [_txn("t1", "card", "-5.00", on="2026-02-10", desc="SKETCH")]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert report["came_back"] == []
+    tracked = report["tracked"][0]
+    assert tracked["came_back"] is False
+    assert tracked["lifecycle"] == "canceled"
+
+
+def test_canceled_bill_charge_on_or_after_effective_comes_back():
+    cfg = _config([CARD], [_bill("Replit", "Card", 20.00, 10, match="REPLIT",
+                                 lifecycle="canceled", cancel_effective="2026-03-01")])
+    txns = [_txn("t1", "card", "-20.00", on="2026-04-10", desc="REPLIT")]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert len(report["came_back"]) == 1
+    assert report["came_back"][0]["name"] == "Replit"
+    assert report["summary"]["came_back"] == 1
+    assert report["tracked"][0]["came_back"] is True
+
+
+def test_canceled_charge_exactly_on_effective_date_comes_back():
+    cfg = _config([CARD], [_bill("Study", "Card", 30.00, 1, match="STUDY",
+                                 lifecycle="canceled", cancel_effective="2026-04-01")])
+    txns = [_txn("t1", "card", "-30.00", on="2026-04-01", desc="STUDY.COM")]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert report["tracked"][0]["came_back"] is True
+
+
+def test_canceled_bill_is_never_overdue():
+    # No charges at all after cancellation -> the bill must not read "overdue".
+    cfg = _config([CARD], [_bill("Sketch", "Card", 5.00, 10, match="SKETCH",
+                                 lifecycle="canceled", cancel_effective="2026-01-01")])
+    report = subscription.subscription_audit(cfg, [], start=WIN_START, end=WIN_END)
+    assert report["tracked"][0]["status"] != "overdue"
+
+
+def test_active_bill_carries_lifecycle_fields():
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
+    report = subscription.subscription_audit(cfg, [], start=WIN_START, end=WIN_END)
+    tracked = report["tracked"][0]
+    assert tracked["lifecycle"] == "active"
+    assert tracked["cancel_effective"] is None
+    assert tracked["came_back"] is False
+
+
+# --- Cancellation watch: set_bill_lifecycle writer ----------------------------
+
+
+def _seed_budget(path):
+    path.write_text(json.dumps({
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [{"name": "Sketch", "envelope": "Card", "amount": 5.00,
+                       "cadence": "monthly", "day": 10, "match": "sketch"}],
+    }), encoding="utf-8")
+
+
+def test_set_lifecycle_marks_canceled(tmp_path):
+    path = tmp_path / "budget.json"
+    _seed_budget(path)
+    result = subscription.set_bill_lifecycle(
+        path, "Sketch", "canceled", cancel_effective="2026-04-01"
+    )
+    assert result["lifecycle"] == "canceled"
+    assert result["cancel_effective"] == "2026-04-01"
+    cfg = budget_config.load_config(path)
+    b = cfg.recurring[0]
+    assert b.lifecycle == "canceled"
+    assert b.cancel_effective == date(2026, 4, 1)
+
+
+def test_set_lifecycle_is_case_insensitive_on_name(tmp_path):
+    path = tmp_path / "budget.json"
+    _seed_budget(path)
+    subscription.set_bill_lifecycle(
+        path, "sketch", "canceling", cancel_effective="2026-04-01"
+    )
+    assert budget_config.load_config(path).recurring[0].lifecycle == "canceling"
+
+
+def test_set_lifecycle_reactivate_clears_effective(tmp_path):
+    path = tmp_path / "budget.json"
+    _seed_budget(path)
+    subscription.set_bill_lifecycle(
+        path, "Sketch", "canceled", cancel_effective="2026-04-01"
+    )
+    subscription.set_bill_lifecycle(path, "Sketch", "active")
+    b = budget_config.load_config(path).recurring[0]
+    assert b.lifecycle == "active"
+    assert b.cancel_effective is None
+
+
+def test_set_lifecycle_reactivate_rejects_effective(tmp_path):
+    path = tmp_path / "budget.json"
+    _seed_budget(path)
+    with pytest.raises(budget_config.BudgetConfigError, match="must be omitted"):
+        subscription.set_bill_lifecycle(
+            path, "Sketch", "active", cancel_effective="2026-04-01"
+        )
+
+
+def test_set_lifecycle_canceled_requires_effective(tmp_path):
+    path = tmp_path / "budget.json"
+    _seed_budget(path)
+    with pytest.raises(budget_config.BudgetConfigError, match="is required"):
+        subscription.set_bill_lifecycle(path, "Sketch", "canceled")
+
+
+def test_set_lifecycle_unknown_name_errors(tmp_path):
+    path = tmp_path / "budget.json"
+    _seed_budget(path)
+    with pytest.raises(budget_config.BudgetConfigError, match="no recurring bill named"):
+        subscription.set_bill_lifecycle(
+            path, "Nonexistent", "canceled", cancel_effective="2026-04-01"
+        )
+
+
+def test_set_lifecycle_invalid_lifecycle_errors(tmp_path):
+    path = tmp_path / "budget.json"
+    _seed_budget(path)
+    with pytest.raises(budget_config.BudgetConfigError, match="lifecycle must be one of"):
+        subscription.set_bill_lifecycle(path, "Sketch", "paused")
+
+
+def test_set_lifecycle_ambiguous_name_errors(tmp_path):
+    path = tmp_path / "budget.json"
+    path.write_text(json.dumps({
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [
+            {"name": "Apple", "envelope": "Card", "amount": 0.99, "cadence": "monthly",
+             "day": 10, "match": "apple"},
+            {"name": "Apple", "envelope": "Card", "amount": 9.99, "cadence": "monthly",
+             "day": 10, "match": "apple"},
+        ],
+    }), encoding="utf-8")
+    with pytest.raises(budget_config.BudgetConfigError, match="names must be unique"):
+        subscription.set_bill_lifecycle(
+            path, "Apple", "canceled", cancel_effective="2026-04-01"
+        )
+
+
+def test_set_lifecycle_missing_file_errors(tmp_path):
+    path = tmp_path / "budget.json"
+    with pytest.raises(budget_config.BudgetConfigError, match="does not exist"):
+        subscription.set_bill_lifecycle(
+            path, "Sketch", "canceled", cancel_effective="2026-04-01"
+        )
+
+
+def test_set_lifecycle_invalid_effective_date_rejected_without_writing(tmp_path):
+    path = tmp_path / "budget.json"
+    _seed_budget(path)
+    before = path.read_text(encoding="utf-8")
+    with pytest.raises(budget_config.BudgetConfigError):
+        subscription.set_bill_lifecycle(
+            path, "Sketch", "canceled", cancel_effective="not-a-date"
+        )
+    # Bad input must never overwrite the working config.
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_came_back_detects_off_schedule_return():
+    # A canceled bill due day 10 that re-charges on day 25 (drift 15 > the
+    # default 7-day tolerance) must still warn: the scheduled matcher would never
+    # match it, and its absence is suppressed, so the identity scan is the only
+    # signal. Regresses a gap where came_back keyed on the scheduled match alone.
+    cfg = _config([CARD], [_bill("Sketch", "Card", 5.00, 10, match="SKETCH",
+                                 lifecycle="canceled", cancel_effective="2026-03-01")])
+    txns = [_txn("t1", "card", "-5.00", on="2026-03-25", desc="SKETCH")]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert len(report["came_back"]) == 1
+    assert report["came_back"][0]["came_back_on"] == "2026-03-25"
+    assert report["expected_missing"] == [] or all(
+        m["name"] != "Sketch" or m["expected_date"] < "2026-03-01"
+        for m in report["expected_missing"]
+    )
+
+
+def test_came_back_detects_different_amount_return():
+    # A re-bill at a changed price (annual renewal, price hike) is still the bill
+    # coming back; came_back is amount-blind.
+    cfg = _config([CARD], [_bill("Replit", "Card", 20.00, 10, match="REPLIT",
+                                 lifecycle="canceled", cancel_effective="2026-03-01")])
+    txns = [_txn("t1", "card", "-200.00", on="2026-04-10", desc="REPLIT ANNUAL")]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert len(report["came_back"]) == 1
+    assert report["came_back"][0]["came_back_on"] == "2026-04-10"
+
+
+def test_came_back_envelope_only_bill_off_schedule():
+    # An envelope-only canceled bill (no match keyword) detects a return by the
+    # account binding, ignoring day/amount.
+    cfg = _config([CARD], [_bill("CardSub", "Card", 5.00, 10,
+                                 lifecycle="canceled", cancel_effective="2026-03-01")])
+    txns = [_txn("t1", "card", "-7.50", on="2026-03-22", desc="WHATEVER")]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert report["tracked"][0]["came_back"] is True
+    assert report["tracked"][0]["came_back_on"] == "2026-03-22"
+
+
+def test_came_back_on_is_latest_return_charge():
+    cfg = _config([CARD], [_bill("Sketch", "Card", 5.00, 10, match="SKETCH",
+                                 lifecycle="canceled", cancel_effective="2026-03-01")])
+    txns = [
+        _txn("t1", "card", "-5.00", on="2026-03-25", desc="SKETCH"),
+        _txn("t2", "card", "-5.00", on="2026-04-25", desc="SKETCH"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert report["tracked"][0]["came_back_on"] == "2026-04-25"
+
+
+def test_came_back_is_scoped_to_audit_window_not_lookback():
+    # A return before the requested window start must NOT warn, and the result
+    # must not flip when start is nudged by a day across the return — came-back is
+    # scoped to the audited window, not to the status look-back internals.
+    cfg = _config([CARD], [_bill("Sketch", "Card", 5.00, 10, match="SKETCH",
+                                 lifecycle="canceled", cancel_effective="2026-03-01")])
+    txns = [_txn("t1", "card", "-5.00", on="2026-03-25", desc="SKETCH")]
+    # Window starts after the return: not in view, no warning.
+    after = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 4, 1), end=date(2026, 6, 30)
+    )
+    assert after["came_back"] == []
+    # One-day nudge does not change the verdict (no look-back coupling).
+    nudged = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 4, 2), end=date(2026, 6, 30)
+    )
+    assert nudged["came_back"] == []
+    # Window that includes the return: warns.
+    including = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 3, 1), end=date(2026, 6, 30)
+    )
+    assert len(including["came_back"]) == 1
+    assert including["came_back"][0]["came_back_on"] == "2026-03-25"

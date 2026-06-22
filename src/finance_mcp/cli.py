@@ -512,6 +512,28 @@ def _cmd_subscriptions(args: argparse.Namespace) -> int:
                 print(f"    - {sk['merchant']}: {sk['reason']}")
         return 0
 
+    if args.action == "mark":
+        if not args.name or not args.lifecycle:
+            print("subscriptions mark requires --name and --lifecycle",
+                  file=sys.stderr)
+            return 1
+        try:
+            result = subscription.set_bill_lifecycle(
+                cfg_path, args.name, args.lifecycle,
+                cancel_effective=args.effective,
+            )
+        except budget_config.BudgetConfigError as exc:
+            print(f"Subscription mark error: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result, indent=2))
+            return 0
+        eff = result.get("cancel_effective")
+        eff_s = f" effective {eff}" if eff else ""
+        print(f"Marked {result['name']!r} as {result['lifecycle']}{eff_s} "
+              f"(saved to {result['path']})")
+        return 0
+
     # action == "audit": with no config there are simply no tracked bills, and
     # the audit still surfaces every untracked recurring merchant it finds.
     if cfg_path.exists():
@@ -542,14 +564,26 @@ def _cmd_subscriptions(args: argparse.Namespace) -> int:
     sm = report["summary"]
     print(f"Subscription audit {w['start']} -> {w['end']}")
     print(f"  Tracked bills: {sm['tracked']}")
+    if report.get("came_back"):
+        print("  ⚠ CANCELED BILLS THAT CAME BACK (charged after cancellation):")
+        for c in report["came_back"]:
+            seen = c.get("came_back_on") or c.get("last_seen")
+            print(f"    {c['name']}: ${c['amount']} — marked {c['lifecycle']} "
+                  f"effective {c.get('cancel_effective')}, charged again {seen}")
     if report.get("tracked"):
         print("  Tracked subscriptions:")
         for t in report["tracked"]:
             env = f" [{t['envelope']}]" if t.get("envelope") else ""
             last = t.get("last_seen") or "never"
             nxt = t.get("next_due") or "?"
+            lc = t.get("lifecycle", "active")
+            if lc != "active":
+                flag = "came back!" if t.get("came_back") else lc
+                state = f"{flag}, effective {t.get('cancel_effective')}"
+            else:
+                state = t["status"]
             print(f"    {t['name']}{env}: ${t['amount']} on day {t['day']} "
-                  f"({t['status']}) — next due {nxt}, last seen {last}")
+                  f"({state}) — next due {nxt}, last seen {last}")
     if report["expected_missing"]:
         print("  MISSING expected charges (possible billing problem / cancellation):")
         for m in report["expected_missing"]:
@@ -764,9 +798,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="missing expected charges + candidate untracked recurring merchants",
     )
     p_sub.add_argument(
-        "action", nargs="?", choices=["audit", "detect"], default="audit",
+        "action", nargs="?", choices=["audit", "detect", "mark"], default="audit",
         help="'audit' (default) checks tracked bills and surfaces candidates; "
-             "'detect' saves detected recurring charges into the budget config",
+             "'detect' saves detected recurring charges into the budget config; "
+             "'mark' sets a bill's lifecycle (canceling/canceled/active)",
     )
     p_sub.add_argument("--start", help="window start, as YYYY-MM-DD (default: a year back)")
     p_sub.add_argument("--end", help="window end, as YYYY-MM-DD (default: today)")
@@ -774,6 +809,16 @@ def build_parser() -> argparse.ArgumentParser:
                        help="days a charge may drift and still count as on schedule")
     p_sub.add_argument("--min-occurrences", type=int, default=3,
                        help="times a merchant must recur to surface as a candidate")
+    p_sub.add_argument("--name", help="bill name to mark (with action 'mark')")
+    p_sub.add_argument(
+        "--lifecycle", choices=["active", "canceling", "canceled"],
+        help="lifecycle to set the named bill to (with action 'mark')",
+    )
+    p_sub.add_argument(
+        "--effective",
+        help="cancellation effective date, as YYYY-MM-DD (required when marking "
+             "canceling/canceled; omit when reactivating)",
+    )
     p_sub.add_argument("--config", help="path to budget config (default: ~/.finance-mcp/budget.json)")
     p_sub.add_argument("--json", action="store_true")
     p_sub.set_defaults(func=_cmd_subscriptions)

@@ -30,6 +30,15 @@ SUPPORTED_VERSION = 1
 # is rejected at parse time rather than silently mis-forecast.
 SUPPORTED_CADENCES = frozenset({"monthly"})
 
+# Lifecycle of a recurring bill. ``active`` (the default) is a live bill expected
+# to keep charging. ``canceling`` means a cancellation was attempted and the bill
+# is no longer expected to charge — a charge on/after ``cancel_effective`` is a
+# warning that the cancellation may not have taken. ``canceled`` is a confirmed
+# cancellation; any charge on/after ``cancel_effective`` is an anomaly. For the
+# two non-active states a charge coming back is the alert, and the bill's absence
+# is expected rather than reported missing.
+LIFECYCLE_STATES = frozenset({"active", "canceling", "canceled"})
+
 
 class BudgetConfigError(Exception):
     """A budget config file is missing, malformed, or internally inconsistent."""
@@ -69,6 +78,13 @@ class RecurringBill:
     could not be matched to any charge. A bill with no ``envelope`` therefore
     always has a ``match`` keyword (enforced at parse time), so it is matched by
     merchant and never falls through to an envelope binding that does not exist.
+
+    ``lifecycle`` is one of :data:`LIFECYCLE_STATES`. When it is ``canceling`` or
+    ``canceled``, ``cancel_effective`` is the date from which the bill is no
+    longer expected to charge (enforced present at parse time for those states);
+    a matching charge on/after that date is surfaced as a "came back" alert and
+    the bill's absence is no longer reported as missing. ``active`` bills always
+    have ``cancel_effective`` of ``None``.
     """
 
     name: str
@@ -77,6 +93,8 @@ class RecurringBill:
     cadence: str
     day: int
     match: str | None = None
+    lifecycle: str = "active"
+    cancel_effective: date | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +248,33 @@ def _require_day(value: Any, *, where: str) -> int:
     return value
 
 
+def _require_lifecycle(value: Any, *, where: str) -> str:
+    # Absent lifecycle defaults to "active" so existing configs (and anyone who
+    # never cancels anything) parse unchanged.
+    if value is None:
+        return "active"
+    if isinstance(value, str) and value.strip().lower() in LIFECYCLE_STATES:
+        return value.strip().lower()
+    raise BudgetConfigError(
+        f"{where}: lifecycle must be one of {sorted(LIFECYCLE_STATES)}, got {value!r}"
+    )
+
+
+def _optional_date(value: Any, *, where: str, field: str) -> date | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise BudgetConfigError(
+            f"{where}: {field} must be an ISO date string (YYYY-MM-DD), got {value!r}"
+        )
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise BudgetConfigError(
+            f"{where}: {field} {value!r} is not a valid ISO date (YYYY-MM-DD)"
+        ) from exc
+
+
 def parse_config(data: Any) -> BudgetConfig:
     """Validate an already-parsed JSON object into a :class:`BudgetConfig`.
 
@@ -364,6 +409,21 @@ def _parse_recurring(
                 "it to a budget and match it by account) or a 'match' keyword (to "
                 "match it by merchant); it has neither"
             )
+        lifecycle = _require_lifecycle(raw.get("lifecycle"), where=ctx)
+        cancel_effective = _optional_date(
+            raw.get("cancel_effective"), where=ctx, field="cancel_effective"
+        )
+        if lifecycle != "active" and cancel_effective is None:
+            raise BudgetConfigError(
+                f"{ctx}: a {lifecycle!r} bill needs a 'cancel_effective' date "
+                "(the day the cancellation took effect) so a charge on/after it "
+                "can be flagged as the bill coming back"
+            )
+        if lifecycle == "active" and cancel_effective is not None:
+            raise BudgetConfigError(
+                f"{ctx}: 'cancel_effective' is only meaningful for a 'canceling' "
+                "or 'canceled' bill; an active bill must not set it"
+            )
         bills.append(
             RecurringBill(
                 name=name,
@@ -372,6 +432,8 @@ def _parse_recurring(
                 cadence=_require_cadence(raw.get("cadence"), where=ctx),
                 day=_require_day(raw.get("day"), where=ctx),
                 match=match,
+                lifecycle=lifecycle,
+                cancel_effective=cancel_effective,
             )
         )
     return tuple(bills)

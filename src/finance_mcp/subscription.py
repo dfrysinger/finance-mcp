@@ -19,6 +19,11 @@ Two scripted outputs the assistant reasons over:
   repeated, same-amount, regularly-spaced debits that are *not* in the tracked
   set. The script emits a structured, auditable candidate list; deciding whether
   each is really a new subscription is left to the assistant.
+* **came_back** (deterministic) — tracked bills the user marked ``canceling`` or
+  ``canceled`` (via the bill's ``lifecycle``/``cancel_effective``) that
+  nonetheless charged again on or after the cancellation date. A canceled bill's
+  *absence* is suppressed from ``expected_missing`` (it is the desired outcome),
+  so the only signal a cancellation raises is a charge coming back.
 
 A tracked bill without a ``match`` keyword is matched by its envelope->account
 binding instead: a debit on one of the envelope's accounts, for the expected
@@ -234,6 +239,26 @@ def _charges(
     return out
 
 
+def _identity_matches_bill(
+    charge: _Charge,
+    bill: RecurringBill,
+    match_tokens: frozenset[str] | None,
+) -> bool:
+    """Does this charge belong to this bill's merchant/account, ignoring amount?
+
+    The identity half of :func:`_matches_bill` with the amount comparison
+    dropped. Used by the cancellation watch: a subscription "coming back" is any
+    charge from the same merchant (keyword) or envelope after the cancellation
+    date, even if it posts off the old schedule or at a different price — a
+    final/partial charge or a re-bill at a new amount must still raise the alert.
+    """
+    if match_tokens is not None:
+        return bool(match_tokens) and match_tokens <= charge.match_tokens
+    if bill.envelope is None:
+        return False
+    return charge.envelope == bill.envelope
+
+
 def _matches_bill(
     charge: _Charge,
     bill: RecurringBill,
@@ -367,6 +392,14 @@ def _match_tracked_bills(
     tracked: list[dict] = []
     for bill, bill_tokens in zip(config.recurring, bill_token_sets):
         last_seen: date | None = None
+        # A canceling/canceled bill is no longer expected to charge on or after
+        # its cancel_effective date, so occurrences from that day forward must not
+        # be reported missing or counted toward overdue — their absence is the
+        # desired outcome. The parse layer guarantees cancel_effective is set
+        # whenever lifecycle is non-active, but the date is read defensively.
+        suppress_after_cancel = (
+            bill.lifecycle != "active" and bill.cancel_effective is not None
+        )
         # The latest scheduled occurrence that actually posted (matched a charge).
         # Compared against latest_due below: status is judged on whether the most
         # recent should-have-posted *occurrence* was paid, not on the charge's
@@ -379,6 +412,13 @@ def _match_tracked_bills(
         # seen if it had.
         latest_due: date | None = None
         for occ in monthly_dates(bill.day, start, end):
+            # A cancellation suppresses overdue/missing reporting from its
+            # effective date forward (computed once per occurrence and reused
+            # below). Matching still runs for these occurrences so a charge that
+            # posts post-cancellation is seen and surfaced as "came back".
+            occ_after_cancel = (
+                suppress_after_cancel and occ >= bill.cancel_effective
+            )
             # An occurrence counts toward overdue only when its full in-tolerance
             # payment window is observed: a charge satisfying `occ` may post as
             # early as `occ - day_tolerance`, so if data begins after that day (or
@@ -397,7 +437,7 @@ def _match_tracked_bills(
                 and day_tolerance <= (occ - date.min).days
                 and (occ - timedelta(days=day_tolerance)) >= earliest_txn
             )
-            if covered and (end - occ).days >= grace:
+            if covered and (end - occ).days >= grace and not occ_after_cancel:
                 latest_due = occ
             # Greedy earliest-first match: the closest unconsumed charge within
             # tolerance, preferring an exact amount, then least date drift.
@@ -436,6 +476,10 @@ def _match_tracked_bills(
             # the requested audit window.
             if occ < window_start:
                 continue
+            # A canceled/canceling bill's absence on or after its effective date
+            # is expected, not a problem — do not report it missing.
+            if occ_after_cancel:
+                continue
             expected_missing.append(
                 {
                     "name": bill.name,
@@ -467,6 +511,40 @@ def _match_tracked_bills(
             for d in monthly_dates(bill.day, _shift_days(end, 1), _shift_days(end, 62))
             if d > end
         ]
+        # "Came back" = any charge from this bill's merchant/envelope posted on or
+        # after the cancellation date — real money leaving the account after the
+        # "Came back" = any charge from this bill's merchant/envelope posted on or
+        # after the cancellation date — real money leaving the account after the
+        # user expected the bill to stop. Detected by an identity scan that is
+        # blind to day-of-month drift and amount, so an off-schedule return or a
+        # re-bill at a changed price still raises the alert (the scheduled matcher
+        # alone would miss both, and the post-cancel absence is suppressed above,
+        # so this scan is the only signal a returning charge gets). came_back_on
+        # is the most recent such charge, surfaced instead of the scheduled
+        # last_seen because an off-schedule return never sets last_seen.
+        #
+        # The scan is floored at window_start as well as cancel_effective: charges
+        # spans a look-back beyond the requested window (to judge status), but a
+        # came-back alert must depend only on the audited window, exactly like
+        # expected_missing. Without the window_start floor a return that posted
+        # before `start` but inside the look-back would warn, and nudging `start`
+        # by a day across that charge would flip the result — a window the caller
+        # never asked about deciding the alert. A return before the window is out
+        # of view here just as a pre-window missed occurrence is; widen `start` to
+        # see it.
+        came_back_floor = (
+            max(bill.cancel_effective, window_start) if suppress_after_cancel else None
+        )
+        came_back_on: date | None = None
+        if came_back_floor is not None:
+            for charge in charges:
+                if charge.on < came_back_floor:
+                    continue
+                if not _identity_matches_bill(charge, bill, bill_tokens):
+                    continue
+                if came_back_on is None or charge.on > came_back_on:
+                    came_back_on = charge.on
+        came_back = came_back_on is not None
         tracked.append(
             {
                 "name": bill.name,
@@ -478,6 +556,14 @@ def _match_tracked_bills(
                 "last_seen": last_seen.isoformat() if last_seen is not None else None,
                 "next_due": upcoming[0].isoformat() if upcoming else None,
                 "status": status,
+                "lifecycle": bill.lifecycle,
+                "cancel_effective": (
+                    bill.cancel_effective.isoformat()
+                    if bill.cancel_effective is not None
+                    else None
+                ),
+                "came_back": came_back,
+                "came_back_on": came_back_on.isoformat() if came_back_on is not None else None,
             }
         )
     return consumed, expected_missing, tracked
@@ -570,16 +656,22 @@ def subscription_audit(
         window_start=start,
     )
 
+    # A bill the user marked canceling/canceled that nonetheless charged again on
+    # or after its effective date — the cancellation watch's headline alert.
+    came_back = [t for t in tracked if t.get("came_back")]
+
     return {
         "window": {"start": start.isoformat(), "end": end.isoformat()},
         "day_tolerance": day_tolerance,
         "min_occurrences": min_occurrences,
         "tracked": tracked,
         "expected_missing": expected_missing,
+        "came_back": came_back,
         "candidate_new": candidate_new,
         "summary": {
             "tracked": len(config.recurring),
             "missing_occurrences": len(expected_missing),
+            "came_back": len(came_back),
             "candidates": len(candidate_new),
         },
     }
@@ -1120,6 +1212,53 @@ def _amount_to_cents_or_none(value: object) -> int | None:
     return int(cents)
 
 
+def _persist_config(path, raw: dict) -> None:
+    """Validate ``raw`` as a budget config and atomically publish it to ``path``.
+
+    Re-parses with :func:`budget_config.parse_config` first, so a config that
+    would not load never overwrites a working one. The write is atomic (sibling
+    temp file + ``os.replace``), so an interrupted or partial write can never
+    truncate the budget config — the single source of truth — and the file is
+    always either the old or the new whole. Validation and filesystem errors
+    (e.g. an unwritable or missing parent directory) are surfaced as
+    :class:`budget_config.BudgetConfigError` so callers report a structured
+    error rather than a raw traceback.
+    """
+    import json
+    import os
+    import tempfile
+
+    from . import budget_config
+
+    budget_config.parse_config(raw)
+    payload = json.dumps(raw, indent=2) + "\n"
+    directory = path.parent if str(path.parent) else "."
+    try:
+        fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=path.name, suffix=".tmp")
+    except OSError as exc:
+        raise budget_config.BudgetConfigError(
+            f"cannot write budget config to {path}: {exc}"
+        ) from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp_name, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise budget_config.BudgetConfigError(
+            f"cannot write budget config to {path}: {exc}"
+        ) from exc
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def merge_subscriptions_into_file(path, bills: list[dict]) -> dict:
     """Append proposed recurring bills to the budget file at ``path``.
 
@@ -1142,8 +1281,6 @@ def merge_subscriptions_into_file(path, bills: list[dict]) -> dict:
     :class:`budget_config.BudgetConfigError`. Returns a summary of what changed.
     """
     import json
-    import os
-    import tempfile
 
     from . import budget_config
 
@@ -1218,45 +1355,115 @@ def merge_subscriptions_into_file(path, bills: list[dict]) -> dict:
         seen.append((key, name_l, amount))
         added.append(bill)
 
-    # Fail loud before persisting: a merged file that would not parse must never
-    # overwrite a working one.
-    budget_config.parse_config(raw)
-    payload = json.dumps(raw, indent=2) + "\n"
-    # Atomic publish: write a sibling temp file then rename over the target, so an
-    # interrupted or partial write can never truncate the budget config (the
-    # single source of truth) — the file is always either the old or the new whole.
-    # Filesystem errors (e.g. an unwritable or missing parent for --config) are
-    # surfaced as BudgetConfigError so callers report a structured error, not a
-    # raw traceback.
-    directory = path.parent if str(path.parent) else "."
-    try:
-        fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=path.name, suffix=".tmp")
-    except OSError as exc:
-        raise budget_config.BudgetConfigError(
-            f"cannot write budget config to {path}: {exc}"
-        ) from exc
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        os.replace(tmp_name, path)
-    except OSError as exc:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise budget_config.BudgetConfigError(
-            f"cannot write budget config to {path}: {exc}"
-        ) from exc
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+    _persist_config(path, raw)
     return {
         "path": str(path),
         "added": len(added),
         "already_tracked": len(skipped),
         "tracked_total": len(existing),
         "added_bills": added,
+    }
+
+
+def set_bill_lifecycle(
+    path,
+    name: str,
+    lifecycle: str,
+    cancel_effective: str | None = None,
+) -> dict:
+    """Set the lifecycle of one recurring bill in the budget file at ``path``.
+
+    The cancellation watch's write side: marks a bill ``canceling`` (a
+    cancellation was attempted) or ``canceled`` (confirmed), or back to
+    ``active``. ``cancel_effective`` is the ISO date the cancellation takes
+    effect and is required for the two non-active states (a charge on or after
+    it is what the audit flags as the bill "coming back"); for ``active`` it must
+    be omitted and any existing value is cleared.
+
+    The bill is located by ``name``, matched case-insensitively after trimming.
+    A name that matches no bill, or more than one, is an error rather than a
+    silent no-op or an ambiguous guess, so the caller always knows exactly which
+    bill changed. The edited config is re-validated and atomically written by
+    :func:`_persist_config`, so an invalid lifecycle/date combination is rejected
+    before it can overwrite a working config. Returns a summary of the change.
+    """
+    import json
+
+    from . import budget_config
+
+    valid = sorted(budget_config.LIFECYCLE_STATES)
+    if not isinstance(lifecycle, str) or lifecycle.strip().lower() not in valid:
+        raise budget_config.BudgetConfigError(
+            f"lifecycle must be one of {valid}, got {lifecycle!r}"
+        )
+    lifecycle = lifecycle.strip().lower()
+
+    if not path.exists():
+        raise budget_config.BudgetConfigError(
+            f"budget config {path} does not exist; nothing to mark"
+        )
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise budget_config.BudgetConfigError(
+            f"budget config {path} is not valid JSON: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise budget_config.BudgetConfigError(
+            f"cannot read budget config {path}: {exc}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise budget_config.BudgetConfigError("budget config must be a JSON object")
+
+    recurring = raw.get("recurring", [])
+    if not isinstance(recurring, list):
+        raise budget_config.BudgetConfigError(
+            "budget config 'recurring' must be a list"
+        )
+
+    target = name.strip().lower()
+    matches = [
+        entry
+        for entry in recurring
+        if isinstance(entry, dict)
+        and isinstance(entry.get("name"), str)
+        and entry["name"].strip().lower() == target
+    ]
+    if not matches:
+        raise budget_config.BudgetConfigError(
+            f"no recurring bill named {name!r} in {path}"
+        )
+    if len(matches) > 1:
+        raise budget_config.BudgetConfigError(
+            f"{len(matches)} recurring bills named {name!r} in {path}; "
+            "names must be unique to mark one"
+        )
+    entry = matches[0]
+
+    if lifecycle == "active":
+        # cancel_effective is meaningless for an active bill, so reactivating
+        # clears it; requiring the caller to pass none avoids a silent override.
+        if cancel_effective is not None:
+            raise budget_config.BudgetConfigError(
+                "cancel_effective must be omitted when reactivating a bill"
+            )
+        entry.pop("lifecycle", None)
+        entry.pop("cancel_effective", None)
+    else:
+        if cancel_effective is None:
+            raise budget_config.BudgetConfigError(
+                f"cancel_effective (an ISO date) is required to mark a bill "
+                f"{lifecycle!r}"
+            )
+        entry["lifecycle"] = lifecycle
+        entry["cancel_effective"] = cancel_effective
+
+    # _persist_config re-validates, so a malformed cancel_effective is rejected
+    # here (as a structured error) before it can overwrite a working config.
+    _persist_config(path, raw)
+    return {
+        "path": str(path),
+        "name": entry["name"],
+        "lifecycle": lifecycle,
+        "cancel_effective": entry.get("cancel_effective"),
     }

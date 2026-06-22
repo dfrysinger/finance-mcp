@@ -65,6 +65,7 @@ uv run finance-mcp set-category <txn_id> Travel      # pin one transaction's cat
 uv run finance-mcp sync --days 120                    # refresh from SimpleFIN
 uv run finance-mcp subscriptions detect               # save recurring charges as a tracked list
 uv run finance-mcp subscriptions                      # audit: did tracked bills post? + new candidates
+uv run finance-mcp subscriptions mark --name Sketch --lifecycle canceled --effective 2026-04-01
 uv run finance-mcp web                                # local read-only review UI in the browser
 ```
 
@@ -76,6 +77,15 @@ not post in its cycle — a possible billing problem or cancellation — and sur
 untracked recurring merchants as candidates to add. A saved subscription needs
 no envelope budget: a `match` keyword pins it to its merchant. Detection is a
 heuristic starting point — review the saved list and remove any false positives.
+
+`subscriptions mark` is the cancellation watch: after you cancel (or try to
+cancel) a subscription, mark it `canceling` (attempted, unconfirmed) or
+`canceled` (confirmed) with the effective date. The audit then stops reporting
+its expected charges as missing — the absence is what you wanted — and instead
+warns you if a charge posts on or after that date, so a cancellation that didn't
+take is surfaced rather than silently billed. `--lifecycle active` reactivates a
+bill. Recurring bills and subscriptions are one list: anything in the budget's
+`recurring` calendar can be watched this way.
 
 SimpleFIN caps a request at 90 days and expects <=24 requests/day, so `sync`
 chunks long ranges into <=89-day windows and you should rely on the archive for

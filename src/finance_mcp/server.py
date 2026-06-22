@@ -448,6 +448,37 @@ def subscriptions_detect(
 
 
 @mcp.tool()
+def subscriptions_mark(
+    name: str,
+    lifecycle: str,
+    cancel_effective: str | None = None,
+) -> dict[str, Any]:
+    """Mark a tracked recurring bill as canceling, canceled, or active again.
+
+    The cancellation watch: after you cancel (or try to cancel) a subscription,
+    record it here so the audit stops reporting its expected charges as missing
+    and instead warns you if it charges again. ``lifecycle`` is ``canceling`` (a
+    cancellation was attempted but not confirmed), ``canceled`` (confirmed), or
+    ``active`` (reactivate a bill you'd marked). ``cancel_effective`` is the
+    YYYY-MM-DD date the cancellation takes effect and is required for canceling
+    and canceled — any matching charge on or after it is surfaced as the bill
+    "coming back". Omit it when reactivating. The bill is found by ``name``
+    (case-insensitive); the name must match exactly one bill.
+    """
+    from . import budget_config, subscription
+
+    try:
+        result = subscription.set_bill_lifecycle(
+            config.budget_config_path(), name, lifecycle,
+            cancel_effective=cancel_effective,
+        )
+    except budget_config.BudgetConfigError as exc:
+        return {"ok": False, "error": str(exc)}
+    result["ok"] = True
+    return result
+
+
+@mcp.tool()
 def reconcile_transfers() -> dict[str, Any]:
     """Rebuild internal-transfer links from the archive (idempotent).
 
