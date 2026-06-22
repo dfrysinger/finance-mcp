@@ -556,6 +556,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   button.mini:hover { border-color:var(--accent); }
   .overlay { position:fixed; inset:0; background:rgba(0,0,0,.55);
              display:flex; align-items:center; justify-content:center; z-index:50; }
+  /* The hidden attribute must win over display:flex, or the modal shows on load. */
+  .overlay[hidden] { display:none; }
   .modal { background:var(--panel); border:1px solid var(--line); border-radius:10px;
            padding:18px 20px; width:min(420px,92vw); }
   .modal h3 { margin:0 0 4px; font-size:15px; }

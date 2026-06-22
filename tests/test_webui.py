@@ -576,3 +576,14 @@ def test_http_post_slow_body_hits_total_deadline(tmp_path, monkeypatch):
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
+
+
+def test_index_html_hides_modal_overlay_by_default():
+    # Regression: the mark-subscription modal must not render on page load. The
+    # .overlay rule sets display:flex, which overrides the HTML `hidden`
+    # attribute unless an explicit `.overlay[hidden]{display:none}` rule wins.
+    # Without it the modal popped up on the Accounts tab with nothing clicked.
+    html = webui.INDEX_HTML
+    assert 'id="markOverlay" class="overlay" hidden' in html
+    assert ".overlay[hidden]" in html
+    assert "display:none" in html.split(".overlay[hidden]", 1)[1][:40]
