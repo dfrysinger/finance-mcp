@@ -742,12 +742,71 @@ def test_reversed_window_raises():
         {"amount_tolerance_cents": -1},
         {"min_occurrences": 1},
         {"grace_days": -1},
+        {"day_tolerance": 367},
+        {"grace_days": 367},
     ],
 )
 def test_invalid_params_raise(kwargs):
     cfg = _config([CARD], [])
     with pytest.raises(ValueError):
         subscription.subscription_audit(cfg, [], start=WIN_START, end=WIN_END, **kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [{"day_tolerance": 800_000}, {"grace_days": 800_000}])
+def test_huge_tolerance_raises_valueerror_not_overflow(kwargs):
+    # A large day-count must be rejected with the documented ValueError contract,
+    # not crash with an opaque OverflowError from ``end - timedelta(days=...)``
+    # underflowing date.min (and not amplify monthly_dates to tens of thousands
+    # of occurrences per bill). These values are well past date.min underflow.
+    cfg = _config([CARD], [])
+    with pytest.raises(ValueError):
+        subscription.subscription_audit(cfg, [], start=WIN_START, end=WIN_END, **kwargs)
+
+
+def test_audit_boundary_dates_do_not_overflow():
+    # A pathological window at the representable date edges (reachable via the
+    # CLI/MCP date parsers) must not raise OverflowError from the look-back
+    # (``end - lookback``), match-window (``start - day_tolerance``), the
+    # per-occurrence coverage gate (``occ - day_tolerance``), or the next_due
+    # projection (``end + 62``). The date.min case carries a parseable
+    # NON-matching transaction and a day-1 bill so the coverage gate's occurrence
+    # arithmetic (``occ`` lands on date.min, ``occ - day_tolerance`` underflows)
+    # is actually exercised. The occurrence's full in-tolerance payment window
+    # reaches before any representable data, so coverage is unprovable and the
+    # bill must read "unseen" — NOT a false "overdue" from clamping the window
+    # start up to date.min. (An empty list or a matching txn would mask this.)
+    import datetime
+
+    cfg_min = _config([CARD], [_bill("Rent", "Card", 9.99, 1, match="RENT")])
+    near_min = subscription.subscription_audit(
+        cfg_min,
+        [_txn("t1", "card", "-5.00", on="0001-01-01", desc="GROCERY")],
+        start=datetime.date.min,
+        end=datetime.date.min + datetime.timedelta(days=10),
+    )
+    assert near_min["summary"]["tracked"] == 1
+    assert near_min["tracked"][0]["status"] == "unseen"
+
+    # date.max with a day-31 bill: the next_due projection clamps end+1/end+62
+    # back to date.max, but the strictly-after-end filter must yield no future
+    # occurrence rather than surfacing the window-end date itself.
+    cfg_max = _config([CARD], [_bill("Rent", "Card", 9.99, 31, match="RENT")])
+    near_max = subscription.subscription_audit(
+        cfg_max, [], start=datetime.date.max, end=datetime.date.max
+    )
+    assert near_max["summary"]["tracked"] == 1
+    assert near_max["tracked"][0]["next_due"] is None
+
+
+def test_detect_boundary_dates_do_not_overflow():
+    # detect_subscriptions widens its charge window by ``start - day_tolerance``;
+    # start at date.min must clamp rather than underflow.
+    import datetime
+
+    out = subscription.detect_subscriptions(
+        [], start=datetime.date.min, end=datetime.date.min
+    )
+    assert out["bills"] == []
 
 
 def test_report_is_json_serializable():
@@ -758,7 +817,186 @@ def test_report_is_json_serializable():
     assert round_tripped["summary"]["tracked"] == 1
 
 
-# --- end-to-end over the archive ---------------------------------------------
+# --- tracked roster -----------------------------------------------------------
+
+
+def test_tracked_lists_every_bill_once_with_due_fields():
+    cfg = _config(
+        [CARD],
+        [
+            _bill("Netflix", "Card", 15.99, 10, match="NETFLIX"),
+            _bill("Spotify", "Card", 11.99, 5, match="SPOTIFY"),
+        ],
+    )
+    txns = [_txn("t1", "card", "-15.99", on="2026-03-10", desc="NETFLIX")]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    tracked = report["tracked"]
+    assert _names(tracked, "name") == ["Netflix", "Spotify"]
+    netflix = tracked[0]
+    assert netflix["amount"] == "15.99"
+    assert netflix["day"] == 10
+    assert netflix["envelope"] == "Card"
+    # next due is the first scheduled occurrence strictly after the window end.
+    assert netflix["next_due"] == "2026-06-10"
+
+
+def test_tracked_status_active_when_seen_overdue_when_missing():
+    cfg = _config(
+        [CARD],
+        [
+            _bill("Netflix", "Card", 15.99, 10, match="NETFLIX"),
+            _bill("Spotify", "Card", 11.99, 5, match="SPOTIFY"),
+        ],
+    )
+    # An early-January anchor charge establishes data coverage from the start of
+    # the window, so Spotify's never-posted occurrences are genuinely overdue
+    # rather than merely beyond the earliest available data.
+    txns = [
+        _txn("a0", "card", "-5.00", on="2026-01-02", desc="GROCERY"),
+        _txn("t1", "card", "-15.99", on="2026-05-10", desc="NETFLIX"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    by_name = {t["name"]: t for t in report["tracked"]}
+    assert by_name["Netflix"]["status"] == "active"
+    assert by_name["Netflix"]["last_seen"] == "2026-05-10"
+    assert by_name["Spotify"]["status"] == "overdue"
+    assert by_name["Spotify"]["last_seen"] is None
+
+
+def test_tracked_early_in_tolerance_payment_is_active_not_overdue():
+    # A charge that clears a few days BEFORE the nominal due day still satisfies
+    # the occurrence (within day_tolerance), so status must read "active", never
+    # "overdue" — and must agree with expected_missing, which omits the occurrence.
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
+    # Single charge on the 5th of a day-10 bill; the May occurrence is past grace
+    # (it would be mislabeled overdue if status compared the post date, 05-05, to
+    # the scheduled due date, 05-10).
+    txns = [_txn("t1", "card", "-15.99", on="2026-05-05", desc="NETFLIX")]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 5, 1), end=date(2026, 5, 31), day_tolerance=7
+    )
+    netflix = report["tracked"][0]
+    assert netflix["status"] == "active"
+    assert netflix["last_seen"] == "2026-05-05"
+    # The May-10 occurrence was satisfied, so it must NOT be reported missing.
+    assert report["expected_missing"] == []
+
+
+def test_tracked_status_unseen_when_not_yet_overdue():
+    # A bill due on the 28th, audited with end just two days later: its January
+    # occurrence is inside the grace window, so it is neither missing nor seen ->
+    # "unseen", not "overdue".
+    cfg = _config([CARD], [_bill("Gym", "Card", 30.00, 28, match="GYM")])
+    report = subscription.subscription_audit(
+        cfg, [], start=date(2026, 1, 1), end=date(2026, 1, 30), day_tolerance=7
+    )
+    gym = report["tracked"][0]
+    assert gym["status"] == "unseen"
+    assert gym["last_seen"] is None
+    assert report["expected_missing"] == []
+
+
+def test_tracked_status_unseen_on_empty_archive_though_occurrence_missing():
+    # Empty archive: status requires evidence, so an unpaid in-window occurrence
+    # reads "unseen" (an early payment we never synced cannot be ruled out) even
+    # though it is still listed in expected_missing as a factual per-occurrence
+    # absence. status and expected_missing are deliberately distinct here.
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
+    report = subscription.subscription_audit(
+        cfg, [], start=date(2026, 5, 1), end=date(2026, 5, 31), day_tolerance=7
+    )
+    netflix = report["tracked"][0]
+    assert netflix["status"] == "unseen"
+    assert [m["expected_date"] for m in report["expected_missing"]] == ["2026-05-10"]
+    # A narrow window that opens AFTER this month's due day yields no in-window
+    # occurrence, yet the bill is genuinely overdue. The status look-back reaches
+    # back to the most recent should-have-posted occurrence (here May 10) and,
+    # finding no payment, reports "overdue" — even though expected_missing stays
+    # scoped to the requested window and is therefore empty.
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
+    # Unrelated charge in March establishes the earliest-data floor; no Netflix
+    # charge ever posts, so the day-10 bill is unpaid.
+    txns = [_txn("t1", "card", "-9.99", on="2026-03-15", desc="COFFEE SHOP")]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 5, 15), end=date(2026, 5, 31), day_tolerance=7
+    )
+    netflix = report["tracked"][0]
+    assert netflix["status"] == "overdue"
+    assert netflix["last_seen"] is None
+    # The overdue May-10 occurrence predates the window start, so it is NOT
+    # reported as a missing occurrence — status and expected_missing stay distinct.
+    assert report["expected_missing"] == []
+
+
+def test_tracked_status_lookback_never_invents_overdue_before_data():
+    # A day-10 bill audited in a narrow late-month window whose look-back reaches
+    # the May-10 occurrence must NOT read "overdue" when data only begins May 12:
+    # a May-10 charge could have posted as early as May 3 (within tolerance) on a
+    # day we hold no data for, so payment can't be denied. The occurrence is still
+    # generated (so a real charge could match), but it does not count toward
+    # overdue because its payment window isn't covered -> status stays "unseen".
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
+    txns = [_txn("t1", "card", "-9.99", on="2026-05-12", desc="COFFEE SHOP")]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 5, 15), end=date(2026, 5, 31), day_tolerance=7
+    )
+    netflix = report["tracked"][0]
+    assert netflix["status"] == "unseen"
+    assert report["expected_missing"] == []
+
+
+def test_tracked_status_late_in_tolerance_payment_matches_via_lookback():
+    # The look-back must GENERATE the most recent occurrence even when data begins
+    # after the due day, so a genuine late-but-in-tolerance charge still matches.
+    # Bill due the 10th, the matching charge posts the 12th (2 days late, within
+    # tolerance 7), data begins the 12th, window opens the 15th -> "active", not a
+    # false "unseen" from suppressing the occurrence.
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
+    txns = [_txn("t1", "card", "-15.99", on="2026-05-12", desc="NETFLIX")]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 5, 15), end=date(2026, 5, 31), day_tolerance=7
+    )
+    netflix = report["tracked"][0]
+    assert netflix["status"] == "active"
+    assert netflix["last_seen"] == "2026-05-12"
+
+
+def test_tracked_status_overdue_requires_full_payment_window_coverage():
+    # Coverage boundary: an unmatched past-grace occurrence is overdue only when
+    # data covers its earliest in-tolerance payment date (occ - day_tolerance).
+    # Day-10 bill, tolerance 7 -> earliest satisfying charge is May 3. With data
+    # beginning exactly May 3 the window is fully observed -> "overdue"; beginning
+    # one day later (May 4) leaves May 3 unobserved -> "unseen".
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
+    covered = subscription.subscription_audit(
+        cfg,
+        [_txn("a", "card", "-1.00", on="2026-05-03", desc="COFFEE")],
+        start=date(2026, 5, 15), end=date(2026, 5, 31), day_tolerance=7,
+    )
+    assert covered["tracked"][0]["status"] == "overdue"
+    uncovered = subscription.subscription_audit(
+        cfg,
+        [_txn("a", "card", "-1.00", on="2026-05-04", desc="COFFEE")],
+        start=date(2026, 5, 15), end=date(2026, 5, 31), day_tolerance=7,
+    )
+    assert uncovered["tracked"][0]["status"] == "unseen"
+
+
+def test_tracked_status_lookback_spans_large_grace():
+    # The look-back must reach the most recent past-grace occurrence even when
+    # grace_days far exceeds the default. A day-15 bill with a 40-day grace,
+    # audited in a narrow late-June window with full data coverage from January
+    # and no matching charge, is genuinely overdue on its April-15 occurrence
+    # (66 days past a 40-day grace) — a fixed two-month look-back would drop that
+    # occurrence and mislabel the bill "unseen".
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 15, match="NETFLIX")])
+    txns = [_txn("a0", "card", "-5.00", on="2026-01-02", desc="GROCERY")]
+    report = subscription.subscription_audit(
+        cfg, txns,
+        start=date(2026, 6, 15), end=date(2026, 6, 20),
+        day_tolerance=7, grace_days=40,
+    )
+    assert report["tracked"][0]["status"] == "overdue"
 
 
 def test_e2e_report_over_archive(tmp_path, monkeypatch):
@@ -802,6 +1040,18 @@ def test_e2e_report_no_archive_is_empty(tmp_path, monkeypatch):
     # No transactions at all -> the one March occurrence is overdue and missing.
     assert _names(report["expected_missing"], "expected_date") == ["2026-03-10"]
     assert report["candidate_new"] == []
+
+
+def test_report_boundary_end_does_not_overflow(tmp_path, monkeypatch):
+    # subscription_report computes its own default start (``end - window``) before
+    # delegating to the audit; an ``end`` at date.min with no start must clamp
+    # rather than raise OverflowError from the subtraction.
+    import datetime
+
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
+    report = subscription.subscription_report(cfg, start=None, end=datetime.date.min)
+    assert report["summary"]["tracked"] == 1
 
 
 # --- detect_subscriptions + merge_subscriptions_into_file --------------------
@@ -1244,6 +1494,18 @@ def test_detect_tags_unsupported_cadence_kind():
     )
     assert out["skipped"]
     assert all(s["kind"] == "unsupported_cadence" for s in out["skipped"])
+
+
+@pytest.mark.parametrize("day_tolerance", [-1, 800_000])
+def test_detect_rejects_out_of_range_day_tolerance(day_tolerance):
+    # detect_subscriptions widens its charge window by ``start - day_tolerance``;
+    # a negative value is invalid and an enormous one would underflow date.min
+    # with an opaque OverflowError. Both must surface as the documented ValueError.
+    with pytest.raises(ValueError):
+        subscription.detect_subscriptions(
+            [], start=date(2026, 1, 1), end=date(2026, 5, 31),
+            day_tolerance=day_tolerance,
+        )
 
 
 def test_detect_surfaces_recurring_charge_at_different_price_for_review():

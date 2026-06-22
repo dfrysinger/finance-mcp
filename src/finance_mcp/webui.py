@@ -602,6 +602,19 @@ const RENDER = {
       <div class="card"><div class="k">missing</div><div class="v">${sm.missing_occurrences||0}</div></div>
       <div class="card"><div class="k">candidates</div><div class="v">${sm.candidates||0}</div></div>
     </div>`;
+    out += `<h2>Tracked subscriptions</h2>`;
+    if (!sm.tracked) {
+      out += `<p class="muted">No saved subscriptions yet &mdash; run <code>finance-mcp subscriptions detect</code> to save your recurring charges as a tracked list.</p>`;
+    }
+    out += table(d.tracked||[], [
+      {label:"Subscription",get:r=>r.name},
+      {label:"Envelope",get:r=>r.envelope||""},
+      {label:"Amount",num:true,money:true,get:r=>r.amount},
+      {label:"Due day",num:true,get:r=>r.day},
+      {label:"Next due",get:r=>r.next_due||""},
+      {label:"Last seen",get:r=>r.last_seen||"never"},
+      {label:"Status",html:true,get:r=>pill(r.status, r.status==="overdue"?"bad":r.status==="active"?"good":"warn")},
+    ]);
     out += `<h2>Missing expected charges</h2>`;
     out += table(d.expected_missing||[], [
       {label:"Bill",get:r=>r.name},
@@ -611,9 +624,6 @@ const RENDER = {
       {label:"Last seen",get:r=>r.last_seen||"never"},
     ]);
     out += `<h2>Untracked recurring candidates</h2>`;
-    if (!sm.tracked) {
-      out += `<p class="muted">No saved subscriptions yet &mdash; every recurring charge below was detected from your history. Run <code>finance-mcp subscriptions detect</code> to save them as a tracked list so they aren't re-inferred each time.</p>`;
-    }
     out += table(d.candidate_new||[], [
       {label:"Merchant",get:r=>r.merchant},
       {label:"Amount",num:true,money:true,get:r=>r.amount},

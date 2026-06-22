@@ -3,6 +3,11 @@ recurring-looking merchants aren't tracked yet?
 
 Two scripted outputs the assistant reasons over:
 
+* **tracked** (deterministic) — the full roster of configured ``recurring``
+  bills, one entry each, carrying the expected amount, nominal day-of-month, the
+  date last seen, the next due date, and a status (``active``/``overdue``/
+  ``unseen``). This is the complete subscription list, independent of whether any
+  given bill posted this window.
 * **expected_missing** (deterministic) — a tracked recurring charge (a budget
   ``recurring`` bill, optionally pinned to its merchant via the bill's ``match``
   keyword) whose monthly occurrence in the window has no matching debit. Because
@@ -39,6 +44,27 @@ from .normalize import amount_to_cents
 DEFAULT_WINDOW_DAYS = 365
 DEFAULT_DAY_TOLERANCE = 7
 DEFAULT_MIN_OCCURRENCES = 3
+# Minimum status look-back: how far before the audit window start a tracked
+# bill's *status* may look back to find its most recent should-have-posted
+# occurrence. The effective look-back is max(this, grace + 31) — a monthly bill's
+# latest occurrence on or before ``end - grace`` sits at most ~31 days earlier, so
+# the window must span grace + 31 days to always generate it; this two-month floor
+# covers the common small-grace case. The look-back only *generates* occurrences
+# (so a late in-tolerance charge can still match); an unmatched occurrence is
+# judged overdue only when the data actually covers its full payment window, so
+# the look-back can never invent an "overdue" for a date with no evidence either
+# way.
+_STATUS_LOOKBACK_DAYS = 62
+
+# Upper bound for the day-count tolerances (``day_tolerance`` and ``grace_days``).
+# Both are public, server- and CLI-exposed parameters that widen the status
+# look-back (``max(_STATUS_LOOKBACK_DAYS, grace + 31)`` days). Without a cap a
+# large value would expand ``monthly_dates`` to tens of thousands of occurrences
+# per bill; a monthly bill never needs a tolerance or grace beyond a single
+# cycle, so a one-year ceiling is generous. (Pathological boundary *dates* — an
+# ``end``/``start`` at date.min/date.max — are handled separately by the
+# ``_shift_days`` clamp, not by this cap.)
+_MAX_TOLERANCE_DAYS = 366
 
 # Median-spacing bands (in days) used to label a candidate's cadence. A group
 # whose median gap falls outside every band is treated as irregular, not a
@@ -52,6 +78,23 @@ _CADENCE_ORDER = {"weekly": 0, "monthly": 1, "yearly": 2}
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _DIGITS_ONLY = re.compile(r"^\d+$")
+
+
+def _shift_days(d: date, days: int) -> date:
+    """Shift ``d`` by ``days`` (which may be negative), clamping to the
+    representable date range instead of raising ``OverflowError``.
+
+    The audit's internal windows only ever widen *past* real transaction data
+    (a leading-edge look-back, or a short trailing projection for ``next_due``),
+    so clamping a pathological boundary ``start``/``end`` (e.g. ``date.min`` or
+    ``date.max``, reachable via the CLI/MCP date parsers) to the representable
+    edge yields a correct result while keeping the public surface from raising
+    an opaque ``OverflowError``.
+    """
+    try:
+        return d + timedelta(days=days)
+    except OverflowError:
+        return date.max if days > 0 else date.min
 
 
 @dataclass(frozen=True)
@@ -283,25 +326,79 @@ def _match_tracked_bills(
     bill_token_sets: list[frozenset[str] | None],
     *,
     start: date,
+    window_start: date,
     end: date,
+    earliest_txn: date | None,
     day_tolerance: int,
     amount_tolerance_cents: int,
     grace: int,
-) -> tuple[set[str], list[dict]]:
+) -> tuple[set[str], list[dict], list[dict]]:
     """Greedy-match each recurring bill's monthly occurrences against charges.
 
-    Returns ``(consumed, expected_missing)``. A charge is *consumed* by the
-    closest unconsumed in-tolerance occurrence (exact amount preferred, then
+    Returns ``(consumed, expected_missing, tracked)``. A charge is *consumed* by
+    the closest unconsumed in-tolerance occurrence (exact amount preferred, then
     least date drift). An occurrence with no match is reported missing only once
     it is genuinely overdue (outside the ``grace`` window). ``consumed`` does not
     depend on ``grace`` — it is the set of charges already covered by a tracked
     bill, which both the audit and detect use to avoid re-surfacing them.
+
+    Occurrences are expanded across ``[start, end]`` (``start`` may reach before
+    ``window_start`` so a narrow window can still see this bill's most recent due
+    date), but a missing occurrence is only reported in ``expected_missing`` when
+    it falls on or after ``window_start`` — the requested audit window. ``tracked``
+    status, by contrast, is judged across the full ``[start, end]`` span so it can
+    tell active from overdue regardless of how narrow ``window_start`` is.
+
+    ``tracked`` is the full roster of configured recurring bills — one entry per
+    bill regardless of whether it posted this window — each carrying its expected
+    amount, nominal day-of-month, the date it was last seen, its next due date,
+    and a status reflecting whether it is *currently* posting on schedule:
+    ``active`` when the most recent due charge posted, ``overdue`` when the most
+    recent occurrence that is past the grace window did not post, and ``unseen``
+    when no charge has matched and nothing is overdue yet. An occurrence only
+    counts toward overdue when ``earliest_txn`` shows we hold data covering its
+    full in-tolerance payment window (``occ - day_tolerance``); otherwise an early
+    payment could be unobservable, so the bill stays ``unseen`` rather than being
+    falsely flagged overdue. Early-window gaps that predate the latest seen charge
+    are historical noise and do not, on their own, mark a subscription overdue.
     """
     consumed: set[str] = set()
     expected_missing: list[dict] = []
+    tracked: list[dict] = []
     for bill, bill_tokens in zip(config.recurring, bill_token_sets):
         last_seen: date | None = None
+        # The latest scheduled occurrence that actually posted (matched a charge).
+        # Compared against latest_due below: status is judged on whether the most
+        # recent should-have-posted *occurrence* was paid, not on the charge's
+        # posting date — a charge that clears a few days early (within tolerance)
+        # still satisfies its occurrence and must not read as overdue.
+        last_matched_due: date | None = None
+        # The latest occurrence that is already past the grace window AND whose
+        # full payment window is covered by available data — i.e. the most recent
+        # charge that definitely should have posted by now and that we would have
+        # seen if it had.
+        latest_due: date | None = None
         for occ in monthly_dates(bill.day, start, end):
+            # An occurrence counts toward overdue only when its full in-tolerance
+            # payment window is observed: a charge satisfying `occ` may post as
+            # early as `occ - day_tolerance`, so if data begins after that day (or
+            # there is no data at all) we cannot rule out an unseen early payment
+            # and must not call the bill overdue — it reads "unseen" instead.
+            # ``expected_missing`` is independent: it still reports the occurrence
+            # as missing, since that is a factual per-occurrence absence.
+            #
+            # The window-start subtraction is done only when it stays
+            # representable. If ``occ - day_tolerance`` would underflow date.min
+            # the window reaches before any possible data, so the occurrence is by
+            # definition not covered — a clamp UP to date.min would instead read
+            # as covered and could invent a false "overdue" at the boundary.
+            covered = (
+                earliest_txn is not None
+                and day_tolerance <= (occ - date.min).days
+                and (occ - timedelta(days=day_tolerance)) >= earliest_txn
+            )
+            if covered and (end - occ).days >= grace:
+                latest_due = occ
             # Greedy earliest-first match: the closest unconsumed charge within
             # tolerance, preferring an exact amount, then least date drift.
             best: _Charge | None = None
@@ -327,10 +424,17 @@ def _match_tracked_bills(
                 consumed.add(best.tid)
                 if last_seen is None or best.on > last_seen:
                     last_seen = best.on
+                if last_matched_due is None or occ > last_matched_due:
+                    last_matched_due = occ
                 continue
             # No charge matched. Only call it missing once it is genuinely
             # overdue; an occurrence still inside the grace window may post late.
             if (end - occ).days < grace:
+                continue
+            # A pre-window occurrence (only reachable via the status look-back)
+            # still informs status above, but the missing alert stays scoped to
+            # the requested audit window.
+            if occ < window_start:
                 continue
             expected_missing.append(
                 {
@@ -342,7 +446,41 @@ def _match_tracked_bills(
                     "last_seen": last_seen.isoformat() if last_seen is not None else None,
                 }
             )
-    return consumed, expected_missing
+        # Current status from the most recent should-have-posted occurrence: behind
+        # only if that occurrence has no matching charge (compared by occurrence
+        # date, so an early-but-in-tolerance payment counts as on time).
+        if latest_due is None:
+            status = "active" if last_seen is not None else "unseen"
+        elif last_matched_due is None or last_matched_due < latest_due:
+            status = "overdue"
+        else:
+            status = "active"
+        # The next scheduled occurrence strictly after the window end, reusing the
+        # canonical monthly expansion so the projected due date matches everywhere
+        # else this bill is reasoned about. 62 days guarantees at least one
+        # monthly occurrence regardless of where `end` falls in the month. The
+        # ``d > end`` filter enforces the strictly-after invariant even at the
+        # date.max edge, where ``_shift_days(end, 1)`` clamps back to ``end`` and
+        # could otherwise surface the window-end date itself as the "next" due.
+        upcoming = [
+            d
+            for d in monthly_dates(bill.day, _shift_days(end, 1), _shift_days(end, 62))
+            if d > end
+        ]
+        tracked.append(
+            {
+                "name": bill.name,
+                "envelope": bill.envelope,
+                "amount": _dollars(bill.amount_cents),
+                "day": bill.day,
+                "cadence": bill.cadence,
+                "match": bill.match,
+                "last_seen": last_seen.isoformat() if last_seen is not None else None,
+                "next_due": upcoming[0].isoformat() if upcoming else None,
+                "status": status,
+            }
+        )
+    return consumed, expected_missing, tracked
 
 
 def subscription_audit(
@@ -367,6 +505,10 @@ def subscription_audit(
         raise ValueError(f"end {end} is before start {start}")
     if day_tolerance < 0:
         raise ValueError(f"day_tolerance must be >= 0, got {day_tolerance}")
+    if day_tolerance > _MAX_TOLERANCE_DAYS:
+        raise ValueError(
+            f"day_tolerance must be <= {_MAX_TOLERANCE_DAYS}, got {day_tolerance}"
+        )
     if amount_tolerance_cents < 0:
         raise ValueError(f"amount_tolerance_cents must be >= 0, got {amount_tolerance_cents}")
     if min_occurrences < 2:
@@ -374,14 +516,31 @@ def subscription_audit(
     grace = day_tolerance if grace_days is None else grace_days
     if grace < 0:
         raise ValueError(f"grace_days must be >= 0, got {grace}")
+    if grace > _MAX_TOLERANCE_DAYS:
+        raise ValueError(
+            f"grace_days must be <= {_MAX_TOLERANCE_DAYS}, got {grace}"
+        )
 
     account_index = config.account_index()
+    # Status look-back: a bill's tracked status is judged from its most recent
+    # should-have-posted occurrence, which can sit before a narrow window's start.
+    # Generate occurrences back far enough to always include that occurrence — the
+    # latest one on or before ``end - grace`` is at most ~31 days before it, so the
+    # look-back spans max(_STATUS_LOOKBACK_DAYS, grace + 31) days (never past
+    # `start`, since the look-back only widens the leading edge) so even a late
+    # in-tolerance charge can still match and a large grace_days can't drop the
+    # occurrence. Whether an *unmatched* occurrence counts as overdue is gated
+    # separately, inside _match_tracked_bills, by the earliest transaction we hold
+    # — so generating an older occurrence here can never invent a false overdue.
+    earliest_txn = _earliest_txn_date(transactions)
+    lookback_days = max(_STATUS_LOOKBACK_DAYS, grace + 31)
+    status_start = min(start, _shift_days(end, -lookback_days))
     # Match against charges from a window widened on the leading edge by
-    # day_tolerance: an occurrence at `start` can legitimately have been paid by
+    # day_tolerance: an occurrence at the start can legitimately have been paid by
     # a charge that posted up to day_tolerance days earlier. candidate_new stays
     # strictly within [start, end] (enforced in _candidate_new) so stale archive
     # history can never surface as a "new" subscription.
-    match_start = start - timedelta(days=day_tolerance)
+    match_start = _shift_days(status_start, -day_tolerance)
     charges = _charges(transactions, account_index, start=match_start, end=end)
 
     consumed: set[str] = set()
@@ -390,12 +549,14 @@ def subscription_audit(
     # sets are reused as `tracked_token_sets` to keep a tracked subscription from
     # resurfacing as a "new" candidate.
     bill_token_sets, tracked_token_sets, _ = _bill_token_sets(config)
-    consumed, expected_missing = _match_tracked_bills(
+    consumed, expected_missing, tracked = _match_tracked_bills(
         config,
         charges,
         bill_token_sets,
-        start=start,
+        start=status_start,
+        window_start=start,
         end=end,
+        earliest_txn=earliest_txn,
         day_tolerance=day_tolerance,
         amount_tolerance_cents=amount_tolerance_cents,
         grace=grace,
@@ -413,6 +574,7 @@ def subscription_audit(
         "window": {"start": start.isoformat(), "end": end.isoformat()},
         "day_tolerance": day_tolerance,
         "min_occurrences": min_occurrences,
+        "tracked": tracked,
         "expected_missing": expected_missing,
         "candidate_new": candidate_new,
         "summary": {
@@ -719,13 +881,16 @@ def subscription_report(
     the earliest transaction date: occurrences before any data exists could only
     ever be reported "missing" because there is nothing to match them, which is
     noise, not a billing signal. (With an empty archive there is no earliest
-    date, so a tracked bill is still reported overdue — the absence of the charge
-    is the signal in that case.)
+    date, so every in-window occurrence is still listed in ``expected_missing`` —
+    the absence of any charge is the signal there. A bill's tracked ``status``,
+    however, requires evidence: with no data covering an occurrence's payment
+    window it reads ``unseen`` rather than ``overdue``, since an early payment we
+    never synced cannot be ruled out.)
     """
     from . import store
 
     end = end or date.today()
-    start = start or (end - timedelta(days=DEFAULT_WINDOW_DAYS))
+    start = start or _shift_days(end, -DEFAULT_WINDOW_DAYS)
 
     view = store.load_archive_view()
     transactions = view["transactions"]
@@ -802,6 +967,10 @@ def detect_subscriptions(
         raise ValueError(f"end {end} is before start {start}")
     if day_tolerance < 0:
         raise ValueError(f"day_tolerance must be >= 0, got {day_tolerance}")
+    if day_tolerance > _MAX_TOLERANCE_DAYS:
+        raise ValueError(
+            f"day_tolerance must be <= {_MAX_TOLERANCE_DAYS}, got {day_tolerance}"
+        )
     cfg = config if config is not None else BudgetConfig(
         version=0, envelopes=(), recurring=(), scheduled_transfers=()
     )
@@ -812,7 +981,7 @@ def detect_subscriptions(
     charges = _charges(
         transactions,
         cfg.account_index(),
-        start=start - timedelta(days=day_tolerance),
+        start=_shift_days(start, -day_tolerance),
         end=end,
     )
     # Exclude charges already covered by an existing tracked bill (keyword- OR
@@ -820,12 +989,14 @@ def detect_subscriptions(
     # an already-tracked subscription is never proposed a second time. consumed is
     # grace-independent, so grace_days is immaterial here.
     bill_token_sets, tracked_token_sets, tracked_amounts = _bill_token_sets(cfg)
-    consumed, _ = _match_tracked_bills(
+    consumed, _, _ = _match_tracked_bills(
         cfg,
         charges,
         bill_token_sets,
         start=start,
+        window_start=start,
         end=end,
+        earliest_txn=_earliest_txn_date(transactions),
         day_tolerance=day_tolerance,
         amount_tolerance_cents=0,
         grace=day_tolerance,

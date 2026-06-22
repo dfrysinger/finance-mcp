@@ -542,6 +542,14 @@ def _cmd_subscriptions(args: argparse.Namespace) -> int:
     sm = report["summary"]
     print(f"Subscription audit {w['start']} -> {w['end']}")
     print(f"  Tracked bills: {sm['tracked']}")
+    if report.get("tracked"):
+        print("  Tracked subscriptions:")
+        for t in report["tracked"]:
+            env = f" [{t['envelope']}]" if t.get("envelope") else ""
+            last = t.get("last_seen") or "never"
+            nxt = t.get("next_due") or "?"
+            print(f"    {t['name']}{env}: ${t['amount']} on day {t['day']} "
+                  f"({t['status']}) — next due {nxt}, last seen {last}")
     if report["expected_missing"]:
         print("  MISSING expected charges (possible billing problem / cancellation):")
         for m in report["expected_missing"]:

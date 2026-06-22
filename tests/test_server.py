@@ -179,6 +179,13 @@ def test_subscription_audit_report_tool(tmp_path, monkeypatch):
     out = server.subscription_audit_report(start="2026-01-01", end="2026-05-31")
     assert out["summary"]["tracked"] == 1
     assert len(out["expected_missing"]) >= 1
+    # The full tracked roster is exposed so the surface can show every
+    # subscription and its due date, not only the missing/candidate slices.
+    assert [t["name"] for t in out["tracked"]] == ["Netflix"]
+    netflix = out["tracked"][0]
+    assert netflix["day"] == 10
+    assert netflix["next_due"] == "2026-06-10"
+    assert netflix["status"] in {"active", "overdue", "unseen"}
 
 
 def test_report_tool_missing_config_returns_error(tmp_path, monkeypatch):

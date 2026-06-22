@@ -353,9 +353,11 @@ def subscription_audit_report(
     surface untracked recurring merchants as candidates for the assistant to judge.
 
     Dates are YYYY-MM-DD; ``end`` defaults to today and ``start`` to a year back so
-    a monthly charge clears ``min_occurrences``. ``expected_missing`` is the
-    deterministic high-stakes alert; ``candidate_new`` is advisory — the assistant
-    decides which candidates are real subscriptions.
+    a monthly charge clears ``min_occurrences``. ``tracked`` is the full roster of
+    configured recurring bills with each one's amount, due day, last-seen date, and
+    next due date. ``expected_missing`` is the deterministic high-stakes alert;
+    ``candidate_new`` is advisory — the assistant decides which candidates are real
+    subscriptions.
     """
     from . import budget_config, subscription
 
