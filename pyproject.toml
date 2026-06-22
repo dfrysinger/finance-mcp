@@ -15,6 +15,7 @@ dependencies = [
 [project.scripts]
 finance-mcp = "finance_mcp.cli:main"
 finance-mcp-server = "finance_mcp.server:main"
+finance-mcp-web = "finance_mcp.webui:_console_main"
 
 [build-system]
 requires = ["hatchling"]

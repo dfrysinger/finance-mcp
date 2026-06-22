@@ -561,6 +561,13 @@ def _cmd_confirm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_web(args: argparse.Namespace) -> int:
+    from . import webui
+
+    return webui.serve(host=args.host, port=args.port,
+                       allow_hosts=tuple(args.allow_host))
+
+
 def _print_errors(errors: list, errlist: list) -> None:
     for err in [*(errors or []), *(errlist or [])]:
         print(f"  ! SimpleFIN: {err}", file=sys.stderr)
@@ -726,6 +733,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_cf.add_argument("link_id", type=int, help="the link id to confirm")
     p_cf.add_argument("--json", action="store_true")
     p_cf.set_defaults(func=_cmd_confirm)
+
+    p_web = sub.add_parser(
+        "web",
+        help="serve a local read-only web UI for reviewing the archive",
+    )
+    p_web.add_argument("--host", default="127.0.0.1",
+                       help="bind address (default 127.0.0.1; serves private data)")
+    p_web.add_argument("--port", type=int, default=8765, help="port (default 8765)")
+    p_web.add_argument("--allow-host", action="append", default=[], metavar="HOST",
+                       help="extra Host-header name allowed to reach the API "
+                            "(repeatable; needed to reach a non-loopback bind)")
+    p_web.set_defaults(func=_cmd_web)
 
     return parser
 

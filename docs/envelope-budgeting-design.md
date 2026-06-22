@@ -375,6 +375,27 @@ second-class citizen.
   audited engine the single source of truth and the surfaces independently
   testable.
 
+### Web UI (`webui.py`) · **built** · read-only review surface
+
+A third surface, `finance-mcp web`, serves a local single-page app plus a small
+JSON API for reviewing the archive and reports in a browser.
+
+- **Reuses the MCP tool functions verbatim.** Each `/api/<name>` endpoint maps
+  to a `server.py` callable, so the browser, the CLI, and Copilot all see one
+  consistent snapshot and the web layer introduces no new analysis logic — it
+  only routes, coerces whitelisted query params, and renders.
+- **Read-only by construction.** It exposes only the read + report tools; there
+  is no sync or confirm endpoint, so reviewing in the browser can never mutate
+  the archive. Mutations stay on the CLI/MCP path that already gates them.
+- **Localhost-bound and private.** Binds to `127.0.0.1` by default (it serves
+  private financial data), sends `X-Frame-Options: DENY` + `Cache-Control:
+  no-store`, and always validates the request `Host` header against an allowlist
+  (loopback names plus any `--allow-host`), so a loopback bind is not defeated by
+  DNS-rebinding and a wildcard bind still refuses an arbitrary `Host`. Bad input
+  is reported as structured `400`/`403`/`404`/`{ok:false}` JSON rather than
+  leaking a traceback. `handle_api` is a pure function so the routing/coercion
+  contract is unit-tested without a socket.
+
 ## Budget config
 
 A single user-supplied JSON file (default `~/.finance-mcp/budget.json`,

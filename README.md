@@ -63,12 +63,34 @@ uv run finance-mcp rules add --pattern "trader joe" --category Groceries
 uv run finance-mcp rules rm --rule-id <id>           # remove a rule
 uv run finance-mcp set-category <txn_id> Travel      # pin one transaction's category
 uv run finance-mcp sync --days 120                    # refresh from SimpleFIN
+uv run finance-mcp web                                # local read-only review UI in the browser
 ```
 
 SimpleFIN caps a request at 90 days and expects <=24 requests/day, so `sync`
 chunks long ranges into <=89-day windows and you should rely on the archive for
 day-to-day queries rather than re-syncing constantly. Any SimpleFIN warnings or
 errors (`errors`/`errlist`) are always surfaced.
+
+## Web UI (review in the browser)
+
+`finance-mcp web` starts a local, read-only web UI for reviewing the archive and
+the budgeting reports without leaving the terminal-driven workflow:
+
+```bash
+uv run finance-mcp web                 # serves http://127.0.0.1:8765/
+uv run finance-mcp web --port 9000     # pick a different port
+```
+
+It binds to `127.0.0.1` only by default because it serves private financial data
+(override with `--host` only if you understand the exposure). The request Host
+header is always checked against an allowlist, so a `127.0.0.1` bind is not
+defeated by DNS-rebinding; to reach a non-loopback or wildcard bind from another
+device, name that device-facing host with `--allow-host` (every other Host is
+refused). Every page is backed by the same functions the MCP server exposes, so
+the browser view and Copilot see identical data, and nothing is mutated — there
+is no sync or confirm action in the UI. Tabs cover accounts, transactions,
+spending, net worth, transfers, and the burn-down / forecast / allocation /
+subscription reports; each view also exposes the raw JSON it rendered.
 
 ## Local archive (multi-year history)
 
