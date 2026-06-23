@@ -542,3 +542,69 @@ def test_transfer_from_and_to_must_differ():
 def test_scheduled_transfers_must_be_list():
     with pytest.raises(BudgetConfigError, match="'scheduled_transfers' must be a list"):
         parse_config(_cfg(scheduled_transfers="nope"))
+
+
+# --- debt accounts ------------------------------------------------------------
+
+def test_debt_accounts_default_empty():
+    cfg = parse_config(_cfg())
+    assert cfg.debt_accounts == ()
+
+
+def test_debt_account_full_fields():
+    cfg = parse_config(_cfg(debt_accounts=[
+        {"account_id": "ACT-1", "label": "2nd Mortgage",
+         "expected_amount": 752.24, "due_day": 1},
+    ]))
+    assert len(cfg.debt_accounts) == 1
+    d = cfg.debt_accounts[0]
+    assert d.account_id == "ACT-1"
+    assert d.label == "2nd Mortgage"
+    assert d.expected_amount_cents == 75224
+    assert d.due_day == 1
+
+
+def test_debt_account_optional_amount_and_day():
+    cfg = parse_config(_cfg(debt_accounts=[
+        {"account_id": "ACT-1", "label": "1st Mortgage"},
+    ]))
+    d = cfg.debt_accounts[0]
+    assert d.expected_amount_cents is None
+    assert d.due_day is None
+
+
+def test_debt_account_requires_account_id():
+    with pytest.raises(BudgetConfigError, match="account_id must be a non-empty string"):
+        parse_config(_cfg(debt_accounts=[{"label": "X"}]))
+
+
+def test_debt_account_requires_label():
+    with pytest.raises(BudgetConfigError, match="label must be a non-empty string"):
+        parse_config(_cfg(debt_accounts=[{"account_id": "ACT-1"}]))
+
+
+def test_debt_account_rejects_duplicate_account():
+    with pytest.raises(BudgetConfigError, match="listed twice"):
+        parse_config(_cfg(debt_accounts=[
+            {"account_id": "ACT-1", "label": "A"},
+            {"account_id": "ACT-1", "label": "B"},
+        ]))
+
+
+def test_debt_account_rejects_bad_due_day():
+    with pytest.raises(BudgetConfigError, match="day must be between 1 and 31"):
+        parse_config(_cfg(debt_accounts=[
+            {"account_id": "ACT-1", "label": "A", "due_day": 40},
+        ]))
+
+
+def test_debt_account_rejects_negative_amount():
+    with pytest.raises(BudgetConfigError, match="expected_amount must not be negative"):
+        parse_config(_cfg(debt_accounts=[
+            {"account_id": "ACT-1", "label": "A", "expected_amount": -5},
+        ]))
+
+
+def test_debt_accounts_must_be_list():
+    with pytest.raises(BudgetConfigError, match="'debt_accounts' must be a list"):
+        parse_config(_cfg(debt_accounts="nope"))

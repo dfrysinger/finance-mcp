@@ -94,6 +94,47 @@ def test_burndown_endpoint_with_config(tmp_path, monkeypatch):
     assert "envelopes" in body
 
 
+def test_redflags_endpoint_detects_returned_and_missed(tmp_path, monkeypatch):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("p1", "ACT-loan", "752.24", on="2026-04-01"),
+            _txn("p2", "ACT-loan", "752.24", on="2026-05-01"),
+            _txn("p3", "ACT-loan", "-752.24", on="2026-05-06", desc="Reversal"),
+            _txn("p4", "ACT-loan", "752.24", on="2026-06-02"),
+        ]})
+    finally:
+        conn.close()
+    _write_budget(monkeypatch, tmp_path, {
+        "version": 1,
+        "envelopes": [{"name": "Loans", "accounts": ["ACT-loan"]}],
+        "debt_accounts": [
+            {"account_id": "ACT-loan", "label": "2nd Mortgage",
+             "expected_amount": 752.24, "due_day": 1},
+        ],
+    })
+    status, body = webui.handle_api("redflags", {"as_of": ["2026-06-22"]})
+    assert status == 200
+    assert body.get("ok") is not False
+    assert body["summary"]["returned"] == 1
+    assert body["summary"]["missed"] == 1
+    assert body["summary"]["red"] == 2
+
+
+def test_redflags_endpoint_without_debt_accounts_is_empty(tmp_path, monkeypatch):
+    _seed_basic(monkeypatch, tmp_path)
+    _write_budget(monkeypatch, tmp_path, {
+        "version": 1,
+        "envelopes": [{"name": "Coffee", "accounts": ["Checking"]}],
+    })
+    status, body = webui.handle_api("redflags", {})
+    assert status == 200
+    assert body.get("ok") is not False
+    assert body["debt_account_count"] == 0
+    assert body["flags"] == []
+
+
 # --- dispatch: error paths ----------------------------------------------------
 
 def test_unknown_endpoint_is_404():

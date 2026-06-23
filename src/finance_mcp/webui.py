@@ -84,6 +84,7 @@ _ENDPOINTS: dict[str, tuple] = {
         },
     ),
     "transfers": (server.list_transfers, {"status": ("str", False)}),
+    "redflags": (server.red_flags_report, {"as_of": ("str", False)}),
 }
 
 _TRUE = {"1", "true", "yes", "on"}
@@ -546,6 +547,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .notice { padding:12px 14px; border:1px solid var(--warn); border-radius:8px;
             background:rgba(210,153,34,.08); color:var(--warn); margin-bottom:14px; }
   .err { border-color:var(--bad); background:rgba(248,81,73,.08); color:var(--bad); }
+  .notice.ok { border-color:var(--good); background:rgba(63,185,80,.08); color:var(--good); }
+  .badge { display:inline-block; min-width:16px; padding:0 5px; margin-left:6px;
+           border-radius:9px; background:var(--bad); color:#fff; font-size:11px;
+           font-weight:700; line-height:16px; text-align:center; }
+  .flagbanner { margin:0; padding:12px 20px; background:var(--bad); color:#fff;
+                font-size:13px; display:flex; align-items:center; gap:12px;
+                cursor:pointer; font-weight:600; }
+  .flagbanner[hidden] { display:none; }
+  .flagbanner button { background:#fff; color:var(--bad); border:none; border-radius:6px;
+                       padding:4px 11px; font-size:12px; font-weight:700; cursor:pointer; }
   .muted { color:var(--muted); }
   h2 { font-size:14px; margin:18px 0 8px; }
   details { margin-top:18px; }
@@ -586,6 +597,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <span class="sub" id="syncedAt"></span>
 </header>
 <nav id="tabs"></nav>
+<div id="redflagBanner" class="flagbanner" hidden></div>
 <main>
   <div class="filters" id="filters"></div>
   <div id="content"><span class="muted">Loading&hellip;</span></div>
@@ -620,6 +632,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 const TABS = [
   { id:"accounts",      label:"Accounts",      filters:[] },
+  { id:"redflags",      label:"Red flags",     filters:[ {k:"as_of",type:"date"} ] },
   { id:"transactions",  label:"Transactions",  filters:[
       {k:"search",type:"text",ph:"merchant / memo"},
       {k:"category",type:"text",ph:"category"},
@@ -774,6 +787,42 @@ function collectParams() {
 }
 
 const RENDER = {
+  redflags(d) {
+    const s = d.summary || {};
+    const flags = d.flags || [];
+    const red = flags.filter(f => f.severity === "red");
+    const info = flags.filter(f => f.severity === "info");
+    let out = `<div class="cards">
+      <div class="card"><div class="k">returned</div><div class="v">${s.returned||0}</div></div>
+      <div class="card"><div class="k">missed</div><div class="v">${s.missed||0}</div></div>
+      <div class="card"><div class="k">can&rsquo;t audit</div><div class="v">${s.unauditable||0}</div></div>
+    </div>`;
+    if (!d.debt_account_count) {
+      out += `<p class="muted">No debt accounts configured. Add a <code>debt_accounts</code> list to your budget config to watch loan payments.</p>`;
+      return out;
+    }
+    if (!red.length) {
+      out += `<div class="notice ok">No returned or missed debt payments since ${esc(d.start||"")}. &#10003;</div>`;
+    } else {
+      out += `<div class="notice err"><strong>&#9888; ${red.length} debt-payment red flag${red.length>1?'s':''}.</strong> A loan payment was returned or missed &mdash; the debt may not have been paid.</div>`;
+      out += table(red, [
+        {label:"Flag",html:true,get:r=>pill(r.kind_label||r.kind,"bad")},
+        {label:"Account",get:r=>r.account_label},
+        {label:"When",get:r=>r.date || r.month},
+        {label:"Amount",num:true,money:true,get:r=>r.actual},
+        {label:"What happened",get:r=>r.detail},
+      ]);
+    }
+    if (info.length) {
+      out += `<h2>Can&rsquo;t audit</h2>`;
+      out += `<p class="muted">These debts couldn&rsquo;t be fully verified &mdash; see each row for why.</p>`;
+      out += table(info, [
+        {label:"Account",get:r=>r.account_label},
+        {label:"Why",get:r=>r.detail},
+      ]);
+    }
+    return out;
+  },
   accounts(d) {
     if (d.synced_at) $("syncedAt").textContent = "synced " + d.synced_at;
     const rows = (d.accounts||[]).slice().sort((a,b)=>(b.balance||0)-(a.balance||0));
@@ -978,6 +1027,31 @@ async function load() {
   } catch (e) {
     $("content").innerHTML = `<div class="notice err">Render error: ${esc(e)}</div>`;
   }
+  if (current.id === "redflags") applyRedFlags(data);
+}
+
+// Keep the always-visible banner and the nav-button badge in sync with the
+// latest red-flag count, so a returned or missed debt payment is loud from any
+// tab, not just the Red flags view.
+function applyRedFlags(d) {
+  const red = (d && d.summary && d.summary.red) || 0;
+  const btn = [...$("tabs").children].find(b => b.dataset.id === "redflags");
+  if (btn) {
+    let badge = btn.querySelector(".badge");
+    if (red > 0) {
+      if (!badge) { badge = document.createElement("span"); badge.className = "badge"; btn.appendChild(badge); }
+      badge.textContent = red;
+    } else if (badge) { badge.remove(); }
+  }
+  const banner = $("redflagBanner");
+  if (red > 0) {
+    banner.innerHTML = `<span>&#9888; ${red} debt-payment red flag${red>1?'s':''}: a loan payment was returned or missed.</span><button>Review</button>`;
+    banner.hidden = false;
+    banner.onclick = () => { const t = TABS.find(t => t.id === "redflags"); if (t) selectTab(t); };
+  } else {
+    banner.hidden = true;
+    banner.onclick = null;
+  }
 }
 
 function selectTab(t) {
@@ -1001,6 +1075,8 @@ function init() {
     const latest = s && s.latest_transaction;
     if (typeof latest === "string" && latest.length >= 7) DEFAULTS.month = latest.slice(0, 7);
   }).catch(() => {}).finally(() => selectTab(TABS[0]));
+  // Loud-from-anywhere red-flag banner + nav badge, refreshed on load.
+  fetch("/api/redflags").then(r => r.json()).then(d => { if (d && d.ok !== false) applyRedFlags(d); }).catch(() => {});
 }
 init();
 </script>

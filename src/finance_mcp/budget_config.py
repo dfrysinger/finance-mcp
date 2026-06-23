@@ -129,12 +129,34 @@ class ScheduledTransfer:
 
 
 @dataclass(frozen=True)
+class DebtAccount:
+    """One liability account whose payments are audited for trouble.
+
+    A debt (loan, mortgage, financed purchase) is identified by its own
+    ``account_id`` because the feed carries no asset/liability type. ``label`` is
+    the human name shown on the red-flags view. ``expected_amount_cents`` is the
+    normal monthly payment in integer cents (``None`` when unknown); it is shown
+    as context only and does not affect detection: the payment amount is never
+    compared. ``due_day`` is the nominal day of month the payment posts; clamped to
+    each audited month, it gates that month's missed check so a month is only
+    evaluated once its due date plus grace has passed — no month, current or
+    prior, is flagged before its payment is actually overdue.
+    """
+
+    account_id: str
+    label: str
+    expected_amount_cents: int | None = None
+    due_day: int | None = None
+
+
+@dataclass(frozen=True)
 class BudgetConfig:
     version: int
     envelopes: tuple[Envelope, ...]
     recurring: tuple[RecurringBill, ...] = ()
     scheduled_transfers: tuple[ScheduledTransfer, ...] = ()
     recurring_amount_tolerance_pct: float = 0.0
+    debt_accounts: tuple[DebtAccount, ...] = ()
 
     def account_index(self) -> dict[str, Envelope]:
         """Map every configured account id to its owning envelope.
@@ -411,6 +433,7 @@ def parse_config(data: Any) -> BudgetConfig:
 
     recurring = _parse_recurring(data, envelopes)
     scheduled = _parse_scheduled_transfers(data, envelopes)
+    debt_accounts = _parse_debt_accounts(data)
 
     return BudgetConfig(
         version=version,
@@ -420,6 +443,7 @@ def parse_config(data: Any) -> BudgetConfig:
         recurring_amount_tolerance_pct=_parse_tolerance_pct(
             data.get("recurring_amount_tolerance_pct")
         ),
+        debt_accounts=debt_accounts,
     )
 
 
@@ -443,6 +467,60 @@ def _envelope_resolver(envelopes: list[Envelope]):
         return got
 
     return resolve
+
+
+def _parse_debt_accounts(data: dict) -> tuple[DebtAccount, ...]:
+    """Validate the optional ``debt_accounts`` list into :class:`DebtAccount`s.
+
+    Absent or empty yields ``()`` so existing configs parse unchanged. Each entry
+    needs a non-empty ``account_id`` (unique across the list) and ``label``;
+    ``expected_amount`` and ``due_day`` are optional. A duplicate account id is
+    rejected rather than silently collapsed, since two rows for one debt would
+    double-count its flags.
+    """
+    raw = data.get("debt_accounts", [])
+    if not isinstance(raw, list):
+        raise BudgetConfigError("budget config 'debt_accounts' must be a list")
+    out: list[DebtAccount] = []
+    seen: dict[str, str] = {}
+    for i, row in enumerate(raw):
+        where = f"debt_accounts[{i}]"
+        if not isinstance(row, dict):
+            raise BudgetConfigError(f"{where} must be an object")
+        acct = row.get("account_id")
+        if not isinstance(acct, str) or not acct.strip():
+            raise BudgetConfigError(
+                f"{where}: account_id must be a non-empty string"
+            )
+        acct = acct.strip()
+        label = row.get("label")
+        if not isinstance(label, str) or not label.strip():
+            raise BudgetConfigError(f"{where}: label must be a non-empty string")
+        label = label.strip()
+        if acct in seen:
+            raise BudgetConfigError(
+                f"debt account {acct!r} is listed twice "
+                f"({seen[acct]!r} and {label!r}); each account belongs once"
+            )
+        seen[acct] = label
+        ctx = f"debt account {label!r}"
+        expected = row.get("expected_amount")
+        expected_cents = (
+            None
+            if expected is None
+            else _money_to_cents(expected, where=ctx, label="expected_amount")
+        )
+        due = row.get("due_day")
+        due_day = None if due is None else _require_day(due, where=ctx)
+        out.append(
+            DebtAccount(
+                account_id=acct,
+                label=label,
+                expected_amount_cents=expected_cents,
+                due_day=due_day,
+            )
+        )
+    return tuple(out)
 
 
 def _parse_recurring(

@@ -375,6 +375,38 @@ def allocation_audit_report(
 
 
 @mcp.tool()
+def red_flags_report(as_of: str | None = None) -> dict[str, Any]:
+    """Loud alerts for debt payments that were returned or missed.
+
+    ``as_of`` is YYYY-MM-DD, defaulting to today. Audits each configured debt
+    account (loans, mortgages, financed purchases) directly from its own
+    transactions, so a payment is caught no matter which account funded it. A
+    returned payment (posted then reversed) and a month whose payments net to
+    zero or less (none posted, or fully reversed) each surface as a red flag; the
+    payment amount is never compared, so any positive net counts as paid. A debt
+    that syncs only a balance surfaces as an explicit ``unauditable`` note rather
+    than a silent gap. With no ``debt_accounts`` configured the report is simply
+    empty.
+    """
+    from datetime import date
+
+    from . import budget_config, redflags
+
+    try:
+        a = _parse_iso(as_of) or date.today()
+    except ValueError as exc:
+        return {"ok": False, "error": f"invalid date: {exc}"}
+    try:
+        cfg = _load_budget_config()
+    except budget_config.BudgetConfigError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        return redflags.red_flags_report(cfg, as_of=a)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
 def subscription_audit_report(
     start: str | None = None,
     end: str | None = None,
