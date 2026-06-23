@@ -225,8 +225,16 @@ def add_rule(
     field: str = "any",
     is_transfer: bool = False,
     priority: int = 100,
+    account_id: str | None = None,
 ) -> int:
-    """Add a single rule; returns its rule_id."""
+    """Add a single rule; returns its rule_id.
+
+    ``account_id`` scopes the rule to one account: when set, the rule matches
+    only transactions on that account (so an account-specific override can
+    reclassify a generic descriptor — e.g. a loan payment that the bank labels
+    only "FUNDS TRAN" — without touching the same descriptor elsewhere). When
+    ``None`` the rule applies to every account, as before.
+    """
     if field not in ("description", "payee", "any"):
         raise ValueError("field must be description, payee, or any")
     pat = (pattern or "").strip().lower()
@@ -235,10 +243,11 @@ def add_rule(
         raise ValueError("pattern must not be empty")
     if not cat:
         raise ValueError("category must not be empty")
+    acct = (account_id or "").strip() or None
     cur = conn.execute(
-        "INSERT INTO category_rules (pattern, field, category, is_transfer, priority, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (pat, field, cat, int(is_transfer), priority, _now()),
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, priority, account_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (pat, field, cat, int(is_transfer), priority, acct, _now()),
     )
     conn.commit()
     return cur.lastrowid
@@ -318,7 +327,10 @@ def _compiled_rules(conn: sqlite3.Connection) -> list[dict]:
     return rules
 
 
-def _match(rule: dict, desc: str, payee: str) -> bool:
+def _match(rule: dict, desc: str, payee: str, account_id: str | None) -> bool:
+    acct = rule.get("account_id")
+    if acct is not None and acct != account_id:
+        return False
     pat = rule["_p"]
     if not pat:
         return False
@@ -346,9 +358,10 @@ def apply_categories(conn: sqlite3.Connection, transactions: list[dict]) -> list
             continue
         desc = (txn.get("description") or "").lower()
         payee = (txn.get("payee") or "").lower()
+        account_id = txn.get("account_id")
         assigned = False
         for rule in rules:
-            if _match(rule, desc, payee):
+            if _match(rule, desc, payee, account_id):
                 txn["category"] = rule["category"]
                 txn["is_transfer"] = bool(rule["is_transfer"])
                 txn["category_source"] = "rule"

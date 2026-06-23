@@ -181,6 +181,7 @@ def _cmd_rules(args: argparse.Namespace) -> int:
                 rid = categories.add_rule(
                     conn, args.pattern, args.category,
                     field=args.field, is_transfer=args.transfer, priority=args.priority,
+                    account_id=args.account,
                 )
             except ValueError as exc:
                 print(f"Could not add rule: {exc}", file=sys.stderr)
@@ -203,8 +204,9 @@ def _cmd_rules(args: argparse.Namespace) -> int:
             return 0
         for r in rules:
             t = " [transfer]" if r["is_transfer"] else ""
+            a = f" @{r['account_id']}" if r.get("account_id") else ""
             print(f"  {r['rule_id']:>4} p{r['priority']:<4} {r['field']:<11} "
-                  f"'{r['pattern']}' -> {r['category']}{t}")
+                  f"'{r['pattern']}' -> {r['category']}{t}{a}")
         return 0
     finally:
         conn.close()
@@ -728,6 +730,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_rules.add_argument("--priority", type=int, default=100)
     p_rules.add_argument("--transfer", action="store_true",
                          help="mark matches as transfers (excluded from spend)")
+    p_rules.add_argument("--account",
+                         help="scope the rule to one account_id (omit = any account)")
     p_rules.add_argument("--rule-id", type=int)
     p_rules.add_argument("--json", action="store_true")
     p_rules.set_defaults(func=_cmd_rules)

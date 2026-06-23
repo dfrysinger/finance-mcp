@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS category_rules (
     category    TEXT NOT NULL,
     is_transfer INTEGER NOT NULL DEFAULT 0,     -- internal transfer, not real spend
     priority    INTEGER NOT NULL DEFAULT 100,   -- lower wins
+    account_id  TEXT,                           -- NULL = any account; else scope to one account
     created_at  TEXT
 );
 
@@ -208,6 +209,35 @@ def _enable_wal(conn: sqlite3.Connection) -> None:
             time.sleep(0.05)
 
 
+def _apply_additive_migrations(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after a database's first creation.
+
+    ``CREATE TABLE IF NOT EXISTS`` never alters an existing table, so a column
+    added to ``_SCHEMA`` after a user's archive was created would be missing on
+    their database. Each migration is a guarded ``ALTER TABLE ADD COLUMN`` —
+    additive only (new nullable columns), so it is safe to run on every connect
+    and is a no-op once applied. Columns are detected via ``PRAGMA table_info``
+    rather than catching a duplicate-column error, so an unrelated failure is
+    never swallowed.
+    """
+    cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(category_rules)").fetchall()
+    }
+    if "account_id" not in cols:
+        try:
+            conn.execute("ALTER TABLE category_rules ADD COLUMN account_id TEXT")
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            # Two processes opening a freshly-upgraded archive at once (the
+            # known CLI-vs-server concurrency) can both see the column missing
+            # and race the ALTER; the loser hits "duplicate column name" once
+            # the winner commits. That is benign — the column now exists.
+            # Re-raise anything else so an unrelated failure is never masked.
+            if "duplicate column name" not in str(exc).lower():
+                raise
+
+
 def connect(path: Path | None = None) -> sqlite3.Connection:
     """Open (creating if needed) the archive database with the schema applied."""
     path = path or (config.home_dir() / "archive.db")
@@ -217,6 +247,7 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     _enable_wal(conn)
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.executescript(_SCHEMA)
+    _apply_additive_migrations(conn)
     try:
         path.chmod(0o600)
     except OSError:

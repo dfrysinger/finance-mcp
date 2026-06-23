@@ -198,18 +198,23 @@ def add_category_rule(
     field: str = "any",
     is_transfer: bool = False,
     priority: int = 100,
+    account_id: str | None = None,
 ) -> dict[str, Any]:
     """Add a category rule: a case-insensitive substring match -> category.
 
     ``field`` is ``description``, ``payee``, or ``any``. ``priority`` is
     lowest-wins. Set ``is_transfer=True`` for internal transfers / card payments
-    so they are excluded from spending totals.
+    so they are excluded from spending totals. Set ``account_id`` to scope the
+    rule to a single account (so a generic descriptor like "FUNDS TRAN" can be
+    reclassified on one account without affecting the same text elsewhere);
+    leave it ``None`` to apply to every account.
     """
     conn = archive.connect()
     try:
         rule_id = categories.add_rule(
             conn, pattern, category,
             field=field, is_transfer=is_transfer, priority=priority,
+            account_id=account_id,
         )
         return {"ok": True, "rule_id": rule_id}
     except ValueError as exc:

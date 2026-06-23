@@ -157,6 +157,130 @@ def test_transfer_flag_propagates(tmp_path):
     assert txns[0]["is_transfer"] is True
 
 
+def _txn_on(tid, account_id, desc="", payee="", amount=-10.0):
+    t = _txn(tid, desc=desc, payee=payee, amount=amount)
+    t["account_id"] = account_id
+    return t
+
+
+def test_account_scoped_rule_matches_only_its_account(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "funds tran", "Loan Payment", account_id="ACT-A")
+    on_a = [_txn_on("t1", "ACT-A", desc="DANIEL FUNDS TRAN")]
+    on_b = [_txn_on("t2", "ACT-B", desc="DANIEL FUNDS TRAN")]
+    categories.apply_categories(conn, on_a)
+    categories.apply_categories(conn, on_b)
+    assert on_a[0]["category"] == "Loan Payment"
+    assert on_b[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_account_scoped_rule_beats_global_pattern_on_its_account(tmp_path):
+    conn = _conn(tmp_path)
+    # A generic descriptor flagged as a transfer everywhere...
+    categories.add_rule(conn, "funds tran", "Transfer", is_transfer=True, priority=12)
+    # ...but on one account it is really a loan payment (real spend).
+    categories.add_rule(
+        conn, "funds tran", "Loan Payment",
+        is_transfer=False, priority=8, account_id="ACT-LOANS",
+    )
+    on_loans = [_txn_on("t1", "ACT-LOANS", desc="DANIEL FUNDS TRAN")]
+    elsewhere = [_txn_on("t2", "ACT-OTHER", desc="DANIEL FUNDS TRAN")]
+    categories.apply_categories(conn, on_loans)
+    categories.apply_categories(conn, elsewhere)
+    assert on_loans[0]["category"] == "Loan Payment"
+    assert on_loans[0]["is_transfer"] is False
+    assert elsewhere[0]["category"] == "Transfer"
+    assert elsewhere[0]["is_transfer"] is True
+
+
+def test_unscoped_rule_still_matches_any_account(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "harmons", "Groceries")
+    txns = [_txn_on("t1", "ACT-ANY", desc="HARMONS #4")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Groceries"
+
+
+def test_account_scoped_rule_no_match_when_txn_has_no_account(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "funds tran", "Loan Payment", account_id="ACT-A")
+    txns = [_txn("t1", desc="DANIEL FUNDS TRAN")]  # no account_id key
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_blank_account_id_stored_as_null_applies_everywhere(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "harmons", "Groceries", account_id="")
+    rid_rule = categories.list_rules(conn)[0]
+    assert rid_rule["account_id"] is None
+    txns = [_txn_on("t1", "ACT-ANY", desc="HARMONS")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Groceries"
+
+
+def test_account_scoped_rule_applies_regardless_of_sign(tmp_path):
+    # An account-scoped rule deliberately matches on description, not amount
+    # sign: on a loan-payment account a debit is the payment (real spend) and a
+    # credit with the same descriptor is a *returned* payment. Both should be
+    # reclassified out of the generic-transfer bucket so the credit surfaces as
+    # a refund inflow rather than a hidden transfer. Headline spend is
+    # outflow-only, so the credit can never inflate spend.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "funds tran", "Transfer", is_transfer=True, priority=12)
+    categories.add_rule(
+        conn, "funds tran", "Loan Payment",
+        is_transfer=False, priority=8, account_id="ACT-LOANS",
+    )
+    debit = [_txn_on("t1", "ACT-LOANS", desc="FUNDS TRAN", amount=-500.0)]
+    credit = [_txn_on("t2", "ACT-LOANS", desc="FUNDS TRAN", amount=500.0)]
+    categories.apply_categories(conn, debit)
+    categories.apply_categories(conn, credit)
+    for t in (debit[0], credit[0]):
+        assert t["category"] == "Loan Payment"
+        assert t["is_transfer"] is False
+
+
+def test_additive_migration_adds_account_id_to_legacy_table(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "legacy.db"
+    raw = sqlite3.connect(str(db))
+    raw.execute(
+        "CREATE TABLE category_rules ("
+        " rule_id INTEGER PRIMARY KEY AUTOINCREMENT, pattern TEXT NOT NULL,"
+        " field TEXT NOT NULL DEFAULT 'any', category TEXT NOT NULL,"
+        " is_transfer INTEGER NOT NULL DEFAULT 0, priority INTEGER NOT NULL DEFAULT 100,"
+        " created_at TEXT)"
+    )
+    # A pre-existing rule written before the column existed must survive the
+    # migration with account_id NULL and keep categorizing every account.
+    raw.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, priority)"
+        " VALUES ('harmons', 'any', 'Groceries', 0, 50)"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = archive.connect(db)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(category_rules)").fetchall()}
+    assert "account_id" in cols
+    legacy = categories.list_rules(conn)
+    assert len(legacy) == 1 and legacy[0]["account_id"] is None
+    txns = [_txn_on("t1", "ACT-WHATEVER", desc="HARMONS #9")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Groceries"
+    rid = categories.add_rule(conn, "funds tran", "Loan Payment", account_id="ACT-A")
+    assert any(r["account_id"] == "ACT-A" for r in categories.list_rules(conn))
+    conn.close()
+
+    # Re-opening an already-migrated archive must be a clean no-op (no
+    # duplicate-column crash, rows intact).
+    conn2 = archive.connect(db)
+    assert len(categories.list_rules(conn2)) == 2
+    conn2.close()
+
+
 def test_remove_rule(tmp_path):
     conn = _conn(tmp_path)
     rid = categories.add_rule(conn, "harmons", "Groceries")
@@ -348,3 +472,75 @@ def test_seed_refuses_to_commit_callers_transaction(tmp_path):
         "SELECT value FROM meta WHERE key='caller'"
     ).fetchone() is None
     conn.close()
+
+
+class _AlterProxy:
+    """Minimal connection proxy: intercepts the additive ALTER, delegates rest.
+
+    ``sqlite3.Connection`` is a C type and rejects attribute assignment, so the
+    migration's exception branches can't be exercised by monkeypatching the
+    connection directly. This proxy forwards ``execute``/``commit`` to a real
+    connection but lets a test inject a failure on the column-add ALTER.
+    """
+
+    def __init__(self, real, on_alter):
+        self._real = real
+        self._on_alter = on_alter
+
+    def execute(self, sql, *args):
+        if sql.strip().upper().startswith("ALTER TABLE CATEGORY_RULES ADD COLUMN"):
+            return self._on_alter(sql, args)
+        return self._real.execute(sql, *args)
+
+    def commit(self):
+        return self._real.commit()
+
+
+def _legacy_conn(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "legacy.db"
+    raw = sqlite3.connect(str(db))
+    raw.execute(
+        "CREATE TABLE category_rules ("
+        " rule_id INTEGER PRIMARY KEY AUTOINCREMENT, pattern TEXT NOT NULL,"
+        " field TEXT NOT NULL DEFAULT 'any', category TEXT NOT NULL,"
+        " is_transfer INTEGER NOT NULL DEFAULT 0, priority INTEGER NOT NULL DEFAULT 100,"
+        " created_at TEXT)"
+    )
+    raw.commit()
+    raw.row_factory = sqlite3.Row
+    return raw
+
+
+def test_migration_swallows_duplicate_column_race(tmp_path):
+    # The loser of a concurrent first-connect ALTER hits "duplicate column
+    # name" after the winner committed; the migration must treat that as benign.
+    import sqlite3
+
+    raw = _legacy_conn(tmp_path)
+
+    def raise_duplicate(sql, args):
+        raise sqlite3.OperationalError("duplicate column name: account_id")
+
+    proxy = _AlterProxy(raw, raise_duplicate)
+    archive._apply_additive_migrations(proxy)  # must not raise
+    raw.close()
+
+
+def test_migration_reraises_unrelated_operational_error(tmp_path):
+    # Any OperationalError that is NOT a duplicate-column race must propagate so
+    # a real failure (e.g. a locked database) is never silently swallowed.
+    import sqlite3
+
+    import pytest
+
+    raw = _legacy_conn(tmp_path)
+
+    def raise_locked(sql, args):
+        raise sqlite3.OperationalError("database is locked")
+
+    proxy = _AlterProxy(raw, raise_locked)
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        archive._apply_additive_migrations(proxy)
+    raw.close()
