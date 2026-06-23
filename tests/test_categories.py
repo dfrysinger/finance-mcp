@@ -544,3 +544,65 @@ def test_migration_reraises_unrelated_operational_error(tmp_path):
     with pytest.raises(sqlite3.OperationalError, match="database is locked"):
         archive._apply_additive_migrations(proxy)
     raw.close()
+
+
+DEBT = frozenset({"ACT-LOAN-1", "ACT-LOAN-2"})
+
+
+def test_debt_account_posting_pinned_to_loan_payment_transfer(tmp_path):
+    # A lender labels a loan account's own payment posting "Principal Interest".
+    # On a debt account that is NOT income — it must be pinned to Loan Payment and
+    # excluded from summaries, even though the seeded income rule would match.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    txns = [_txn_on("t1", "ACT-LOAN-1", desc="PRINCIPAL INTEREST", amount=752.24)]
+    categories.apply_categories(conn, txns, debt_account_ids=DEBT)
+    assert txns[0]["category"] == categories.LOAN_PAYMENT
+    assert txns[0]["is_transfer"] is True
+    assert txns[0]["category_source"] == "debt_account"
+
+
+def test_same_descriptor_on_non_debt_account_still_investment_income(tmp_path):
+    # The exact descriptor on a real brokerage account (not a debt) keeps its
+    # income rule: the debt pin is account-scoped, not a blanket suppression.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    txns = [_txn_on("t1", "ACT-BROKERAGE", desc="PRINCIPAL INTEREST", amount=120.0)]
+    categories.apply_categories(conn, txns, debt_account_ids=DEBT)
+    assert txns[0]["category"] == "Investment Income"
+    assert txns[0]["is_transfer"] is False
+
+
+def test_debt_pin_applies_regardless_of_sign(tmp_path):
+    # Both a payment (here a credit posting on the loan) and a returned payment
+    # (a debit reversal) on a debt account are debt activity, never income/spend.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    credit = [_txn_on("t1", "ACT-LOAN-2", desc="PRINCIPAL INTEREST", amount=500.0)]
+    debit = [_txn_on("t2", "ACT-LOAN-2", desc="PAYMENT REVERSAL", amount=-500.0)]
+    categories.apply_categories(conn, credit, debt_account_ids=DEBT)
+    categories.apply_categories(conn, debit, debt_account_ids=DEBT)
+    for t in (credit[0], debit[0]):
+        assert t["category"] == categories.LOAN_PAYMENT
+        assert t["is_transfer"] is True
+
+
+def test_manual_override_beats_debt_pin(tmp_path):
+    # An explicit manual category still wins over the debt-account pin.
+    conn = _conn(tmp_path)
+    _seed_txn(conn, "t1")
+    categories.set_manual_category(conn, "t1", "Investment Income")
+    txns = [_txn_on("t1", "ACT-LOAN-1", desc="PRINCIPAL INTEREST", amount=100.0)]
+    categories.apply_categories(conn, txns, debt_account_ids=DEBT)
+    assert txns[0]["category"] == "Investment Income"
+    assert txns[0]["category_source"] == "manual"
+
+
+def test_no_debt_accounts_is_backward_compatible(tmp_path):
+    # Default (no debt set): the loan descriptor resolves to its income rule, the
+    # prior behavior, so existing callers are unaffected.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    txns = [_txn_on("t1", "ACT-LOAN-1", desc="PRINCIPAL INTEREST", amount=100.0)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Investment Income"

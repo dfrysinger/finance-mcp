@@ -4,8 +4,10 @@ Categories are derived, not stored on the transaction row, so they survive every
 re-sync. Resolution order for a transaction's effective category:
 
 1. a manual override (``transaction_categories``), else
-2. the first matching rule (``category_rules``, lowest ``priority`` wins), else
-3. ``"Uncategorized"``.
+2. a debt-account pin: a posting on a configured debt/loan account is debt
+   activity, not income or spending (see ``apply_categories``), else
+3. the first matching rule (``category_rules``, lowest ``priority`` wins), else
+4. ``"Uncategorized"``.
 
 Rules and overrides carry an ``is_transfer`` flag. Internal transfers and
 credit-card payments are not real spending, so budgets exclude them by default.
@@ -17,6 +19,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 UNCATEGORIZED = "Uncategorized"
+LOAN_PAYMENT = "Loan Payment"
 
 # Starter rules, seeded from the user's real merchants plus common ones. Patterns
 # are case-insensitive substrings. Transfers/payments are flagged is_transfer=1
@@ -342,19 +345,44 @@ def _match(rule: dict, desc: str, payee: str, account_id: str | None) -> bool:
     return pat in desc or pat in payee
 
 
-def apply_categories(conn: sqlite3.Connection, transactions: list[dict]) -> list[dict]:
+def apply_categories(
+    conn: sqlite3.Connection,
+    transactions: list[dict],
+    *,
+    debt_account_ids: frozenset[str] | set[str] | None = None,
+) -> list[dict]:
     """Annotate each transaction with ``category``, ``is_transfer``, ``category_source``.
 
-    Mutates and returns the same list. Manual overrides win; otherwise the
-    first matching rule (by priority) is used; otherwise ``Uncategorized``.
+    Mutates and returns the same list. Resolution order per transaction:
+
+    1. a manual override (``transaction_categories``) — always wins, else
+    2. a debt-account pin: a transaction posting on one of ``debt_account_ids`` is
+       debt activity (a payment, returned payment, or interest posting), not income
+       or spending. The lender labels these with descriptors like "Principal
+       Interest" that an income rule would otherwise match, inflating income; pinning
+       them to ``"Loan Payment"`` with ``is_transfer=True`` keeps them out of both
+       inflow and outflow totals. The same descriptor on a real brokerage account
+       (not a debt) still resolves to its income rule, so this is account-scoped, not
+       a blanket suppression. Else
+    3. the first matching rule (by priority), else
+    4. ``Uncategorized``.
+
+    ``debt_account_ids`` defaults to ``None`` (no debt accounts), preserving the
+    prior behavior for callers that do not supply it.
     """
     manual = _manual_map(conn)
     rules = _compiled_rules(conn)
+    debts = debt_account_ids or frozenset()
     for txn in transactions:
         tid = txn.get("id")
         if tid in manual:
             cat, transfer = manual[tid]
             txn["category"], txn["is_transfer"], txn["category_source"] = cat, transfer, "manual"
+            continue
+        if txn.get("account_id") in debts:
+            txn["category"], txn["is_transfer"], txn["category_source"] = (
+                LOAN_PAYMENT, True, "debt_account",
+            )
             continue
         desc = (txn.get("description") or "").lower()
         payee = (txn.get("payee") or "").lower()

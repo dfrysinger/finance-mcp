@@ -126,3 +126,97 @@ def test_set_manual_category_accepts_cache_fallback_txn(tmp_path, monkeypatch):
             categories.set_manual_category(conn, "does-not-exist", "Gifts")
     finally:
         conn.close()
+
+
+def test_archive_view_excludes_debt_account_postings_from_income(tmp_path, monkeypatch):
+    # Regression: a loan account's own "Principal Interest" posting must not be
+    # counted as Investment Income. With the account listed as a debt in the
+    # budget config, the read path pins it to a transfer category so it leaves
+    # both income (inflow) and spend (outflow) totals.
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    from finance_mcp import archive, config, queries
+
+    budget = {
+        "version": 1,
+        "envelopes": [],
+        "debt_accounts": [{"account_id": "LOAN", "label": "2nd Mortgage"}],
+    }
+    config.budget_config_path().write_text(json.dumps(budget), encoding="utf-8")
+
+    conn = archive.connect(tmp_path / "archive.db")
+    norm = {
+        "accounts": [{"account_id": "LOAN", "account_name": "Loan", "org": "O",
+                      "balance_date_ts": 1, "balance": "-1000", "balance_float": -1000.0,
+                      "balance_date": "2024-01-01T00:00:00+00:00"}],
+        "transactions": [
+            {"id": "p1", "account_id": "LOAN", "posted_ts": 100, "posted": "2024-01-01",
+             "description": "PRINCIPAL INTEREST", "amount": "752.24",
+             "amount_float": 752.24, "pending": False},
+        ],
+    }
+    archive.upsert(conn, norm)
+    conn.close()
+
+    view = store.load_archive_view()
+    txn = view["transactions"][0]
+    assert txn["category"] == "Loan Payment"
+    assert txn["is_transfer"] is True
+
+    summary = queries.spending_summary(view["transactions"], group_by="category")
+    assert summary["total_inflow"] == 0.0  # not counted as income
+
+
+def test_archive_view_warns_on_invalid_budget_config_not_silent(tmp_path, monkeypatch, capsys):
+    # A present-but-invalid budget.json must NOT silently drop debt accounts (that
+    # would reinstate income inflation). The read path keeps working but warns.
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    from finance_mcp import archive, config
+
+    config.budget_config_path().write_text("{ not valid json", encoding="utf-8")
+    conn = archive.connect(tmp_path / "archive.db")
+    norm = {
+        "accounts": [{"account_id": "LOAN", "account_name": "Loan", "org": "O",
+                      "balance_date_ts": 1, "balance": "-1", "balance_float": -1.0,
+                      "balance_date": "2024-01-01T00:00:00+00:00"}],
+        "transactions": [
+            {"id": "p1", "account_id": "LOAN", "posted_ts": 100, "posted": "2024-01-01",
+             "description": "PRINCIPAL INTEREST", "amount": "752.24",
+             "amount_float": 752.24, "pending": False},
+        ],
+    }
+    archive.upsert(conn, norm)
+    conn.close()
+
+    view = store.load_archive_view()
+    # Degrades to no debt accounts (read path still works) ...
+    assert view["transactions"][0]["category"] == "Investment Income"
+    # ... but warns so the user knows their debts aren't being applied.
+    assert "could not be loaded" in capsys.readouterr().err
+
+
+def test_archive_view_tolerates_missing_budget_config(tmp_path, monkeypatch, capsys):
+    # No budget.json: the read path must still categorize (no debt accounts), not
+    # raise and not warn. The loan descriptor falls back to its income rule, as
+    # before. A missing config is the legitimate "no debts" case, distinct from a
+    # present-but-invalid one (which warns).
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    from finance_mcp import archive, config
+
+    assert not config.budget_config_path().exists()
+    conn = archive.connect(tmp_path / "archive.db")
+    norm = {
+        "accounts": [{"account_id": "A", "account_name": "A", "org": "O",
+                      "balance_date_ts": 1, "balance": "1", "balance_float": 1.0,
+                      "balance_date": "2024-01-01T00:00:00+00:00"}],
+        "transactions": [
+            {"id": "x1", "account_id": "A", "posted_ts": 100, "posted": "2024-01-01",
+             "description": "PRINCIPAL INTEREST", "amount": "120",
+             "amount_float": 120.0, "pending": False},
+        ],
+    }
+    archive.upsert(conn, norm)
+    conn.close()
+
+    view = store.load_archive_view()
+    assert view["transactions"][0]["category"] == "Investment Income"
+    assert capsys.readouterr().err == ""  # missing config is silent
