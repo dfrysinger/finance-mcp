@@ -521,6 +521,7 @@ def _cmd_subscriptions(args: argparse.Namespace) -> int:
             result = subscription.set_bill_lifecycle(
                 cfg_path, args.name, args.lifecycle,
                 cancel_effective=args.effective,
+                variable=args.variable,
             )
         except budget_config.BudgetConfigError as exc:
             print(f"Subscription mark error: {exc}", file=sys.stderr)
@@ -530,7 +531,8 @@ def _cmd_subscriptions(args: argparse.Namespace) -> int:
             return 0
         eff = result.get("cancel_effective")
         eff_s = f" effective {eff}" if eff else ""
-        print(f"Marked {result['name']!r} as {result['lifecycle']}{eff_s} "
+        var_s = ", variable amount" if result.get("variable") else ""
+        print(f"Marked {result['name']!r} as {result['lifecycle']}{eff_s}{var_s} "
               f"(saved to {result['path']})")
         return 0
 
@@ -818,6 +820,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--effective",
         help="cancellation effective date, as YYYY-MM-DD (required when marking "
              "canceling/canceled; omit when reactivating)",
+    )
+    p_sub.add_argument(
+        "--variable", dest="variable", action="store_const", const=True,
+        default=None,
+        help="mark the bill as variable-amount (match by merchant/date, ignore "
+             "amount) (with action 'mark')",
+    )
+    p_sub.add_argument(
+        "--no-variable", dest="variable", action="store_const", const=False,
+        help="clear the variable-amount flag, restoring exact-amount matching "
+             "(with action 'mark')",
     )
     p_sub.add_argument("--config", help="path to budget config (default: ~/.finance-mcp/budget.json)")
     p_sub.add_argument("--json", action="store_true")

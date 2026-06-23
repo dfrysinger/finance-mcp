@@ -425,6 +425,65 @@ def test_cancel_effective_must_be_iso_date():
         ]))
 
 
+def test_variable_defaults_to_false():
+    cfg = parse_config(_cfg(recurring=[
+        {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly", "day": 5}
+    ]))
+    assert cfg.recurring[0].variable is False
+
+
+def test_variable_true_parses():
+    cfg = parse_config(_cfg(recurring=[
+        {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+         "day": 5, "match": "acme", "variable": True}
+    ]))
+    assert cfg.recurring[0].variable is True
+
+
+def test_variable_non_bool_rejected():
+    with pytest.raises(BudgetConfigError, match="variable must be true or false"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+             "day": 5, "variable": "yes"}
+        ]))
+
+
+def test_variable_without_match_rejected():
+    with pytest.raises(BudgetConfigError, match="variable-amount bill must have a 'match'"):
+        parse_config(_cfg(recurring=[
+            {"name": "X", "envelope": "Groceries", "amount": 10, "cadence": "monthly",
+             "day": 5, "variable": True}
+        ]))
+
+
+def test_variable_with_match_and_no_envelope_ok():
+    cfg = parse_config(_cfg(recurring=[
+        {"name": "X", "amount": 10, "cadence": "monthly", "day": 5,
+         "match": "acme", "variable": True}
+    ]))
+    assert cfg.recurring[0].variable is True
+    assert cfg.recurring[0].envelope is None
+
+
+def test_tolerance_pct_defaults_to_zero():
+    assert parse_config(_cfg()).recurring_amount_tolerance_pct == 0.0
+
+
+def test_tolerance_pct_parses_fraction():
+    cfg = parse_config(_cfg(recurring_amount_tolerance_pct=0.1))
+    assert cfg.recurring_amount_tolerance_pct == 0.1
+
+
+def test_tolerance_pct_out_of_range_rejected():
+    with pytest.raises(BudgetConfigError, match="between 0 and 1"):
+        parse_config(_cfg(recurring_amount_tolerance_pct=10))
+
+
+def test_tolerance_pct_bool_rejected():
+    with pytest.raises(BudgetConfigError, match="must be a number"):
+        parse_config(_cfg(recurring_amount_tolerance_pct=True))
+
+
 def test_cancel_effective_must_be_string():
     with pytest.raises(BudgetConfigError, match="must be an ISO date string"):
         parse_config(_cfg(recurring=[

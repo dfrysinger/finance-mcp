@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import math
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -85,6 +86,16 @@ class RecurringBill:
     a matching charge on/after that date is surfaced as a "came back" alert and
     the bill's absence is no longer reported as missing. ``active`` bills always
     have ``cancel_effective`` of ``None``.
+
+    ``variable`` marks a bill whose amount legitimately changes every cycle (a
+    usage-based charge like metered insurance, or an escrow-adjusted mortgage).
+    When ``True`` the subscription audit matches a charge to the bill by merchant
+    keyword (or envelope) and due date alone, ignoring the amount entirely, and
+    reports the most recent charge's actual amount rather than the stored
+    ``amount_cents``. ``amount_cents`` is still required (it is the expected /
+    typical figure shown when no charge has matched yet) but no longer gates the
+    match, so a price swing never reads as a missing bill. ``False`` (the
+    default) keeps the exact-or-within-tolerance amount match.
     """
 
     name: str
@@ -95,6 +106,7 @@ class RecurringBill:
     match: str | None = None
     lifecycle: str = "active"
     cancel_effective: date | None = None
+    variable: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,6 +134,7 @@ class BudgetConfig:
     envelopes: tuple[Envelope, ...]
     recurring: tuple[RecurringBill, ...] = ()
     scheduled_transfers: tuple[ScheduledTransfer, ...] = ()
+    recurring_amount_tolerance_pct: float = 0.0
 
     def account_index(self) -> dict[str, Envelope]:
         """Map every configured account id to its owning envelope.
@@ -275,6 +288,50 @@ def _optional_date(value: Any, *, where: str, field: str) -> date | None:
         ) from exc
 
 
+def _require_variable(value: Any, *, where: str) -> bool:
+    # Absent defaults to False so existing bills (and the common fixed-amount
+    # case) parse unchanged. Only a real JSON boolean is accepted — a string or
+    # number here is a malformed config, not a truthy guess, so it fails loud.
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise BudgetConfigError(
+            f"{where}: variable must be true or false, got {value!r}"
+        )
+    return value
+
+
+def _parse_tolerance_pct(value: Any) -> float:
+    """Parse the global recurring-amount drift allowance as a 0..1 fraction.
+
+    Absent defaults to ``0.0`` (exact-amount matching, the prior behavior). The
+    value is a fraction of each bill's amount a charge may drift and still count
+    as that bill — e.g. ``0.1`` lets a $50 bill match a $45–$55 charge, which
+    absorbs escrow nudges and rounding without per-bill configuration. Rejected
+    rather than clamped when out of range so a typo (``10`` meaning 10%) fails
+    loud instead of silently allowing a 1000% tolerance that would match almost
+    anything.
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BudgetConfigError(
+            "recurring_amount_tolerance_pct must be a number between 0 and 1 "
+            f"(a fraction), got {value!r}"
+        )
+    pct = float(value)
+    if not math.isfinite(pct):
+        raise BudgetConfigError(
+            f"recurring_amount_tolerance_pct must be finite, got {value!r}"
+        )
+    if not 0.0 <= pct <= 1.0:
+        raise BudgetConfigError(
+            "recurring_amount_tolerance_pct must be between 0 and 1 (a fraction, "
+            f"e.g. 0.1 for 10%), got {value!r}"
+        )
+    return pct
+
+
 def parse_config(data: Any) -> BudgetConfig:
     """Validate an already-parsed JSON object into a :class:`BudgetConfig`.
 
@@ -360,6 +417,9 @@ def parse_config(data: Any) -> BudgetConfig:
         envelopes=tuple(envelopes),
         recurring=recurring,
         scheduled_transfers=scheduled,
+        recurring_amount_tolerance_pct=_parse_tolerance_pct(
+            data.get("recurring_amount_tolerance_pct")
+        ),
     )
 
 
@@ -410,6 +470,14 @@ def _parse_recurring(
                 "match it by merchant); it has neither"
             )
         lifecycle = _require_lifecycle(raw.get("lifecycle"), where=ctx)
+        variable = _require_variable(raw.get("variable"), where=ctx)
+        if variable and match is None:
+            raise BudgetConfigError(
+                f"{ctx}: a variable-amount bill must have a 'match' keyword. A "
+                "variable bill ignores the amount when matching, so without a "
+                "merchant keyword to pin it, it would match any charge in its "
+                "envelope near the due date and silently hide a missing bill"
+            )
         cancel_effective = _optional_date(
             raw.get("cancel_effective"), where=ctx, field="cancel_effective"
         )
@@ -434,6 +502,7 @@ def _parse_recurring(
                 match=match,
                 lifecycle=lifecycle,
                 cancel_effective=cancel_effective,
+                variable=variable,
             )
         )
     return tuple(bills)

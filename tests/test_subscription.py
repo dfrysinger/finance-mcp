@@ -30,7 +30,8 @@ def _txn(tid, account, amount, *, on, desc="", is_transfer=False):
     }
 
 
-def _bill(name, envelope, amount, day, *, match=None, lifecycle=None, cancel_effective=None):
+def _bill(name, envelope, amount, day, *, match=None, lifecycle=None,
+          cancel_effective=None, variable=None):
     raw = {
         "name": name,
         "envelope": envelope,
@@ -44,13 +45,16 @@ def _bill(name, envelope, amount, day, *, match=None, lifecycle=None, cancel_eff
         raw["lifecycle"] = lifecycle
     if cancel_effective is not None:
         raw["cancel_effective"] = cancel_effective
+    if variable is not None:
+        raw["variable"] = variable
     return raw
 
 
-def _config(envelopes, recurring):
-    return budget_config.parse_config(
-        {"version": 1, "envelopes": list(envelopes), "recurring": list(recurring)}
-    )
+def _config(envelopes, recurring, *, recurring_amount_tolerance_pct=None):
+    data = {"version": 1, "envelopes": list(envelopes), "recurring": list(recurring)}
+    if recurring_amount_tolerance_pct is not None:
+        data["recurring_amount_tolerance_pct"] = recurring_amount_tolerance_pct
+    return budget_config.parse_config(data)
 
 
 def _names(items, key):
@@ -211,6 +215,147 @@ def test_one_charge_cannot_satisfy_two_occurrences():
     )
     # March satisfied, April missing (the charge was consumed by March).
     assert _names(report["expected_missing"], "expected_date") == ["2026-04-10"]
+
+
+# --- variable-amount bills + global drift allowance ---------------------------
+
+
+def test_variable_bill_matches_any_amount():
+    # A usage-based bill (e.g. metered insurance) whose amount swings every month
+    # must still match by merchant + date, never reading as missing on a price
+    # change. Stored amount 250.00 but charges land at 273.42 / 304.76 / 238.40.
+    cfg = _config([CARD], [_bill("Tesla Insurance", "Card", 250.00, 15,
+                                  match="TESLA", variable=True)])
+    txns = [
+        _txn("t1", "card", "-273.42", on="2026-03-15", desc="TESLA INC"),
+        _txn("t2", "card", "-304.76", on="2026-04-15", desc="TESLA INC"),
+        _txn("t3", "card", "-238.40", on="2026-05-15", desc="TESLA INC"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    # No occurrence is missing despite none of the charges matching the stored
+    # amount; Jan/Feb predate the first charge and stay missing only if overdue.
+    missing = _names(report["expected_missing"], "expected_date")
+    assert "2026-03-15" not in missing
+    assert "2026-04-15" not in missing
+    assert "2026-05-15" not in missing
+
+
+def test_variable_bill_reports_last_charged_amount():
+    cfg = _config([CARD], [_bill("Tesla Insurance", "Card", 250.00, 15,
+                                  match="TESLA", variable=True)])
+    txns = [
+        _txn("t1", "card", "-273.42", on="2026-03-15", desc="TESLA INC"),
+        _txn("t2", "card", "-238.40", on="2026-05-15", desc="TESLA INC"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    row = next(r for r in report["tracked"] if r["name"] == "Tesla Insurance")
+    assert row["variable"] is True
+    # last_amount reflects the most recent matched charge, not the stored figure.
+    assert row["last_amount"] == "238.40"
+    assert row["amount"] == "250.00"
+
+
+def test_variable_bill_prefers_closest_charge_not_placeholder_amount():
+    # For a variable bill the stored amount is only a typical placeholder, so the
+    # occurrence must bind to the charge with least date drift — never to a
+    # farther charge that merely happens to equal the placeholder. Mortgage due
+    # the 1st, stored 3200.00; a 3347.00 charge lands on the 1st and a 3200.00
+    # charge lands on the 5th. The on-time 3347.00 charge must win.
+    cfg = _config([CARD], [_bill("Mortgage", "Card", 3200.00, 1,
+                                  match="MTG", variable=True)],
+                  recurring_amount_tolerance_pct=0.10)
+    txns = [
+        _txn("t1", "card", "-3347.00", on="2026-03-01", desc="MTG PAYMENT"),
+        _txn("t2", "card", "-3200.00", on="2026-03-05", desc="MTG PAYMENT"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    row = next(r for r in report["tracked"] if r["name"] == "Mortgage")
+    # The closest (on-time) charge is bound, so last_amount is its actual figure,
+    # not the placeholder-matching 3200.00 charge four days later.
+    assert row["last_amount"] == "3347.00"
+
+
+def test_fixed_bill_exposes_variable_false_and_last_amount():
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
+    txns = [_txn("t1", "card", "-15.99", on="2026-03-10", desc="NETFLIX.COM")]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    row = next(r for r in report["tracked"] if r["name"] == "Netflix")
+    assert row["variable"] is False
+    assert row["last_amount"] == "15.99"
+
+
+def test_global_tolerance_pct_absorbs_drift():
+    # A 10% global allowance lets a $47.56 bill match a $47.61 charge (and a much
+    # larger absolute drift on a big bill) with no per-bill configuration.
+    cfg = _config(
+        [CARD],
+        [_bill("Cabin Ins", "Card", 47.56, 10, match="COOP")],
+        recurring_amount_tolerance_pct=0.1,
+    )
+    txns = [_txn("t1", "card", "-47.61", on="2026-03-10", desc="COOP INS")]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 3, 1), end=date(2026, 3, 31)
+    )
+    assert report["expected_missing"] == []
+
+
+def test_global_tolerance_pct_does_not_match_beyond_allowance():
+    cfg = _config(
+        [CARD],
+        [_bill("Svc", "Card", 100.00, 10, match="SVC")],
+        recurring_amount_tolerance_pct=0.05,  # +/- $5
+    )
+    txns = [_txn("t1", "card", "-120.00", on="2026-03-10", desc="SVC CO")]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 3, 1), end=date(2026, 3, 31)
+    )
+    assert _names(report["expected_missing"], "expected_date") == ["2026-03-10"]
+
+
+def test_tolerance_pct_from_config_applies_by_default():
+    # subscription_audit reads the allowance from the config when the caller does
+    # not override amount_tolerance_pct.
+    cfg = _config(
+        [CARD],
+        [_bill("Svc", "Card", 200.00, 10, match="SVC")],
+        recurring_amount_tolerance_pct=0.1,  # +/- $20
+    )
+    txns = [_txn("t1", "card", "-215.00", on="2026-03-10", desc="SVC CO")]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 3, 1), end=date(2026, 3, 31)
+    )
+    assert report["expected_missing"] == []
+
+
+def test_tolerance_pct_explicit_override_beats_config():
+    cfg = _config(
+        [CARD],
+        [_bill("Svc", "Card", 200.00, 10, match="SVC")],
+        recurring_amount_tolerance_pct=0.1,
+    )
+    txns = [_txn("t1", "card", "-215.00", on="2026-03-10", desc="SVC CO")]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 3, 1), end=date(2026, 3, 31),
+        amount_tolerance_pct=0.0,
+    )
+    assert _names(report["expected_missing"], "expected_date") == ["2026-03-10"]
+
+
+def test_tolerance_pct_out_of_range_rejected():
+    cfg = _config([CARD], [_bill("Svc", "Card", 10.00, 10, match="SVC")])
+    with pytest.raises(ValueError):
+        subscription.subscription_audit(
+            cfg, [], start=WIN_START, end=WIN_END, amount_tolerance_pct=1.5
+        )
+
+
+def test_tolerance_pct_bool_override_rejected():
+    # bool is a subclass of int; True must not slip through as 100% tolerance.
+    cfg = _config([CARD], [_bill("Svc", "Card", 10.00, 10, match="SVC")])
+    with pytest.raises(ValueError):
+        subscription.subscription_audit(
+            cfg, [], start=WIN_START, end=WIN_END, amount_tolerance_pct=True
+        )
 
 
 # --- candidate-new ------------------------------------------------------------
@@ -1646,6 +1791,37 @@ def _seed_budget(path):
         "recurring": [{"name": "Sketch", "envelope": "Card", "amount": 5.00,
                        "cadence": "monthly", "day": 10, "match": "sketch"}],
     }), encoding="utf-8")
+
+
+def test_set_lifecycle_sets_variable_flag(tmp_path):
+    path = tmp_path / "budget.json"
+    _seed_budget(path)
+    result = subscription.set_bill_lifecycle(path, "Sketch", "active", variable=True)
+    assert result["variable"] is True
+    assert budget_config.load_config(path).recurring[0].variable is True
+
+
+def test_set_lifecycle_clears_variable_flag(tmp_path):
+    path = tmp_path / "budget.json"
+    _seed_budget(path)
+    subscription.set_bill_lifecycle(path, "Sketch", "active", variable=True)
+    result = subscription.set_bill_lifecycle(path, "Sketch", "active", variable=False)
+    assert result["variable"] is False
+    assert budget_config.load_config(path).recurring[0].variable is False
+    # Cleared rather than written as a redundant false.
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert "variable" not in raw["recurring"][0]
+
+
+def test_set_lifecycle_leaves_variable_untouched_when_none(tmp_path):
+    path = tmp_path / "budget.json"
+    _seed_budget(path)
+    subscription.set_bill_lifecycle(path, "Sketch", "active", variable=True)
+    # A later mark that does not pass variable must not disturb the flag.
+    subscription.set_bill_lifecycle(
+        path, "Sketch", "canceled", cancel_effective="2026-04-01"
+    )
+    assert budget_config.load_config(path).recurring[0].variable is True
 
 
 def test_set_lifecycle_marks_canceled(tmp_path):

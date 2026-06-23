@@ -40,6 +40,7 @@ into two groups.
 from __future__ import annotations
 
 import contextlib
+import math
 import threading
 import re
 from dataclasses import dataclass
@@ -266,10 +267,23 @@ def _matches_bill(
     bill: RecurringBill,
     *,
     amount_tolerance_cents: int,
+    amount_tolerance_pct: float,
     match_tokens: frozenset[str] | None,
 ) -> bool:
-    if abs(charge.amount_cents - bill.amount_cents) > amount_tolerance_cents:
-        return False
+    # A variable-amount bill (metered insurance, escrow-adjusted mortgage) is
+    # matched by merchant/envelope and due date alone — its amount legitimately
+    # swings every cycle, so gating on amount would read a normal price change as
+    # a missing bill. Fixed bills still gate on amount, within the larger of the
+    # flat tolerance and the global percentage drift allowance (the percentage is
+    # amount-proportional so one setting fits a $5 bill and a $3,400 mortgage).
+    if not bill.variable:
+        tolerance = amount_tolerance_cents
+        if amount_tolerance_pct > 0:
+            tolerance = max(
+                tolerance, round(amount_tolerance_pct * bill.amount_cents)
+            )
+        if abs(charge.amount_cents - bill.amount_cents) > tolerance:
+            return False
     if match_tokens is not None:
         # Keyword match: the bill's normalized tokens must all appear among the
         # charge's merchant-identity tokens (description + payee, the reliable
@@ -358,6 +372,7 @@ def _match_tracked_bills(
     earliest_txn: date | None,
     day_tolerance: int,
     amount_tolerance_cents: int,
+    amount_tolerance_pct: float = 0.0,
     grace: int,
 ) -> tuple[set[str], list[dict], list[dict]]:
     """Greedy-match each recurring bill's monthly occurrences against charges.
@@ -394,6 +409,10 @@ def _match_tracked_bills(
     tracked: list[dict] = []
     for bill, bill_tokens in zip(config.recurring, bill_token_sets):
         last_seen: date | None = None
+        # The amount of the charge that set ``last_seen`` (the most recent matched
+        # charge). Surfaced for variable bills, whose stored ``amount_cents`` is
+        # only a typical figure — the UI shows what was actually charged.
+        last_amount_cents: int | None = None
         # A canceling/canceled bill is no longer expected to charge on or after
         # its cancel_effective date, so occurrences from that day forward must not
         # be reported missing or counted toward overdue — their absence is the
@@ -442,7 +461,11 @@ def _match_tracked_bills(
             if covered and (end - occ).days >= grace and not occ_after_cancel:
                 latest_due = occ
             # Greedy earliest-first match: the closest unconsumed charge within
-            # tolerance, preferring an exact amount, then least date drift.
+            # tolerance, preferring an exact amount, then least date drift. For
+            # variable bills the stored amount is only a typical placeholder, so
+            # the exact-amount preference is disabled and ranking is by date
+            # drift alone — otherwise a farther charge that happens to equal the
+            # placeholder could beat the closer charge for this occurrence.
             best: _Charge | None = None
             best_key: tuple = ()
             for charge in charges:
@@ -455,10 +478,13 @@ def _match_tracked_bills(
                     charge,
                     bill,
                     amount_tolerance_cents=amount_tolerance_cents,
+                    amount_tolerance_pct=amount_tolerance_pct,
                     match_tokens=bill_tokens,
                 ):
                     continue
-                exact = charge.amount_cents == bill.amount_cents
+                exact = (not bill.variable) and (
+                    charge.amount_cents == bill.amount_cents
+                )
                 cand_key = (not exact, drift, charge.tid)
                 if best is None or cand_key < best_key:
                     best, best_key = charge, cand_key
@@ -466,6 +492,7 @@ def _match_tracked_bills(
                 consumed.add(best.tid)
                 if last_seen is None or best.on > last_seen:
                     last_seen = best.on
+                    last_amount_cents = best.amount_cents
                 if last_matched_due is None or occ > last_matched_due:
                     last_matched_due = occ
                 continue
@@ -552,6 +579,12 @@ def _match_tracked_bills(
                 "name": bill.name,
                 "envelope": bill.envelope,
                 "amount": _dollars(bill.amount_cents),
+                "variable": bill.variable,
+                "last_amount": (
+                    _dollars(last_amount_cents)
+                    if last_amount_cents is not None
+                    else None
+                ),
                 "day": bill.day,
                 "cadence": bill.cadence,
                 "match": bill.match,
@@ -579,6 +612,7 @@ def subscription_audit(
     end: date,
     day_tolerance: int = DEFAULT_DAY_TOLERANCE,
     amount_tolerance_cents: int = 0,
+    amount_tolerance_pct: float | None = None,
     min_occurrences: int = DEFAULT_MIN_OCCURRENCES,
     grace_days: int | None = None,
 ) -> dict:
@@ -588,6 +622,13 @@ def subscription_audit(
     fields the archive view exposes (``id``, ``account_id``, ``amount``,
     ``posted``, ``description``/``payee``/``memo``, ``is_transfer``). Returns a
     fully JSON-serializable report.
+
+    ``amount_tolerance_pct`` is the global drift allowance (a 0..1 fraction of a
+    bill's amount a charge may differ and still match it); ``None`` takes the
+    value from ``config`` so the configured allowance applies by default while a
+    caller can still override it. It is combined with the flat
+    ``amount_tolerance_cents`` per bill as ``max(flat, pct*amount)``, and is
+    ignored for bills flagged ``variable`` (those match amount-blind).
     """
     if end < start:
         raise ValueError(f"end {end} is before start {start}")
@@ -599,6 +640,20 @@ def subscription_audit(
         )
     if amount_tolerance_cents < 0:
         raise ValueError(f"amount_tolerance_cents must be >= 0, got {amount_tolerance_cents}")
+    pct = (
+        config.recurring_amount_tolerance_pct
+        if amount_tolerance_pct is None
+        else amount_tolerance_pct
+    )
+    # bool is a subclass of int, so reject it explicitly — an out-of-band True
+    # would otherwise read as a 100% tolerance — mirroring the config parser.
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        raise ValueError(f"amount_tolerance_pct must be a number, got {pct!r}")
+    pct = float(pct)
+    if not math.isfinite(pct) or not 0.0 <= pct <= 1.0:
+        raise ValueError(
+            f"amount_tolerance_pct must be between 0 and 1, got {pct}"
+        )
     if min_occurrences < 2:
         raise ValueError(f"min_occurrences must be >= 2, got {min_occurrences}")
     grace = day_tolerance if grace_days is None else grace_days
@@ -647,6 +702,7 @@ def subscription_audit(
         earliest_txn=earliest_txn,
         day_tolerance=day_tolerance,
         amount_tolerance_cents=amount_tolerance_cents,
+        amount_tolerance_pct=pct,
         grace=grace,
     )
 
@@ -961,6 +1017,7 @@ def subscription_report(
     end: date | None = None,
     day_tolerance: int = DEFAULT_DAY_TOLERANCE,
     amount_tolerance_cents: int = 0,
+    amount_tolerance_pct: float | None = None,
     min_occurrences: int = DEFAULT_MIN_OCCURRENCES,
     grace_days: int | None = None,
 ) -> dict:
@@ -998,6 +1055,7 @@ def subscription_report(
         end=end,
         day_tolerance=day_tolerance,
         amount_tolerance_cents=amount_tolerance_cents,
+        amount_tolerance_pct=amount_tolerance_pct,
         min_occurrences=min_occurrences,
         grace_days=grace_days,
     )
@@ -1093,6 +1151,7 @@ def detect_subscriptions(
         earliest_txn=_earliest_txn_date(transactions),
         day_tolerance=day_tolerance,
         amount_tolerance_cents=0,
+        amount_tolerance_pct=cfg.recurring_amount_tolerance_pct,
         grace=day_tolerance,
     )
     candidates = _candidate_new(
@@ -1431,6 +1490,7 @@ def set_bill_lifecycle(
     name: str,
     lifecycle: str,
     cancel_effective: str | None = None,
+    variable: bool | None = None,
 ) -> dict:
     """Set the lifecycle of one recurring bill in the budget file at ``path``.
 
@@ -1440,6 +1500,12 @@ def set_bill_lifecycle(
     effect and is required for the two non-active states (a charge on or after
     it is what the audit flags as the bill "coming back"); for ``active`` it must
     be omitted and any existing value is cleared.
+
+    ``variable`` optionally sets whether the bill's amount varies every cycle
+    (``True`` matches the bill amount-blind and reports the actual charged
+    amount; ``False`` restores exact-amount matching). ``None`` (the default)
+    leaves the existing setting untouched, so a caller marking only the lifecycle
+    does not disturb a bill's variable flag.
 
     The bill is located by ``name``, matched case-insensitively after trimming.
     A name that matches no bill, or more than one, is an error rather than a
@@ -1458,6 +1524,10 @@ def set_bill_lifecycle(
             f"lifecycle must be one of {valid}, got {lifecycle!r}"
         )
     lifecycle = lifecycle.strip().lower()
+    if variable is not None and not isinstance(variable, bool):
+        raise budget_config.BudgetConfigError(
+            f"variable must be true or false, got {variable!r}"
+        )
 
     with _config_write_guard(path):
         if not path.exists():
@@ -1520,6 +1590,16 @@ def set_bill_lifecycle(
             entry["lifecycle"] = lifecycle
             entry["cancel_effective"] = cancel_effective
 
+        # Apply the variable flag independently of lifecycle. Stored only when
+        # True (the default is False, so an omitted key reads as fixed) to keep
+        # the config minimal: clearing it removes the key rather than writing a
+        # redundant ``false``.
+        if variable is not None:
+            if variable:
+                entry["variable"] = True
+            else:
+                entry.pop("variable", None)
+
         # _persist_config re-validates, so a malformed cancel_effective is rejected
         # here (as a structured error) before it can overwrite a working config.
         _persist_config(path, raw)
@@ -1528,4 +1608,5 @@ def set_bill_lifecycle(
         "name": entry["name"],
         "lifecycle": lifecycle,
         "cancel_effective": entry.get("cancel_effective"),
+        "variable": bool(entry.get("variable", False)),
     }

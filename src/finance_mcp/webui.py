@@ -163,6 +163,7 @@ _POST_ENDPOINTS: dict[str, tuple] = {
             "name": ("str", True),
             "lifecycle": ("str", True),
             "cancel_effective": ("str", False),
+            "variable": ("bool", False),
         },
     ),
 }
@@ -203,6 +204,11 @@ def _build_kwargs_json(body: dict, schema: dict[str, tuple]) -> dict:
                 raise ValueError(f"missing required parameter: {name}")
             continue
         if not isinstance(raw, str):
+            # A JSON boolean is accepted directly for a bool param (the JS sends a
+            # real ``true``/``false``); any other non-string is malformed.
+            if kind == "bool" and isinstance(raw, bool):
+                kwargs[name] = raw
+                continue
             raise ValueError(f"{name} must be a string")
         kwargs[name] = _coerce_one(name, kind, raw)
     return kwargs
@@ -565,6 +571,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                  word-break:break-word; }
   .modal label { display:flex; flex-direction:column; gap:4px; font-size:12px;
                  color:var(--muted); margin-bottom:12px; }
+  .modal label.check { flex-direction:row; align-items:center; gap:8px; }
+  .modal label.check input { width:auto; margin:0; }
   .modal select, .modal input { background:var(--bg); color:var(--fg);
         border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:13px; }
   .modal .row { display:flex; gap:8px; justify-content:flex-end; margin-top:6px; }
@@ -601,6 +609,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <input type="date" id="markEffective">
     </label>
     <div class="hint" id="markHint">Required when canceling or canceled &mdash; any charge on or after this date is flagged as the bill coming back.</div>
+    <label class="check"><input type="checkbox" id="markVariable"> Variable amount (match by merchant &amp; date; don&rsquo;t alert on price changes)</label>
     <div id="markError" class="notice err" hidden></div>
     <div class="row">
       <button class="mini" onclick="closeMark()">Cancel</button>
@@ -675,6 +684,7 @@ function openMark(i) {
   $("markName").textContent = r.name;
   $("markLifecycle").value = r.lifecycle || "active";
   $("markEffective").value = r.cancel_effective || "";
+  $("markVariable").checked = !!r.variable;
   const err = $("markError"); err.hidden = true; err.textContent = "";
   $("markOverlay").hidden = false;
 }
@@ -689,13 +699,14 @@ async function submitMark() {
   if (!r) { closeMark(); return; }
   const lifecycle = $("markLifecycle").value;
   const effective = $("markEffective").value;
+  const variable = $("markVariable").checked;
   const err = $("markError");
   if (lifecycle !== "active" && !effective) {
     err.textContent = "Pick a cancellation effective date for a canceling/canceled bill.";
     err.hidden = false;
     return;
   }
-  const payload = { name: r.name, lifecycle };
+  const payload = { name: r.name, lifecycle, variable };
   if (lifecycle !== "active") payload.cancel_effective = effective;
   const save = $("markSave");
   save.disabled = true;
@@ -902,7 +913,13 @@ const RENDER = {
     out += table(_trackedRows, [
       {label:"Subscription",get:r=>r.name},
       {label:"Envelope",get:r=>r.envelope||""},
-      {label:"Amount",num:true,money:true,get:r=>r.amount},
+      {label:"Amount",num:true,html:true,get:r=>{
+        if (r.variable) {
+          const v = money(r.last_amount || r.amount);
+          return `${v} <span class="muted" title="amount varies each cycle">~var</span>`;
+        }
+        return money(r.amount);
+      }},
       {label:"Due day",num:true,get:r=>r.day},
       {label:"Next due",get:r=>r.next_due||""},
       {label:"Last seen",get:r=>r.last_seen||"never"},

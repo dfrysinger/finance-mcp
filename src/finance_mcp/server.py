@@ -452,6 +452,7 @@ def subscriptions_mark(
     name: str,
     lifecycle: str,
     cancel_effective: str | None = None,
+    variable: bool | None = None,
 ) -> dict[str, Any]:
     """Mark a tracked recurring bill as canceling, canceled, or active again.
 
@@ -462,7 +463,11 @@ def subscriptions_mark(
     ``active`` (reactivate a bill you'd marked). ``cancel_effective`` is the
     YYYY-MM-DD date the cancellation takes effect and is required for canceling
     and canceled — any matching charge on or after it is surfaced as the bill
-    "coming back". Omit it when reactivating. The bill is found by ``name``
+    "coming back". Omit it when reactivating. ``variable`` optionally flags the
+    bill as one whose amount changes every cycle (a usage-based or escrow bill):
+    ``true`` matches it by merchant and date regardless of amount and reports the
+    actual charged amount, ``false`` restores exact-amount matching, ``null``
+    leaves the setting unchanged. The bill is found by ``name``
     (case-insensitive); the name must match exactly one bill.
     """
     from . import budget_config, subscription
@@ -471,6 +476,7 @@ def subscriptions_mark(
         result = subscription.set_bill_lifecycle(
             config.budget_config_path(), name, lifecycle,
             cancel_effective=cancel_effective,
+            variable=variable,
         )
     except budget_config.BudgetConfigError as exc:
         return {"ok": False, "error": str(exc)}

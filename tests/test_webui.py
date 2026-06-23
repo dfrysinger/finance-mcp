@@ -408,6 +408,43 @@ def test_post_mark_no_such_bill_is_400(tmp_path, monkeypatch):
     assert status == 400 and body["ok"] is False
 
 
+def test_post_mark_sets_variable_from_json_bool(tmp_path, monkeypatch):
+    _budget_with_replit(monkeypatch, tmp_path)
+    status, body = webui.handle_api_post(
+        "subscriptions/mark",
+        {"name": "replit", "lifecycle": "active", "variable": True})
+    assert status == 200 and body["ok"] is True
+    assert body["variable"] is True
+    saved = json.loads(config.budget_config_path().read_text(encoding="utf-8"))
+    assert saved["recurring"][0]["variable"] is True
+
+
+def test_post_mark_variable_false_clears_flag(tmp_path, monkeypatch):
+    _write_budget(monkeypatch, tmp_path, {
+        "version": 1,
+        "envelopes": [{"name": "Card", "accounts": ["card"]}],
+        "recurring": [
+            {"name": "Replit", "envelope": "Card", "amount": 20.00,
+             "cadence": "monthly", "day": 10, "match": "replit", "variable": True},
+        ],
+    })
+    status, body = webui.handle_api_post(
+        "subscriptions/mark",
+        {"name": "replit", "lifecycle": "active", "variable": False})
+    assert status == 200 and body["ok"] is True
+    assert body["variable"] is False
+    saved = json.loads(config.budget_config_path().read_text(encoding="utf-8"))
+    assert "variable" not in saved["recurring"][0]
+
+
+def test_post_mark_non_bool_variable_is_400(tmp_path, monkeypatch):
+    _budget_with_replit(monkeypatch, tmp_path)
+    status, body = webui.handle_api_post(
+        "subscriptions/mark",
+        {"name": "replit", "lifecycle": "active", "variable": "maybe"})
+    assert status == 400 and body["ok"] is False
+
+
 def test_http_post_requires_csrf_header_and_persists(tmp_path, monkeypatch):
     _budget_with_replit(monkeypatch, tmp_path)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
@@ -587,3 +624,11 @@ def test_index_html_hides_modal_overlay_by_default():
     assert 'id="markOverlay" class="overlay" hidden' in html
     assert ".overlay[hidden]" in html
     assert "display:none" in html.split(".overlay[hidden]", 1)[1][:40]
+
+
+def test_index_html_has_variable_checkbox():
+    # The Mark dialog must expose the variable-amount toggle the POST endpoint
+    # and the render path depend on.
+    html = webui.INDEX_HTML
+    assert 'id="markVariable"' in html
+    assert 'type="checkbox"' in html.split('id="markVariable"', 1)[0][-60:]
