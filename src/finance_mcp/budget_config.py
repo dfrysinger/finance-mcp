@@ -129,6 +129,29 @@ class ScheduledTransfer:
 
 
 @dataclass(frozen=True)
+class PaymentSource:
+    """How to find a debt's payments when the loan account has no transactions.
+
+    Some lenders sync only a balance for a loan/mortgage, so its payments never
+    post to the loan account and the on-account audit has nothing to read. This
+    points the audit at the *funding* side instead: matching outflows on a normal
+    account (checking) are the payments, and a matching inflow is a return.
+
+    ``description_contains`` is a list of case-insensitive substrings supplied by
+    the user; a transaction matches when any one of them appears in its
+    description or payee text. ``account_id`` optionally scopes the search to a
+    single funding account; when ``None`` the match runs across every account
+    except the debt's own. The loan account's own postings are always ignored in
+    funding-side mode, so a matching transaction there is never counted.
+    Nothing here is institution-specific — the user describes their own lender's
+    payment text in config, so the pattern generalizes to any debt.
+    """
+
+    description_contains: tuple[str, ...]
+    account_id: str | None = None
+
+
+@dataclass(frozen=True)
 class DebtAccount:
     """One liability account whose payments are audited for trouble.
 
@@ -141,12 +164,19 @@ class DebtAccount:
     each audited month, it gates that month's missed check so a month is only
     evaluated once its due date plus grace has passed — no month, current or
     prior, is flagged before its payment is actually overdue.
+
+    ``payment_source`` opts the debt into funding-side auditing (see
+    :class:`PaymentSource`): when set, the loan account's own postings are ignored
+    and payments are detected from matching transactions on a funding account
+    instead. When ``None`` (the default) the debt is audited from its own
+    postings, so existing configs are unaffected.
     """
 
     account_id: str
     label: str
     expected_amount_cents: int | None = None
     due_day: int | None = None
+    payment_source: PaymentSource | None = None
 
 
 @dataclass(frozen=True)
@@ -512,15 +542,59 @@ def _parse_debt_accounts(data: dict) -> tuple[DebtAccount, ...]:
         )
         due = row.get("due_day")
         due_day = None if due is None else _require_day(due, where=ctx)
+        payment_source = _parse_payment_source(row.get("payment_source"), where=ctx)
         out.append(
             DebtAccount(
                 account_id=acct,
                 label=label,
                 expected_amount_cents=expected_cents,
                 due_day=due_day,
+                payment_source=payment_source,
             )
         )
     return tuple(out)
+
+
+def _parse_payment_source(raw: object, *, where: str) -> PaymentSource | None:
+    """Parse an optional ``payment_source`` block on a debt account.
+
+    Absent (``None``) yields ``None`` so a debt without it is audited from its own
+    postings. When present it must be an object with a non-empty
+    ``description_contains`` list of non-empty strings; an empty list is rejected
+    rather than accepted, because a source audit that matches nothing would
+    silently flag every month missed. ``account_id``, if given, must be a
+    non-empty string.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise BudgetConfigError(f"{where}: payment_source must be an object")
+    patterns = raw.get("description_contains")
+    if not isinstance(patterns, list) or not patterns:
+        raise BudgetConfigError(
+            f"{where}: payment_source.description_contains must be a "
+            "non-empty list of strings"
+        )
+    cleaned: list[str] = []
+    for p in patterns:
+        if not isinstance(p, str) or not p.strip():
+            raise BudgetConfigError(
+                f"{where}: payment_source.description_contains entries must be "
+                "non-empty strings"
+            )
+        cleaned.append(p.strip())
+    src_acct = raw.get("account_id")
+    if src_acct is not None and (
+        not isinstance(src_acct, str) or not src_acct.strip()
+    ):
+        raise BudgetConfigError(
+            f"{where}: payment_source.account_id must be a non-empty string "
+            "when given"
+        )
+    return PaymentSource(
+        description_contains=tuple(cleaned),
+        account_id=src_acct.strip() if isinstance(src_acct, str) else None,
+    )
 
 
 def _parse_recurring(

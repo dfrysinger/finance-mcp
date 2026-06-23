@@ -409,3 +409,138 @@ def test_cleared_payment_still_counts_when_pending_absent():
     ]
     rep = _detect(debts, txns, as_of=date(2026, 6, 22))
     assert rep["flags"] == []
+
+
+# --- funding-side auditing (payment_source) -----------------------------------
+
+from finance_mcp.budget_config import PaymentSource  # noqa: E402
+
+FUND = "ACT-checking"
+
+
+def _out(amount, *, on, desc="MTG PMT LOAN PAYMT", account=FUND, payee=""):
+    # A funding-account row: a payment is an outflow (negative amount).
+    t = _txn(account, amount, on=on, desc=desc)
+    t["payee"] = payee
+    return t
+
+
+def _mtg(account_id=None):
+    return PaymentSource(description_contains=("MTG PMT",), account_id=account_id)
+
+
+def test_by_source_outflows_count_as_paid_loan_account_ignored():
+    # The loan account has no transactions; payments are outflows on checking.
+    debt = DebtAccount(LOAN, "Loan", None, 1, payment_source=_mtg(FUND))
+    txns = [
+        _out("-1000.00", on="2026-04-01"),
+        _out("-1000.00", on="2026-05-01"),
+        _out("-1000.00", on="2026-06-01"),
+        _txn(LOAN, "999.00", on="2026-05-15"),  # noise on the loan account, ignored
+    ]
+    rep = _detect((debt,), txns)
+    assert rep["flags"] == []
+    assert rep["summary"]["unauditable"] == 0
+
+
+def test_by_source_missing_month_is_flagged():
+    # No matching outflow in May -> May is a missed month.
+    debt = DebtAccount(LOAN, "Loan", None, 1, payment_source=_mtg(FUND))
+    txns = [
+        _out("-1000.00", on="2026-04-01"),
+        _out("-1000.00", on="2026-06-01"),
+    ]
+    rep = _detect((debt,), txns)
+    missed = {f["month"] for f in rep["flags"] if f["kind"] == "missed_payment"}
+    assert "2026-05" in missed
+    detail = next(f for f in rep["flags"] if f["kind"] == "missed_payment")["detail"]
+    assert "funding account" in detail
+
+
+def test_by_source_inflow_is_a_returned_payment():
+    # A matching inflow on the funding account is money coming back: a return.
+    debt = DebtAccount(LOAN, "Loan", None, 1, payment_source=_mtg(FUND))
+    txns = [
+        _out("-1000.00", on="2026-04-01"),
+        _out("1000.00", on="2026-04-09"),  # reversed/credited back
+        _out("-1000.00", on="2026-05-01"),
+        _out("-1000.00", on="2026-06-01"),
+    ]
+    rep = _detect((debt,), txns)
+    returned = [f for f in rep["flags"] if f["kind"] == "returned_payment"]
+    assert len(returned) == 1
+    assert returned[0]["date"] == "2026-04-09"
+
+
+def test_by_source_matches_payee_not_only_description():
+    debt = DebtAccount(LOAN, "Loan", None, 1, payment_source=_mtg(FUND))
+    txns = [
+        _out("-1000.00", on="2026-04-01", desc="ACH DEBIT", payee="MTG PMT"),
+        _out("-1000.00", on="2026-05-01", desc="ACH DEBIT", payee="MTG PMT"),
+        _out("-1000.00", on="2026-06-01", desc="ACH DEBIT", payee="MTG PMT"),
+    ]
+    rep = _detect((debt,), txns)
+    assert rep["flags"] == []
+
+
+def test_by_source_account_id_scopes_the_search():
+    # An identically-described outflow on a different account must not count.
+    debt = DebtAccount(LOAN, "Loan", None, 1, payment_source=_mtg(FUND))
+    txns = [
+        _out("-1000.00", on="2026-04-01", account="ACT-elsewhere"),
+        _out("-1000.00", on="2026-05-01", account="ACT-elsewhere"),
+        _out("-1000.00", on="2026-06-01", account="ACT-elsewhere"),
+    ]
+    rep = _detect((debt,), txns)
+    # No matching rows on the configured funding account -> unauditable, not silent.
+    kinds = {f["kind"] for f in rep["flags"]}
+    assert kinds == {"unauditable"}
+
+
+def test_by_source_any_account_when_no_account_id():
+    # With no account_id, a matching outflow on any account counts.
+    debt = DebtAccount(LOAN, "Loan", None, 1, payment_source=_mtg(None))
+    txns = [
+        _out("-1000.00", on="2026-04-01", account="ACT-whatever"),
+        _out("-1000.00", on="2026-05-01", account="ACT-another"),
+        _out("-1000.00", on="2026-06-01", account="ACT-whatever"),
+    ]
+    rep = _detect((debt,), txns)
+    assert rep["flags"] == []
+
+
+def test_by_source_no_matches_is_unauditable_with_guidance():
+    debt = DebtAccount(LOAN, "Loan", None, 1, payment_source=_mtg(FUND))
+    txns = [
+        _out("-1000.00", on="2026-05-01", desc="UNRELATED DEBIT"),
+    ]
+    rep = _detect((debt,), txns)
+    assert _kinds(rep) == ["unauditable"]
+    assert "payment_source" in rep["flags"][0]["detail"]
+
+
+def test_by_source_any_account_still_ignores_the_loans_own_postings():
+    # With no funding account_id, matching is across every *other* account, but the
+    # loan's own postings are still ignored. A matching positive posting on the loan
+    # account must NOT be sign-flipped into a phantom return / zeroed-out missed month.
+    debt = DebtAccount(LOAN, "Loan", None, 1, payment_source=_mtg(None))
+    txns = [
+        _out("-1000.00", on="2026-04-01"),
+        _out("-1000.00", on="2026-05-01"),
+        _out("-1000.00", on="2026-06-01"),
+        _txn(LOAN, "1000.00", on="2026-05-15", desc="MTG PMT POSTED"),  # on the loan
+    ]
+    rep = _detect((debt,), txns)
+    assert rep["flags"] == []
+
+
+def test_by_source_pending_outflow_does_not_count_as_paid():
+    debt = DebtAccount(LOAN, "Loan", None, 1, payment_source=_mtg(FUND))
+    txns = [
+        _out("-1000.00", on="2026-04-01"),
+        {**_out("-1000.00", on="2026-05-01"), "pending": True},  # not cleared
+        _out("-1000.00", on="2026-06-01"),
+    ]
+    rep = _detect((debt,), txns)
+    missed = {f["month"] for f in rep["flags"] if f["kind"] == "missed_payment"}
+    assert "2026-05" in missed

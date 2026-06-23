@@ -608,3 +608,65 @@ def test_debt_account_rejects_negative_amount():
 def test_debt_accounts_must_be_list():
     with pytest.raises(BudgetConfigError, match="'debt_accounts' must be a list"):
         parse_config(_cfg(debt_accounts="nope"))
+
+
+def test_debt_account_payment_source_default_none():
+    cfg = parse_config(_cfg(debt_accounts=[
+        {"account_id": "ACT-1", "label": "1st Mortgage"},
+    ]))
+    assert cfg.debt_accounts[0].payment_source is None
+
+
+def test_debt_account_payment_source_parsed():
+    cfg = parse_config(_cfg(debt_accounts=[
+        {"account_id": "ACT-1", "label": "1st Mortgage", "due_day": 1,
+         "payment_source": {
+             "account_id": "ACT-checking",
+             "description_contains": ["CYPRUS MTG PMT", "MTG PMT LOAN"],
+         }},
+    ]))
+    ps = cfg.debt_accounts[0].payment_source
+    assert ps is not None
+    assert ps.account_id == "ACT-checking"
+    assert ps.description_contains == ("CYPRUS MTG PMT", "MTG PMT LOAN")
+
+
+def test_debt_account_payment_source_account_id_optional():
+    cfg = parse_config(_cfg(debt_accounts=[
+        {"account_id": "ACT-1", "label": "L",
+         "payment_source": {"description_contains": ["MTG PMT"]}},
+    ]))
+    ps = cfg.debt_accounts[0].payment_source
+    assert ps.account_id is None
+    assert ps.description_contains == ("MTG PMT",)
+
+
+def test_payment_source_must_be_object():
+    with pytest.raises(BudgetConfigError, match="payment_source must be an object"):
+        parse_config(_cfg(debt_accounts=[
+            {"account_id": "ACT-1", "label": "L", "payment_source": "nope"},
+        ]))
+
+
+def test_payment_source_requires_nonempty_patterns():
+    with pytest.raises(BudgetConfigError, match="description_contains must be a non-empty list"):
+        parse_config(_cfg(debt_accounts=[
+            {"account_id": "ACT-1", "label": "L",
+             "payment_source": {"description_contains": []}},
+        ]))
+
+
+def test_payment_source_rejects_blank_pattern():
+    with pytest.raises(BudgetConfigError, match="description_contains entries must be non-empty"):
+        parse_config(_cfg(debt_accounts=[
+            {"account_id": "ACT-1", "label": "L",
+             "payment_source": {"description_contains": ["ok", "  "]}},
+        ]))
+
+
+def test_payment_source_rejects_blank_account_id():
+    with pytest.raises(BudgetConfigError, match="payment_source.account_id must be a non-empty string"):
+        parse_config(_cfg(debt_accounts=[
+            {"account_id": "ACT-1", "label": "L",
+             "payment_source": {"description_contains": ["MTG"], "account_id": ""}},
+        ]))
