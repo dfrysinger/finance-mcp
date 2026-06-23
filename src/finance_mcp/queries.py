@@ -94,6 +94,15 @@ _GROUPERS = {
     "category": lambda t: t.get("category") or "Uncategorized",
 }
 
+# Grouping keys that are computed from a real transaction field alone, plus the
+# envelope grouping, which additionally needs an account_id -> envelope-name map.
+_VALID_GROUP_BY = frozenset(_GROUPERS) | {"envelope"}
+
+# Bucket name for spend on an account that belongs to no configured envelope, so
+# envelope-grouped totals never silently drop money (mirrors the burn-down's
+# unmapped bucket).
+UNMAPPED_ENVELOPE = "(unmapped)"
+
 
 def spending_summary(
     transactions: list[dict],
@@ -103,17 +112,31 @@ def spending_summary(
     end_date: str | None = None,
     include_pending: bool = True,
     exclude_transfers: bool = True,
+    envelope_index: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Aggregate inflow/outflow over a date range, grouped by a real field.
 
-    ``group_by`` is one of ``account``, ``org``, ``month``, ``category``. Outflow
-    is the sum of negative amounts (money out), inflow the sum of positive
-    amounts. Internal transfers and card payments are excluded by default so the
-    budget reflects real spending.
+    ``group_by`` is one of ``account``, ``org``, ``month``, ``category``, or
+    ``envelope``. Outflow is the sum of negative amounts (money out), inflow the
+    sum of positive amounts. Internal transfers and card payments are excluded by
+    default so the budget reflects real spending.
+
+    ``envelope`` grouping requires ``envelope_index`` (a mapping of account id to
+    envelope name); a transaction on an account in no envelope is bucketed under
+    :data:`UNMAPPED_ENVELOPE` so spend is never silently dropped.
     """
-    if group_by not in _GROUPERS:
-        raise ValueError(f"group_by must be one of {sorted(_GROUPERS)}")
-    grouper = _GROUPERS[group_by]
+    if group_by not in _VALID_GROUP_BY:
+        raise ValueError(f"group_by must be one of {sorted(_VALID_GROUP_BY)}")
+    if group_by == "envelope":
+        if envelope_index is None:
+            raise ValueError("group_by='envelope' requires envelope_index")
+
+        def grouper(t: dict) -> str:
+            acct = t.get("account_id")
+            name = envelope_index.get(acct) if acct is not None else None
+            return name if name is not None else UNMAPPED_ENVELOPE
+    else:
+        grouper = _GROUPERS[group_by]
 
     rows = filter_transactions(
         transactions,

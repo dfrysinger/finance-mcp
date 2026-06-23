@@ -627,7 +627,7 @@ const TABS = [
       {k:"include_transfers",type:"bool",label:"transfers",def:false},
       {k:"limit",type:"number",def:200} ] },
   { id:"summary",       label:"Spending",      filters:[
-      {k:"group_by",type:"select",opts:["category","account","org","month"]},
+      {k:"group_by",type:"select",opts:["category","account","envelope","org","month"]},
       {k:"start_date",type:"date"}, {k:"end_date",type:"date"} ] },
   { id:"networth",      label:"Net worth",     filters:[] },
   { id:"transfers",     label:"Transfers",     filters:[

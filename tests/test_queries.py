@@ -65,6 +65,32 @@ def test_spending_summary_rejects_bad_group_by(normalized):
         queries.spending_summary(normalized["transactions"], group_by="nonsense")
 
 
+def test_spending_summary_by_envelope_buckets_unmapped(normalized):
+    # The checking account is its own envelope ("Everyday"); the card belongs to
+    # no envelope, so its spend must surface in the (unmapped) bucket rather than
+    # vanish. Checking: +2000 in, -45 -12.34 out. Card: -89.10 out.
+    result = queries.spending_summary(
+        normalized["transactions"],
+        group_by="envelope",
+        envelope_index={"ACT-checking": "Everyday"},
+    )
+    assert result["group_by"] == "envelope"
+    groups = {g["group"]: g for g in result["groups"]}
+    assert set(groups) == {"Everyday", queries.UNMAPPED_ENVELOPE}
+    assert groups["Everyday"]["inflow"] == 2000.0
+    assert groups["Everyday"]["outflow"] == round(-45.0 - 12.34, 2)
+    assert groups[queries.UNMAPPED_ENVELOPE]["outflow"] == -89.1
+    # No money is dropped: bucket totals reconcile with the headline totals.
+    assert result["total_outflow"] == round(-45.0 - 12.34 - 89.1, 2)
+
+
+def test_spending_summary_envelope_requires_index(normalized):
+    import pytest
+
+    with pytest.raises(ValueError):
+        queries.spending_summary(normalized["transactions"], group_by="envelope")
+
+
 def test_filter_by_category(normalized):
     txns = [dict(t) for t in normalized["transactions"]]
     txns[0]["category"] = "Coffee"

@@ -121,6 +121,36 @@ def test_budget_burndown_bad_month_returns_error(tmp_path, monkeypatch):
     assert out["ok"] is False
 
 
+def test_spending_summary_by_envelope_tool(tmp_path, monkeypatch):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    conn = archive.connect()
+    try:
+        archive.upsert(conn, {"accounts": [], "transactions": [
+            _txn("g1", "g", "-50.00", on="2026-05-10", desc="STORE"),
+            _txn("x1", "x", "-9.00", on="2026-05-11", desc="UNMAPPED CARD"),
+        ]})
+    finally:
+        conn.close()
+    _write_budget(monkeypatch, tmp_path, {
+        "version": 1,
+        "envelopes": [{"name": "Groceries", "accounts": ["g"], "monthly_target": 750.00}],
+    })
+    out = server.spending_summary(group_by="envelope")
+    assert out["group_by"] == "envelope"
+    groups = {g["group"]: g for g in out["groups"]}
+    assert groups["Groceries"]["outflow"] == -50.0
+    # Spend on the unconfigured account is bucketed, not dropped.
+    assert "(unmapped)" in groups
+    assert groups["(unmapped)"]["outflow"] == -9.0
+
+
+def test_spending_summary_by_envelope_without_envelopes_errors(tmp_path, monkeypatch):
+    _write_budget(monkeypatch, tmp_path, {"version": 1, "envelopes": []})
+    out = server.spending_summary(group_by="envelope")
+    assert out["ok"] is False
+    assert "envelope" in out["error"].lower()
+
+
 def test_budget_forecast_tool(tmp_path, monkeypatch):
     monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
     archive.connect().close()

@@ -104,11 +104,37 @@ def spending_summary(
 ) -> dict[str, Any]:
     """Aggregate inflow/outflow over a date range, grouped for budgeting.
 
-    ``group_by`` is ``category`` (default), ``account``, ``org``, or ``month``.
-    Categories come from a local rules engine plus manual overrides. Internal
-    transfers and credit-card payments are excluded by default so the totals
-    reflect real spending; set ``exclude_transfers=False`` to include them.
+    ``group_by`` is ``category`` (default), ``account``, ``org``, ``month``, or
+    ``envelope``. Categories come from a local rules engine plus manual
+    overrides. Internal transfers and credit-card payments are excluded by
+    default so the totals reflect real spending; set ``exclude_transfers=False``
+    to include them.
+
+    ``envelope`` rolls spend up by the configured budget envelope that owns each
+    account (so spend on a non-envelope account such as a loan or brokerage falls
+    into an ``(unmapped)`` bucket). It needs at least one envelope in the budget
+    config; with none configured it returns an error rather than an empty view.
     """
+    from . import budget_config
+
+    envelope_index: dict[str, str] | None = None
+    if group_by == "envelope":
+        try:
+            cfg = _load_budget_config()
+        except budget_config.BudgetConfigError as exc:
+            return {"ok": False, "error": str(exc)}
+        if not cfg.envelopes:
+            return {
+                "ok": False,
+                "error": (
+                    "group_by='envelope' needs envelopes in the budget config, "
+                    "but none are defined"
+                ),
+            }
+        envelope_index = {
+            acct: env.name for acct, env in cfg.account_index().items()
+        }
+
     cache = store.load_archive_view()
     return queries.spending_summary(
         cache["transactions"],
@@ -117,6 +143,7 @@ def spending_summary(
         end_date=end_date,
         include_pending=include_pending,
         exclude_transfers=exclude_transfers,
+        envelope_index=envelope_index,
     )
 
 
