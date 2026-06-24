@@ -191,6 +191,45 @@ _OBSOLETE_DEFAULT_RULES: list[tuple[str, str, str, int, int]] = [
 _OBSOLETE_DEFAULTS_VERSION = 1
 
 
+# Default rules added in later versions. ``seed_default_rules`` only inserts the
+# starter set on first seed (it early-returns once the ``rules_seeded`` sentinel
+# exists, so a user who curates the defaults away does not get them back). That
+# same early-return means a NEW default added to ``DEFAULT_RULES`` never reaches
+# an archive seeded before it existed — so the new rule silently does nothing for
+# every existing user. Each entry here is backfilled once into already-seeded
+# archives, gated by the ``new_default_rules_version`` meta sentinel.
+#
+# The trailing int is the version that introduced the rule. The backfill inserts
+# only rules whose introduced-version is greater than the archive's already-applied
+# version, and only when the rule's pattern is absent (so a user's own same-pattern
+# rule is never duplicated). The introduced-version gate means a later
+# ``_NEW_DEFAULTS_VERSION`` bump (to add a brand-new rule) does NOT re-evaluate —
+# and therefore never resurrects — an earlier backfilled rule the user has since
+# deleted.
+#
+# Known limitation for the v1 (income) entries: backfilling at ``applied == 0`` is
+# required to reach genuinely legacy archives seeded before the income rules
+# existed — that is the whole point. But the very first income release seeded those
+# rules via the normal path WITHOUT writing this sentinel, so an archive freshly
+# seeded by that one release whose user then deleted an income rule is, at
+# ``applied == 0``, indistinguishable from a legacy archive — and the backfill will
+# restore the rule once. This window is closed going forward: a fresh seed by this
+# version records ``new_default_rules_version`` (see ``_insert_new_default_rules``),
+# so any later deletion is preserved. Do NOT extend this rationalization to future
+# additions — a rule added in a release that also ships this sentinel has no such
+# ambiguity and must carry the correct introduced-version. Bump
+# ``_NEW_DEFAULTS_VERSION`` whenever this list grows, tagging each appended rule
+# with that new version.
+_NEW_DEFAULT_RULES: list[tuple[str, str, str, int, int, int]] = [
+    # Income flag (parallel to transfers) shipped after the starter set, so
+    # archives seeded earlier never received these and kept counting benefit
+    # deposits as negative spending. Both patterns are collision-safe substrings.
+    ("unemployment", "any", "Income", 0, 20, 1),
+    ("social security", "any", "Income", 0, 20, 1),
+]
+_NEW_DEFAULTS_VERSION = 1
+
+
 def _now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
@@ -221,6 +260,56 @@ def _prune_obsolete_default_rules(conn: sqlite3.Connection) -> None:
         "VALUES ('obsolete_default_rules_version', ?)",
         (str(_OBSOLETE_DEFAULTS_VERSION),),
     )
+
+
+def _insert_new_default_rules(conn: sqlite3.Connection, *, already_seeded: bool) -> int:
+    """Backfill newly-added default rules into an already-seeded archive (once).
+
+    Runs inside the caller's open transaction (``seed_default_rules`` opens it).
+    Idempotent: a ``meta`` version key records the highest new-default set applied,
+    so this is a no-op after the first run. Returns the number of rules inserted.
+
+    Only an ``already_seeded`` archive is backfilled here. A fresh archive (no
+    ``rules_seeded`` sentinel) gets these patterns from the normal seed insert in
+    ``seed_default_rules``; backfilling them here too would double-insert and throw
+    off that function's inserted-count return. In the fresh case this still records
+    the version sentinel so the backfill never fires later. Each new default is
+    inserted only when (a) its introduced-version is newer than the archive's
+    already-applied version — so a later version bump never re-evaluates, and thus
+    never resurrects, an earlier backfilled rule the user has since deleted — and
+    (b) no rule with that pattern already exists, so a user's own same-pattern rule
+    is never duplicated.
+    """
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='new_default_rules_version'"
+    ).fetchone()
+    applied = int(row[0]) if row is not None and str(row[0]).isdigit() else 0
+    if applied >= _NEW_DEFAULTS_VERSION:
+        return 0
+    inserted = 0
+    if already_seeded:
+        existing = {
+            r[0] for r in conn.execute("SELECT pattern FROM category_rules").fetchall()
+        }
+        now = _now()
+        to_insert = [
+            (p, f, c, t, pr, now)
+            for (p, f, c, t, pr, added_in) in _NEW_DEFAULT_RULES
+            if added_in > applied and p not in existing
+        ]
+        if to_insert:
+            conn.executemany(
+                "INSERT INTO category_rules (pattern, field, category, is_transfer, priority, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                to_insert,
+            )
+            inserted = len(to_insert)
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) "
+        "VALUES ('new_default_rules_version', ?)",
+        (str(_NEW_DEFAULTS_VERSION),),
+    )
+    return inserted
 
 
 def seed_default_rules(conn: sqlite3.Connection, *, force: bool = False) -> int:
@@ -256,13 +345,19 @@ def seed_default_rules(conn: sqlite3.Connection, *, force: bool = False) -> int:
         # archive is already seeded (the early-return below would otherwise skip
         # it). Guarded to run once. Must precede the sentinel check.
         _prune_obsolete_default_rules(conn)
+        already = conn.execute(
+            "SELECT value FROM meta WHERE key='rules_seeded'"
+        ).fetchone()
+        # Symmetric to the prune: backfill defaults added after this archive was
+        # seeded, which the sentinel early-return below would otherwise skip,
+        # leaving the new rule inert for every existing user. Guarded to run once.
+        # Only an already-seeded archive needs this; a fresh archive gets the same
+        # patterns from the normal insert below.
+        backfilled = _insert_new_default_rules(conn, already_seeded=already is not None)
         if not force:
-            already = conn.execute(
-                "SELECT value FROM meta WHERE key='rules_seeded'"
-            ).fetchone()
             if already is not None:
                 conn.commit()
-                return 0
+                return backfilled
         existing = {
             row[0]
             for row in conn.execute("SELECT pattern FROM category_rules").fetchall()
@@ -284,7 +379,7 @@ def seed_default_rules(conn: sqlite3.Connection, *, force: bool = False) -> int:
             (now,),
         )
         conn.commit()
-        return len(to_insert)
+        return len(to_insert) + backfilled
     except Exception:
         conn.rollback()
         raise

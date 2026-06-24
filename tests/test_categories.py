@@ -685,6 +685,12 @@ def test_prune_removes_stale_pension_default_from_seeded_archive(tmp_path):
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('rules_seeded', ?)",
         (categories._now(),),
     )
+    # Mark the new-defaults backfill as already applied so this prune-focused test
+    # isn't perturbed by it (the backfill has its own dedicated tests).
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('new_default_rules_version', ?)",
+        (str(categories._NEW_DEFAULTS_VERSION),),
+    )
     conn.commit()
     inserted = categories.seed_default_rules(conn)  # already seeded -> early return path
     assert inserted == 0
@@ -720,3 +726,149 @@ def test_prune_is_idempotent(tmp_path):
         "SELECT value FROM meta WHERE key='obsolete_default_rules_version'"
     ).fetchone()
     assert int(row["value"]) == categories._OBSOLETE_DEFAULTS_VERSION
+
+
+def test_backfill_adds_new_default_into_already_seeded_archive(tmp_path):
+    # An archive seeded before the income rules existed must receive them, even
+    # though seed_default_rules early-returns once seeded. Simulate a legacy
+    # archive: mark it seeded but strip the new income defaults and the version
+    # sentinel that records the backfill as applied.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    conn.execute(
+        "DELETE FROM category_rules WHERE pattern IN ('unemployment','social security')"
+    )
+    conn.execute("DELETE FROM meta WHERE key='new_default_rules_version'")
+    conn.commit()
+    patterns = [r["pattern"] for r in categories.list_rules(conn)]
+    assert "unemployment" not in patterns
+
+    inserted = categories.seed_default_rules(conn)  # already seeded -> early return path
+    # The early-return path now honestly reports the rules the backfill inserted.
+    assert inserted == 2
+    patterns = [r["pattern"] for r in categories.list_rules(conn)]
+    assert "unemployment" in patterns
+    assert "social security" in patterns
+    # A benefit deposit now resolves to income and is excluded from spending.
+    txns = [_txn("t1", payee="Unemployment Insurance", amount=685.1)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Income"
+    assert txns[0]["is_income"] is True
+
+
+def test_backfill_does_not_duplicate_on_fresh_archive(tmp_path):
+    # A fresh archive's normal seed already inserts the income rules; the backfill
+    # must not add a second copy regardless of ordering.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM category_rules WHERE pattern='unemployment'"
+        ).fetchone()[0]
+        == 1
+    )
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='new_default_rules_version'"
+    ).fetchone()
+    assert int(row["value"]) == categories._NEW_DEFAULTS_VERSION
+
+
+def test_backfill_preserves_user_custom_same_pattern_rule(tmp_path):
+    # A user who already curated their own "unemployment" rule (different
+    # category) must not get a duplicate default appended.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    conn.execute(
+        "DELETE FROM category_rules WHERE pattern IN ('unemployment','social security')"
+    )
+    conn.execute("DELETE FROM meta WHERE key='new_default_rules_version'")
+    conn.commit()
+    categories.add_rule(conn, "unemployment", "Side Gig")
+    categories.seed_default_rules(conn)
+    rules = [r for r in categories.list_rules(conn) if r["pattern"] == "unemployment"]
+    assert len(rules) == 1
+    assert rules[0]["category"] == "Side Gig"
+
+
+def test_backfill_is_idempotent(tmp_path):
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    categories.seed_default_rules(conn)
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM category_rules WHERE pattern='unemployment'"
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_fresh_seed_records_version_so_later_deletion_is_preserved(tmp_path):
+    # A fresh seed by this version records new_default_rules_version, so a user who
+    # then deletes a backfilled default does NOT get it resurrected on the next read.
+    # This closes the forward-going window of the v1 backfill's known limitation.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='new_default_rules_version'"
+    ).fetchone()
+    assert int(row["value"]) == categories._NEW_DEFAULTS_VERSION
+    rid = next(
+        r["rule_id"]
+        for r in categories.list_rules(conn)
+        if r["pattern"] == "unemployment"
+    )
+    categories.remove_rule(conn, rid)
+    categories.seed_default_rules(conn)
+    patterns = [r["pattern"] for r in categories.list_rules(conn)]
+    assert "unemployment" not in patterns
+
+
+def test_backfill_force_reseed_counts_backfilled_rules(tmp_path):
+    # force=True on a legacy seeded archive that predates the income defaults must
+    # report the backfilled rows in its returned count (the documented contract is
+    # "the number of default rules actually inserted").
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    conn.execute(
+        "DELETE FROM category_rules WHERE pattern IN ('unemployment','social security')"
+    )
+    conn.execute("DELETE FROM meta WHERE key='new_default_rules_version'")
+    conn.commit()
+    inserted = categories.seed_default_rules(conn, force=True)
+    # The two income defaults were backfilled; nothing else was missing.
+    assert inserted == 2
+    patterns = [r["pattern"] for r in categories.list_rules(conn)]
+    assert patterns.count("unemployment") == 1
+    assert patterns.count("social security") == 1
+
+
+def test_backfill_version_bump_does_not_resurrect_deleted_rule(tmp_path, monkeypatch):
+    # After v1 is applied and the user deletes a v1 backfilled default, a later
+    # version bump that adds a brand-new default must insert ONLY the new rule and
+    # must NOT resurrect the deleted one.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)  # applies v1
+    categories.remove_rule(
+        conn,
+        next(
+            r["rule_id"]
+            for r in categories.list_rules(conn)
+            if r["pattern"] == "unemployment"
+        ),
+    )
+    # Simulate a future release: bump the version and append a v2 rule.
+    monkeypatch.setattr(
+        categories,
+        "_NEW_DEFAULT_RULES",
+        [
+            ("unemployment", "any", "Income", 0, 20, 1),
+            ("social security", "any", "Income", 0, 20, 1),
+            ("child support", "any", "Income", 0, 20, 2),
+        ],
+    )
+    monkeypatch.setattr(categories, "_NEW_DEFAULTS_VERSION", 2)
+    inserted = categories.seed_default_rules(conn)
+    patterns = [r["pattern"] for r in categories.list_rules(conn)]
+    assert "child support" in patterns  # v2 rule backfilled
+    assert "unemployment" not in patterns  # deleted v1 rule stays gone
+    assert inserted == 1
