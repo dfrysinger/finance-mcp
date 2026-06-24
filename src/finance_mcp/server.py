@@ -101,14 +101,19 @@ def spending_summary(
     end_date: str | None = None,
     include_pending: bool = True,
     exclude_transfers: bool = True,
+    exclude_income: bool = True,
 ) -> dict[str, Any]:
-    """Aggregate inflow/outflow over a date range, grouped for budgeting.
+    """Aggregate net spending over a date range, grouped for budgeting.
 
     ``group_by`` is ``category`` (default), ``account``, ``org``, ``month``, or
     ``envelope``. Categories come from a local rules engine plus manual
-    overrides. Internal transfers and credit-card payments are excluded by
-    default so the totals reflect real spending; set ``exclude_transfers=False``
-    to include them.
+    overrides. Internal transfers and income (payroll, benefits, investment
+    income) are excluded by default so the totals reflect real spending; set
+    ``exclude_transfers=False`` or ``exclude_income=False`` to include them.
+
+    Per group, ``outflow`` is spend, ``inflow`` is refunds/returns that net
+    against it, and ``unclassified_inflow`` is positive amounts with no spending
+    category (surfaced but not netted). ``net`` is outflow plus refunds.
 
     ``envelope`` rolls spend up by the configured budget envelope that owns each
     account (so spend on a non-envelope account such as a loan or brokerage falls
@@ -143,6 +148,7 @@ def spending_summary(
         end_date=end_date,
         include_pending=include_pending,
         exclude_transfers=exclude_transfers,
+        exclude_income=exclude_income,
         envelope_index=envelope_index,
     )
 

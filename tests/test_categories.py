@@ -606,3 +606,117 @@ def test_no_debt_accounts_is_backward_compatible(tmp_path):
     txns = [_txn_on("t1", "ACT-LOAN-1", desc="PRINCIPAL INTEREST", amount=100.0)]
     categories.apply_categories(conn, txns)
     assert txns[0]["category"] == "Investment Income"
+
+
+def test_income_rule_sets_is_income(tmp_path):
+    # A payroll deposit resolves to Income and is flagged is_income so spending
+    # views can exclude it. Investment income is likewise flagged.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    txns = [
+        _txn("t1", desc="GITHUB INC PAYROLL", amount=5000.0),
+        _txn("t2", desc="DIVIDEND RECEIVED", amount=12.0),
+        _txn("t3", desc="UNEMPLOYMENT BENEFIT", amount=685.0),
+    ]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Income"
+    assert txns[0]["is_income"] is True
+    assert txns[1]["category"] == "Investment Income"
+    assert txns[1]["is_income"] is True
+    assert txns[2]["category"] == "Income"
+    assert txns[2]["is_income"] is True
+
+
+def test_spending_is_not_income(tmp_path):
+    # A regular purchase and an uncategorized row are never flagged income.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "harmons", "Groceries")
+    txns = [
+        _txn("t1", desc="HARMONS #12", amount=-40.0),
+        _txn("t2", desc="SOME UNKNOWN MERCHANT", amount=-9.0),
+    ]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["is_income"] is False
+    assert txns[1]["is_income"] is False
+
+
+def test_transfer_dominates_income_flag(tmp_path):
+    # A manual override marking a row as a transfer is never income, even if the
+    # category name looks income-like.
+    conn = _conn(tmp_path)
+    _seed_txn(conn, "t1")
+    categories.set_manual_category(conn, "t1", "Investment Income", is_transfer=True)
+    txns = [_txn("t1", desc="WHATEVER", amount=100.0)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["is_transfer"] is True
+    assert txns[0]["is_income"] is False
+
+
+def test_debt_pin_is_not_income(tmp_path):
+    # A debt-account posting is pinned to Loan Payment / transfer, never income.
+    conn = _conn(tmp_path)
+    txns = [_txn_on("t1", "ACT-LOAN-1", desc="PRINCIPAL INTEREST", amount=100.0)]
+    categories.apply_categories(conn, txns, debt_account_ids=DEBT)
+    assert txns[0]["category"] == categories.LOAN_PAYMENT
+    assert txns[0]["is_income"] is False
+
+
+def test_income_patterns_do_not_match_unrelated_spend(tmp_path):
+    # Income substrings must not collide with real merchant spend. Regression:
+    # "pension" once matched "SUSPENSION" and buried auto-repair outflow as income.
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    txns = [_txn("t1", desc="PEP BOYS BRAKE SUSPENSION SERVICE", amount=-220.0)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] != "Income"
+    assert txns[0]["is_income"] is False
+
+
+def test_prune_removes_stale_pension_default_from_seeded_archive(tmp_path):
+    # An archive seeded before "pension" was removed still holds the stale default.
+    # seed_default_rules early-returns once seeded, so the prune must delete it.
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, priority, created_at) "
+        "VALUES ('pension','any','Income',0,20,?)",
+        (categories._now(),),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('rules_seeded', ?)",
+        (categories._now(),),
+    )
+    conn.commit()
+    inserted = categories.seed_default_rules(conn)  # already seeded -> early return path
+    assert inserted == 0
+    patterns = [r["pattern"] for r in categories.list_rules(conn)]
+    assert "pension" not in patterns
+    # A SUSPENSION purchase is no longer income.
+    txns = [_txn("t1", desc="PEP BOYS BRAKE SUSPENSION SERVICE", amount=-220.0)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["is_income"] is False
+
+
+def test_prune_preserves_user_custom_pension_rule(tmp_path):
+    # Only the exact default signature is removed. A user's own "pension" rule
+    # (different category) must survive the prune.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "pension", "Retirement Spending")
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('rules_seeded', ?)",
+        (categories._now(),),
+    )
+    conn.commit()
+    categories.seed_default_rules(conn)
+    rules = {r["pattern"]: r["category"] for r in categories.list_rules(conn)}
+    assert rules.get("pension") == "Retirement Spending"
+
+
+def test_prune_is_idempotent(tmp_path):
+    conn = _conn(tmp_path)
+    categories.seed_default_rules(conn)
+    # Re-running must not error and must leave the version sentinel set.
+    categories.seed_default_rules(conn)
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='obsolete_default_rules_version'"
+    ).fetchone()
+    assert int(row["value"]) == categories._OBSOLETE_DEFAULTS_VERSION

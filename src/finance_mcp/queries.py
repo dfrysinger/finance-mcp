@@ -11,6 +11,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
+from .categories import UNCATEGORIZED
+
 
 def _parse_date(value: str | None) -> int | None:
     """Parse a YYYY-MM-DD (or ISO) date string into a UTC Unix timestamp."""
@@ -40,6 +42,7 @@ def filter_transactions(
     include_pending: bool = True,
     category: str | None = None,
     include_transfers: bool = True,
+    include_income: bool = True,
     limit: int | None = None,
 ) -> list[dict]:
     """Return transactions matching all supplied filters (AND semantics)."""
@@ -53,6 +56,8 @@ def filter_transactions(
         if not include_pending and txn.get("pending"):
             continue
         if not include_transfers and txn.get("is_transfer"):
+            continue
+        if not include_income and txn.get("is_income"):
             continue
         if want_cat is not None and (txn.get("category") or "").lower() != want_cat:
             continue
@@ -112,14 +117,31 @@ def spending_summary(
     end_date: str | None = None,
     include_pending: bool = True,
     exclude_transfers: bool = True,
+    exclude_income: bool = True,
     envelope_index: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Aggregate inflow/outflow over a date range, grouped by a real field.
+    """Aggregate net spending over a date range, grouped by a real field.
 
     ``group_by`` is one of ``account``, ``org``, ``month``, ``category``, or
-    ``envelope``. Outflow is the sum of negative amounts (money out), inflow the
-    sum of positive amounts. Internal transfers and card payments are excluded by
-    default so the budget reflects real spending.
+    ``envelope``. This view answers "how much did I actually spend per group",
+    so it sorts money into three kinds and reports them in separate columns:
+
+    - ``outflow`` — money spent (sum of negative amounts).
+    - ``inflow`` — *refunds/returns*: positive amounts that carry a real
+      spending category. A return keeps the category of what it refunds, so it
+      nets against that group's spend (``net = outflow + inflow``).
+    - ``unclassified_inflow`` — positive amounts with no spending category
+      (``Uncategorized``). These are surfaced separately and deliberately do
+      **not** net against spend: an unclassified deposit is just as likely to be
+      unrecognized income as a refund, and letting mystery money reduce spend
+      would understate it. Categorize such a row (e.g. tag a return to its
+      envelope, or a deposit as income) to move it into ``inflow`` or out of the
+      view entirely.
+
+    Internal transfers (``exclude_transfers``) and income
+    (``exclude_income`` — payroll, benefits, investment income) are dropped
+    before aggregation so neither masks real spending. ``net`` is therefore true
+    net spend (outflow minus returns), never inflated by income.
 
     ``envelope`` grouping requires ``envelope_index`` (a mapping of account id to
     envelope name); a transaction on an account in no envelope is bucketed under
@@ -144,12 +166,19 @@ def spending_summary(
         end_date=end_date,
         include_pending=include_pending,
         include_transfers=not exclude_transfers,
+        include_income=not exclude_income,
     )
 
     groups: dict[str, dict[str, float]] = defaultdict(
-        lambda: {"inflow": 0.0, "outflow": 0.0, "net": 0.0, "count": 0}
+        lambda: {
+            "inflow": 0.0,
+            "outflow": 0.0,
+            "unclassified_inflow": 0.0,
+            "net": 0.0,
+            "count": 0,
+        }
     )
-    total_in = total_out = 0.0
+    total_in = total_out = total_unclassified = 0.0
     skipped = 0
     for txn in rows:
         amt = txn.get("amount_float")
@@ -161,10 +190,18 @@ def spending_summary(
         if amt < 0:
             bucket["outflow"] += amt
             total_out += amt
+            bucket["net"] += amt
+        elif (txn.get("category") or UNCATEGORIZED) == UNCATEGORIZED:
+            # Positive amount with no spending category: surface it, but do not
+            # let it net against spend (it may be unrecognized income).
+            bucket["unclassified_inflow"] += amt
+            total_unclassified += amt
         else:
+            # Positive amount with a real spending category: a refund/return
+            # that offsets spend in this group.
             bucket["inflow"] += amt
             total_in += amt
-        bucket["net"] += amt
+            bucket["net"] += amt
 
     groups_out = [
         {"group": key, **{k: round(v, 2) for k, v in vals.items()}}
@@ -175,10 +212,12 @@ def spending_summary(
         "start_date": start_date,
         "end_date": end_date,
         "exclude_transfers": exclude_transfers,
+        "exclude_income": exclude_income,
         "transaction_count": len(rows),
         "amount_missing_count": skipped,
         "total_inflow": round(total_in, 2),
         "total_outflow": round(total_out, 2),
+        "total_unclassified_inflow": round(total_unclassified, 2),
         "net": round(total_in + total_out, 2),
         "groups": groups_out,
     }

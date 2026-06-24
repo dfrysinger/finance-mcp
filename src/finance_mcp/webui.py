@@ -59,6 +59,7 @@ _ENDPOINTS: dict[str, tuple] = {
             "end_date": ("str", False),
             "include_pending": ("bool", False),
             "exclude_transfers": ("bool", False),
+            "exclude_income": ("bool", False),
         },
     ),
     "burndown": (server.budget_burndown, {"month": ("str", True)}),
@@ -641,7 +642,8 @@ const TABS = [
       {k:"limit",type:"number",def:200} ] },
   { id:"summary",       label:"Spending",      filters:[
       {k:"group_by",type:"select",opts:["category","account","envelope","org","month"]},
-      {k:"start_date",type:"date"}, {k:"end_date",type:"date"} ] },
+      {k:"start_date",type:"date"}, {k:"end_date",type:"date"},
+      {k:"exclude_income",type:"bool",label:"exclude income",def:true} ] },
   { id:"networth",      label:"Net worth",     filters:[] },
   { id:"transfers",     label:"Transfers",     filters:[
       {k:"status",type:"select",opts:["","unconfirmed","inferred","confirmed","unmatched"]} ] },
@@ -853,9 +855,10 @@ const RENDER = {
       : Object.entries(groups).map(([k,v])=>({key:k, ...(typeof v==='object'?v:{value:v})}));
     return table(rows, [
       {label:"Group",get:r=>r.key ?? r.group ?? r.name},
-      {label:"Outflow",num:true,money:true,get:r=>r.outflow},
-      {label:"Inflow",num:true,money:true,get:r=>r.inflow},
-      {label:"Net",num:true,money:true,get:r=>r.net},
+      {label:"Spent",num:true,money:true,get:r=>r.outflow},
+      {label:"Returns",num:true,money:true,get:r=>r.inflow},
+      {label:"Unclassified in",num:true,money:true,get:r=>r.unclassified_inflow},
+      {label:"Net spent",num:true,money:true,get:r=>r.net},
       {label:"Count",num:true,get:r=>r.count},
     ]);
   },

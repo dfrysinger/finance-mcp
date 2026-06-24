@@ -21,6 +21,22 @@ from datetime import datetime, timezone
 UNCATEGORIZED = "Uncategorized"
 LOAN_PAYMENT = "Loan Payment"
 
+# Categories that represent money earned (not a refund of a purchase). Spending
+# views exclude these the same way they exclude transfers, so income never masks
+# or offsets real spend. A transfer is never income (the ``is_transfer`` flag
+# wins), and an inflow that merely refunds a purchase keeps its spending category
+# so it can net against that envelope instead of being dropped as income.
+INCOME_CATEGORIES = frozenset({"Income", "Investment Income"})
+
+
+def is_income_category(category: str | None, is_transfer: bool) -> bool:
+    """True when ``category`` is income and the row is not a transfer.
+
+    ``is_transfer`` dominates: an internal move labeled with an income-like
+    category is still a transfer, not income.
+    """
+    return not is_transfer and category in INCOME_CATEGORIES
+
 # Starter rules, seeded from the user's real merchants plus common ones. Patterns
 # are case-insensitive substrings. Transfers/payments are flagged is_transfer=1
 # and given high priority so they win over any incidental merchant match.
@@ -49,6 +65,13 @@ DEFAULT_RULES: list[tuple[str, str, str, int, int]] = [
     # Income
     ("payroll", "any", "Income", 0, 20),
     ("direct dep", "any", "Income", 0, 20),
+    # Common standard income sources (generic, not merchant-specific). These are
+    # earnings/benefits, never a refund of a purchase, so the spending view
+    # excludes them once classified. Patterns must be safe as case-insensitive
+    # substrings: avoid short tokens that appear inside unrelated merchant words
+    # (e.g. "pension" would match "suspension" and bury real auto-repair spend).
+    ("unemployment", "any", "Income", 0, 20),
+    ("social security", "any", "Income", 0, 20),
     ("dividend", "any", "Investment Income", 0, 20),
     ("interest paid", "any", "Investment Income", 0, 20),
     ("interest earned", "any", "Investment Income", 0, 20),
@@ -153,8 +176,51 @@ DEFAULT_RULES: list[tuple[str, str, str, int, int]] = [
 ]
 
 
+# Default rules removed in later versions. An archive seeded before a default was
+# pruned still holds the stale row, and ``seed_default_rules`` early-returns once
+# an archive is seeded — so without an explicit cleanup the obsolete rule lingers
+# and keeps mis-categorizing spend. Each entry is the exact original default
+# signature; only an unmodified default (``account_id IS NULL`` and every other
+# column matching) is deleted, so a user's own same-pattern rule is preserved.
+# Bump ``_OBSOLETE_DEFAULTS_VERSION`` whenever this list grows.
+_OBSOLETE_DEFAULT_RULES: list[tuple[str, str, str, int, int]] = [
+    # "pension" matched the substring inside "suspension", burying auto-repair
+    # spend as Income. Replaced by collision-safe income patterns.
+    ("pension", "any", "Income", 0, 20),
+]
+_OBSOLETE_DEFAULTS_VERSION = 1
+
+
 def _now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _prune_obsolete_default_rules(conn: sqlite3.Connection) -> None:
+    """Delete superseded default rules from an already-seeded archive (once).
+
+    Runs inside the caller's open transaction (``seed_default_rules`` opens it).
+    Idempotent: a ``meta`` version key records the highest obsolete-set applied,
+    so this is a no-op after the first run. Only an exact, unmodified default
+    signature with ``account_id IS NULL`` is removed, so a user's customized
+    same-pattern rule is never touched.
+    """
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='obsolete_default_rules_version'"
+    ).fetchone()
+    applied = int(row[0]) if row is not None and str(row[0]).isdigit() else 0
+    if applied >= _OBSOLETE_DEFAULTS_VERSION:
+        return
+    for pat, field, cat, transfer, prio in _OBSOLETE_DEFAULT_RULES:
+        conn.execute(
+            "DELETE FROM category_rules WHERE pattern=? AND field=? AND category=? "
+            "AND is_transfer=? AND priority=? AND account_id IS NULL",
+            (pat, field, cat, transfer, prio),
+        )
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) "
+        "VALUES ('obsolete_default_rules_version', ?)",
+        (str(_OBSOLETE_DEFAULTS_VERSION),),
+    )
 
 
 def seed_default_rules(conn: sqlite3.Connection, *, force: bool = False) -> int:
@@ -186,6 +252,10 @@ def seed_default_rules(conn: sqlite3.Connection, *, force: bool = False) -> int:
         )
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # Remove any default rule that has since been superseded, even when the
+        # archive is already seeded (the early-return below would otherwise skip
+        # it). Guarded to run once. Must precede the sentinel check.
+        _prune_obsolete_default_rules(conn)
         if not force:
             already = conn.execute(
                 "SELECT value FROM meta WHERE key='rules_seeded'"
@@ -351,7 +421,7 @@ def apply_categories(
     *,
     debt_account_ids: frozenset[str] | set[str] | None = None,
 ) -> list[dict]:
-    """Annotate each transaction with ``category``, ``is_transfer``, ``category_source``.
+    """Annotate each transaction with ``category``, ``is_transfer``, ``is_income``, ``category_source``.
 
     Mutates and returns the same list. Resolution order per transaction:
 
@@ -378,11 +448,13 @@ def apply_categories(
         if tid in manual:
             cat, transfer = manual[tid]
             txn["category"], txn["is_transfer"], txn["category_source"] = cat, transfer, "manual"
+            txn["is_income"] = is_income_category(cat, transfer)
             continue
         if txn.get("account_id") in debts:
             txn["category"], txn["is_transfer"], txn["category_source"] = (
                 LOAN_PAYMENT, True, "debt_account",
             )
+            txn["is_income"] = False
             continue
         desc = (txn.get("description") or "").lower()
         payee = (txn.get("payee") or "").lower()
@@ -393,12 +465,16 @@ def apply_categories(
                 txn["category"] = rule["category"]
                 txn["is_transfer"] = bool(rule["is_transfer"])
                 txn["category_source"] = "rule"
+                txn["is_income"] = is_income_category(
+                    txn["category"], txn["is_transfer"]
+                )
                 assigned = True
                 break
         if not assigned:
             txn["category"], txn["is_transfer"], txn["category_source"] = (
                 UNCATEGORIZED, False, "none",
             )
+            txn["is_income"] = False
     return transactions
 
 

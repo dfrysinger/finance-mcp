@@ -44,10 +44,12 @@ def test_limit(normalized):
 def test_spending_summary_by_account(normalized):
     result = queries.spending_summary(normalized["transactions"], group_by="account")
     assert result["group_by"] == "account"
-    # inflow = 2000 (payroll); outflow = -45 -12.34 -89.10 -0 = -146.44
-    assert result["total_inflow"] == 2000.0
+    # +2000 has no spending category, so it surfaces as unclassified inflow and is
+    # NOT netted against spend; outflow = -45 -12.34 -89.10 = -146.44.
+    assert result["total_inflow"] == 0.0
+    assert result["total_unclassified_inflow"] == 2000.0
     assert result["total_outflow"] == -146.44
-    assert result["net"] == round(2000.0 - 146.44, 2)
+    assert result["net"] == -146.44
     groups = {g["group"]: g for g in result["groups"]}
     assert "Checking" in groups
     assert "Rewards Card" in groups
@@ -68,7 +70,7 @@ def test_spending_summary_rejects_bad_group_by(normalized):
 def test_spending_summary_by_envelope_buckets_unmapped(normalized):
     # The checking account is its own envelope ("Everyday"); the card belongs to
     # no envelope, so its spend must surface in the (unmapped) bucket rather than
-    # vanish. Checking: +2000 in, -45 -12.34 out. Card: -89.10 out.
+    # vanish. Checking: +2000 uncategorized, -45 -12.34 out. Card: -89.10 out.
     result = queries.spending_summary(
         normalized["transactions"],
         group_by="envelope",
@@ -77,7 +79,10 @@ def test_spending_summary_by_envelope_buckets_unmapped(normalized):
     assert result["group_by"] == "envelope"
     groups = {g["group"]: g for g in result["groups"]}
     assert set(groups) == {"Everyday", queries.UNMAPPED_ENVELOPE}
-    assert groups["Everyday"]["inflow"] == 2000.0
+    # The +2000 has no spending category, so it is surfaced as unclassified inflow
+    # and does not net against the envelope's spend.
+    assert groups["Everyday"]["unclassified_inflow"] == 2000.0
+    assert groups["Everyday"]["inflow"] == 0.0
     assert groups["Everyday"]["outflow"] == round(-45.0 - 12.34, 2)
     assert groups[queries.UNMAPPED_ENVELOPE]["outflow"] == -89.1
     # No money is dropped: bucket totals reconcile with the headline totals.
@@ -117,4 +122,70 @@ def test_spending_summary_by_category_excludes_transfers(normalized):
 
     included = queries.spending_summary(txns, group_by="category", exclude_transfers=False)
     assert "Transfer" in {g["group"] for g in included["groups"]}
+
+
+def _txn(tid, account_id, amount, category, *, is_income=False, is_transfer=False):
+    return {
+        "id": tid,
+        "account_id": account_id,
+        "amount_float": amount,
+        "category": category,
+        "is_income": is_income,
+        "is_transfer": is_transfer,
+        "posted_ts": 1700000000,
+    }
+
+
+def test_filter_exclude_income():
+    txns = [
+        _txn("pay", "ACT-main", 2000.0, "Income", is_income=True),
+        _txn("buy", "ACT-main", -50.0, "Groceries"),
+    ]
+    rows = queries.filter_transactions(txns, include_income=False)
+    assert {t["id"] for t in rows} == {"buy"}
+    # default keeps income
+    assert {t["id"] for t in queries.filter_transactions(txns)} == {"pay", "buy"}
+
+
+def test_spending_summary_excludes_income_by_default():
+    txns = [
+        _txn("pay", "ACT-main", 2000.0, "Income", is_income=True),
+        _txn("buy", "ACT-main", -50.0, "Groceries"),
+    ]
+    result = queries.spending_summary(txns, group_by="account")
+    assert result["exclude_income"] is True
+    # Income is dropped: net spend is just the -50 outflow, never inflated by pay.
+    assert result["total_inflow"] == 0.0
+    assert result["total_outflow"] == -50.0
+    assert result["net"] == -50.0
+    # Opting income back in restores it as inflow.
+    included = queries.spending_summary(txns, group_by="account", exclude_income=False)
+    assert included["total_inflow"] == 2000.0
+
+
+def test_spending_summary_refund_nets_unclassified_does_not():
+    # A categorized return nets against its group; an uncategorized deposit is
+    # surfaced separately and does NOT reduce spend.
+    txns = [
+        _txn("buy", "ACT-main", -100.0, "Groceries"),
+        _txn("return", "ACT-main", 30.0, "Groceries"),
+        _txn("mystery", "ACT-main", 500.0, "Uncategorized"),
+    ]
+    result = queries.spending_summary(txns, group_by="account")
+    assert len(result["groups"]) == 1
+    g = result["groups"][0]
+    assert g["outflow"] == -100.0
+    assert g["inflow"] == 30.0  # the return offsets spend
+    assert g["unclassified_inflow"] == 500.0  # mystery deposit surfaced, not netted
+    assert g["net"] == -70.0  # -100 + 30, mystery excluded
+    assert result["total_unclassified_inflow"] == 500.0
+
+
+def test_spending_summary_missing_category_is_unclassified_inflow():
+    # A positive amount with no category at all is treated as unclassified.
+    txns = [_txn("dep", "ACT-main", 75.0, None)]
+    result = queries.spending_summary(txns, group_by="account")
+    assert result["total_inflow"] == 0.0
+    assert result["total_unclassified_inflow"] == 75.0
+    assert result["net"] == 0.0
 
