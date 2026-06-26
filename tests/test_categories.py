@@ -872,3 +872,559 @@ def test_backfill_version_bump_does_not_resurrect_deleted_rule(tmp_path, monkeyp
     assert "child support" in patterns  # v2 rule backfilled
     assert "unemployment" not in patterns  # deleted v1 rule stays gone
     assert inserted == 1
+
+
+# --- Per-transaction predicates: amount magnitude, day-of-month, regex --------
+
+from datetime import datetime, timezone
+
+import pytest
+
+from finance_mcp import archive as _archive
+
+
+def _ts(year, month, day):
+    """Epoch seconds at midnight UTC, matching how the importer stores posted_ts."""
+    return int(datetime(year, month, day, tzinfo=timezone.utc).timestamp())
+
+
+def _dated_txn(tid, *, desc="", payee="", amount=-10.0, day=None, ts=None):
+    txn = {"id": tid, "description": desc, "payee": payee, "amount_float": amount}
+    if ts is not None:
+        txn["posted_ts"] = ts
+    elif day is not None:
+        txn["posted_ts"] = _ts(2026, 4, day)
+    return txn
+
+
+def test_amount_band_matches_magnitude_not_sign(tmp_path):
+    # A 200-350 band matches a $304 *charge* (negative amount) by magnitude.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla, inc", "Insurance",
+                        amount_min=200, amount_max=350)
+    txns = [_dated_txn("t1", desc="TESLA, INC. 45500 FREMO", amount=-304.76)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Insurance"
+
+
+def test_amount_band_excludes_out_of_range(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla, inc", "Insurance",
+                        amount_min=200, amount_max=350)
+    # A $900 Supercharge/parts charge at the same merchant is left alone.
+    txns = [_dated_txn("t1", desc="TESLA, INC. 45500 FREMO", amount=-900.00)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_amount_band_is_inclusive_at_bounds(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla", "Insurance", amount_min=200, amount_max=350)
+    lo = _dated_txn("lo", desc="TESLA", amount=-200.0)
+    hi = _dated_txn("hi", desc="TESLA", amount=-350.0)
+    categories.apply_categories(conn, [lo, hi])
+    assert lo["category"] == "Insurance"
+    assert hi["category"] == "Insurance"
+
+
+def test_amount_min_only_and_max_only(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "floor", "Big", amount_min=100)
+    categories.add_rule(conn, "ceil", "Small", amount_max=50)
+    txns = [
+        _dated_txn("a", desc="FLOOR", amount=-150.0),   # >= 100 -> Big
+        _dated_txn("b", desc="FLOOR", amount=-40.0),    # < 100 -> not Big
+        _dated_txn("c", desc="CEIL", amount=-40.0),     # <= 50 -> Small
+        _dated_txn("d", desc="CEIL", amount=-90.0),     # > 50 -> not Small
+    ]
+    categories.apply_categories(conn, txns)
+    assert [t["category"] for t in txns] == [
+        "Big", categories.UNCATEGORIZED, "Small", categories.UNCATEGORIZED,
+    ]
+
+
+def test_amount_predicate_fails_closed_when_amount_missing(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla", "Insurance", amount_min=200, amount_max=350)
+    txn = {"id": "t1", "description": "TESLA", "payee": "", "amount_float": None}
+    categories.apply_categories(conn, [txn])
+    assert txn["category"] == categories.UNCATEGORIZED
+
+
+def test_day_of_month_band_matches(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla", "Insurance", day_min=12, day_max=17)
+    inside = _dated_txn("in", desc="TESLA", day=15)
+    below = _dated_txn("lo", desc="TESLA", day=3)
+    above = _dated_txn("hi", desc="TESLA", day=28)
+    categories.apply_categories(conn, [inside, below, above])
+    assert inside["category"] == "Insurance"
+    assert below["category"] == categories.UNCATEGORIZED
+    assert above["category"] == categories.UNCATEGORIZED
+
+
+def test_day_band_falls_back_to_posted_string(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla", "Insurance", day_min=12, day_max=17)
+    txn = {"id": "t1", "description": "TESLA", "payee": "",
+           "amount_float": -300.0, "posted": "2026-05-15"}
+    categories.apply_categories(conn, [txn])
+    assert txn["category"] == "Insurance"
+
+
+def test_day_predicate_fails_closed_when_date_missing(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla", "Insurance", day_min=12, day_max=17)
+    txn = {"id": "t1", "description": "TESLA", "payee": "", "amount_float": -300.0}
+    categories.apply_categories(conn, [txn])
+    assert txn["category"] == categories.UNCATEGORIZED
+
+
+def test_tesla_insurance_discriminator_end_to_end(tmp_path):
+    # The motivating case: isolate the monthly mid-month $200-350 Tesla insurance
+    # premium from other Tesla charges using merchant + amount + day together.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla", "Insurance",
+                        amount_min=200, amount_max=350, day_min=12, day_max=17,
+                        priority=50)
+    categories.add_rule(conn, "tesla", "Auto", priority=60)
+    premium = _dated_txn("p", desc="TESLA, INC. 45500 FREMO", amount=-304.76, day=15)
+    supercharge = _dated_txn("s", desc="TESLA, INC. 45500 FREMO", amount=-22.10, day=8)
+    parts = _dated_txn("r", desc="TESLA, INC. 45500 FREMO", amount=-512.00, day=20)
+    categories.apply_categories(conn, [premium, supercharge, parts])
+    assert premium["category"] == "Insurance"
+    assert supercharge["category"] == "Auto"
+    assert parts["category"] == "Auto"
+
+
+def test_regex_match_survives_inserted_store_number(tmp_path):
+    # Substring "rei sandy" fails against "REI #81 SANDY SANDY"; a regex spanning
+    # the inserted store number matches.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, r"rei .*sandy", "Shopping", match_mode="regex")
+    txns = [_dated_txn("t1", desc="REI #81 SANDY SANDY")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Shopping"
+
+
+def test_regex_is_case_insensitive(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, r"AMZN\s+Mktp", "Shopping", match_mode="regex")
+    txns = [_dated_txn("t1", desc="amzn mktp us*1a2b3")]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Shopping"
+
+
+def test_regex_anchors_and_alternation(tmp_path):
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, r"^(uber|lyft)\b", "Travel", match_mode="regex")
+    ride = _dated_txn("a", desc="UBER TRIP 123")
+    grub = _dated_txn("b", desc="GRUBHUB UBER EATS")  # not anchored at start
+    categories.apply_categories(conn, [ride, grub])
+    assert ride["category"] == "Travel"
+    assert grub["category"] == categories.UNCATEGORIZED
+
+
+def test_add_rule_rejects_invalid_regex(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, r"tesla(", "Insurance", match_mode="regex")
+
+
+def test_add_rule_rejects_bad_match_mode(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "tesla", "Insurance", match_mode="fuzzy")
+
+
+def test_add_rule_rejects_inverted_amount_band(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "x", "Y", amount_min=350, amount_max=200)
+
+
+def test_add_rule_rejects_negative_amount_bound(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "x", "Y", amount_min=-5)
+
+
+def test_add_rule_rejects_non_finite_amount_bound(tmp_path):
+    # NaN/inf slip past the >=0 and min<=max checks (NaN comparisons are False),
+    # so they must be rejected explicitly or they silently neuter the predicate.
+    conn = _conn(tmp_path)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            categories.add_rule(conn, "x", "Y", amount_min=bad)
+        with pytest.raises(ValueError):
+            categories.add_rule(conn, "x", "Y", amount_max=bad)
+
+
+def test_amount_predicate_fails_closed_on_non_finite_amount(tmp_path):
+    # A transaction whose amount is NaN/inf (malformed upstream/cache data) must
+    # not satisfy a bounded rule — every comparison against NaN is False.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla", "Insurance", amount_min=200, amount_max=350)
+    for bad in (float("nan"), float("inf")):
+        txn = {"id": "t1", "description": "TESLA", "payee": "", "amount_float": bad}
+        categories.apply_categories(conn, [txn])
+        assert txn["category"] == categories.UNCATEGORIZED
+
+
+def test_add_rule_rejects_inverted_day_band(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "x", "Y", day_min=20, day_max=10)
+
+
+def test_add_rule_rejects_out_of_range_day(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "x", "Y", day_min=0)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "x", "Y", day_max=32)
+
+
+def test_add_rule_rejects_non_finite_or_fractional_day_bound(tmp_path):
+    # int(inf) raises OverflowError (not ValueError), so without normalization a
+    # programmatic caller would get an uncaught crash instead of a clean reject.
+    # A fractional float must be rejected, not silently truncated.
+    conn = _conn(tmp_path)
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValueError):
+            categories.add_rule(conn, "x", "Y", day_min=bad)
+        with pytest.raises(ValueError):
+            categories.add_rule(conn, "x", "Y", day_max=bad)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "x", "Y", day_min=15.7)
+
+
+def test_amount_predicate_fails_closed_on_non_finite_stored_bound(tmp_path):
+    # A row written while the validation gap was open (or hand-edited) can carry
+    # an infinite bound; at match time that must fail closed, not match everything.
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, "
+        "priority, amount_max) VALUES ('tesla', 'any', 'Insurance', 0, 50, ?)",
+        (float("inf"),),
+    )
+    conn.commit()
+    txns = [_dated_txn("t1", desc="TESLA", amount=-999999999.0)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_day_predicate_fails_closed_on_non_finite_stored_bound(tmp_path):
+    # Symmetric to the amount case: a hand-edited inf in the day column must fail
+    # closed, not silently un-bound the day predicate.
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, "
+        "priority, day_max) VALUES ('tesla', 'any', 'Insurance', 0, 50, ?)",
+        (float("inf"),),
+    )
+    conn.commit()
+    txns = [_dated_txn("t1", desc="TESLA", amount=-300.0, day=15)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_match_fails_closed_on_non_numeric_stored_bound(tmp_path):
+    # A hand-edited row putting TEXT into the REAL/INTEGER bound columns must not
+    # crash categorization; the rule fails closed instead.
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, "
+        "priority, amount_min) VALUES ('tesla', 'any', 'Insurance', 0, 50, 'abc')"
+    )
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, "
+        "priority, day_min) VALUES ('costco', 'any', 'Groceries', 0, 50, 'xyz')"
+    )
+    conn.commit()
+    txns = [
+        _dated_txn("a", desc="TESLA", amount=-300.0, day=15),
+        _dated_txn("b", desc="COSTCO", amount=-80.0, day=15),
+    ]
+    categories.apply_categories(conn, txns)  # must not raise
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+    assert txns[1]["category"] == categories.UNCATEGORIZED
+
+
+def test_add_rule_rejects_non_integral_decimal_day_bound(tmp_path):
+    # A Decimal (or numeric string) caller must not bypass the float-only guard
+    # and get silently truncated.
+    from decimal import Decimal
+
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "x", "Y", day_min=Decimal("15.7"))
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "x", "Y", day_max="20.5")
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "x", "Y", day_min=True)
+    # An integral Decimal / numeric string is still accepted and normalized.
+    rid = categories.add_rule(conn, "z", "W", day_min=Decimal("12"), day_max="17")
+    stored = [r for r in categories.list_rules(conn) if r["rule_id"] == rid][0]
+    assert stored["day_min"] == 12 and stored["day_max"] == 17
+
+
+def test_regex_pattern_preserves_case_in_storage(tmp_path):
+    # Substring rules are lowercased on store; a regex must NOT be (would corrupt
+    # tokens like \D). Verify the stored pattern keeps its original case.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, r"Tesla\D+Inc", "Insurance", match_mode="regex")
+    stored = [r for r in categories.list_rules(conn) if r["category"] == "Insurance"][0]
+    assert stored["pattern"] == r"Tesla\D+Inc"
+    assert stored["match_mode"] == "regex"
+
+
+def test_malformed_regex_in_db_matches_nothing(tmp_path):
+    # A regex hand-edited straight into the DB (bypassing add_rule validation)
+    # must never crash categorization — it matches nothing instead.
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, "
+        "priority, match_mode) VALUES ('tesla(', 'any', 'Insurance', 0, 50, 'regex')"
+    )
+    conn.commit()
+    txns = [_dated_txn("t1", desc="TESLA")]
+    categories.apply_categories(conn, txns)  # must not raise
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_predicates_default_to_match_anything(tmp_path):
+    # A plain rule (no predicates) still matches regardless of amount/date.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "harmons", "Groceries")
+    txns = [_dated_txn("t1", desc="HARMONS #12", amount=-9999.0, day=1)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Groceries"
+
+
+def test_legacy_archive_migrates_predicate_columns(tmp_path):
+    # An archive whose category_rules predates the predicate columns gains them
+    # on connect; the existing row keeps working and defaults to substring/NULL.
+    import sqlite3 as _sqlite3
+
+    db = tmp_path / "legacy.db"
+    raw = _sqlite3.connect(db)
+    # Old schema: base columns + account_id only (pre-predicate era). Because
+    # archive.connect uses CREATE TABLE IF NOT EXISTS, this pre-existing shape
+    # survives and only the additive migration fills the gap.
+    raw.execute(
+        "CREATE TABLE category_rules ("
+        "rule_id INTEGER PRIMARY KEY AUTOINCREMENT, pattern TEXT NOT NULL, "
+        "field TEXT NOT NULL DEFAULT 'any', category TEXT NOT NULL, "
+        "is_transfer INTEGER NOT NULL DEFAULT 0, priority INTEGER NOT NULL DEFAULT 100, "
+        "account_id TEXT, created_at TEXT)"
+    )
+    raw.execute(
+        "INSERT INTO category_rules (pattern, field, category) "
+        "VALUES ('harmons', 'any', 'Groceries')"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = _archive.connect(db)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(category_rules)")}
+    for c in ("amount_min", "amount_max", "day_min", "day_max", "match_mode"):
+        assert c in cols
+    # The legacy row defaults to substring matching and still classifies.
+    rule = categories.list_rules(conn)[0]
+    assert rule["match_mode"] == "substring"
+    assert rule["amount_min"] is None and rule["day_max"] is None
+    txns = [_dated_txn("t1", desc="HARMONS #12", amount=-50.0, day=9)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Groceries"
+    conn.close()
+
+
+def test_add_rule_rejects_non_numeric_amount_bound_type(tmp_path):
+    # A non-numeric, non-string amount bound (e.g. a JSON array from an MCP
+    # caller) must raise ValueError, not TypeError, so the entrypoint's
+    # `except ValueError` envelope catches it. Mirrors the day-bound contract.
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "tesla", "Insurance", amount_min=[1, 2])
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "tesla", "Insurance", amount_max={"x": 1})
+
+
+def test_add_rule_rejects_bool_amount_bound(tmp_path):
+    # True/False as a money magnitude is a caller bug; reject outright instead
+    # of silently storing 1.0/0.0.
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "tesla", "Insurance", amount_min=True)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "tesla", "Insurance", amount_max=False)
+
+
+def test_categorization_survives_malformed_transaction_amount(tmp_path):
+    # A non-numeric amount_float on one transaction must not crash the whole
+    # pass. The amount-agnostic rule still classifies a sibling transaction, and
+    # the malformed one falls through to Uncategorized.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "harmons", "Groceries")
+    txns = [
+        {"id": "bad", "description": "HARMONS #1", "payee": "", "amount_float": "abc"},
+        _dated_txn("good", desc="HARMONS #2", amount=-12.0),
+    ]
+    categories.apply_categories(conn, txns)  # must not raise
+    # The amount-agnostic rule does not depend on magnitude, so even the
+    # malformed row matches; the key assertion is that nothing raised.
+    assert txns[1]["category"] == "Groceries"
+
+
+def test_amount_rule_fails_closed_on_malformed_transaction_amount(tmp_path):
+    # An amount-constrained rule cannot verify a malformed amount, so it fails
+    # closed (no match) rather than crashing.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla", "Insurance", amount_min=200, amount_max=350)
+    txns = [{"id": "bad", "description": "TESLA", "payee": "", "amount_float": "abc"}]
+    categories.apply_categories(conn, txns)  # must not raise
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_day_predicate_fails_closed_on_fractional_stored_bound(tmp_path):
+    # A fractional day bound can only reach the matcher via a hand-edited row
+    # (input validation rejects it). It is not a whole day-of-month, so the day
+    # predicate fails closed instead of matching on a partial day.
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, "
+        "priority, day_min, day_max) VALUES ('tesla', 'any', 'Insurance', 0, 50, 15.7, 20.0)"
+    )
+    conn.commit()
+    txns = [_dated_txn("t1", desc="TESLA", day=16)]
+    categories.apply_categories(conn, txns)  # must not raise
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_day_predicate_fails_closed_on_out_of_range_stored_bound(tmp_path):
+    # A day bound outside 1..31 (hand-edited row) is impossible, so the day
+    # predicate fails closed rather than matching nothing-or-everything.
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, "
+        "priority, day_max) VALUES ('tesla', 'any', 'Insurance', 0, 50, 99)"
+    )
+    conn.commit()
+    txns = [_dated_txn("t1", desc="TESLA", day=16)]
+    categories.apply_categories(conn, txns)  # must not raise
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_amount_rule_fails_closed_on_boolean_transaction_amount(tmp_path):
+    # bool is an int subclass; a stored amount_float of True must not coerce to
+    # 1.0 and satisfy an amount band. The predicate fails closed.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla", "Insurance", amount_min=1, amount_max=1)
+    txns = [{"id": "b", "description": "TESLA", "payee": "", "amount_float": True}]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_unknown_stored_match_mode_fails_closed(tmp_path):
+    # A match_mode that is neither 'substring' nor 'regex' (hand-edited /
+    # affinity-corrupted row) is not evaluable and must match nothing rather
+    # than silently degrade to a substring match.
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, "
+        "priority, match_mode) VALUES ('tesla', 'any', 'Insurance', 0, 50, 'bogus')"
+    )
+    conn.commit()
+    txns = [_dated_txn("t1", desc="TESLA")]
+    categories.apply_categories(conn, txns)  # must not raise
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_day_rule_fails_closed_on_boolean_posted_ts(tmp_path):
+    # A boolean posted_ts must not resolve to 1970-01-01 (day 1) and satisfy a
+    # day-of-month predicate. With no other usable date, the day predicate fails
+    # closed.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla", "Insurance", day_min=1, day_max=1)
+    txns = [{"id": "b", "description": "TESLA", "payee": "", "posted_ts": True}]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_add_rule_normalizes_overflow_amount_bound_to_value_error(tmp_path):
+    # An over-large Python int makes float() raise OverflowError (not
+    # ValueError); the validator must normalize it so the MCP/CLI entrypoint's
+    # `except ValueError` envelope catches it instead of crashing.
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "tesla", "Insurance", amount_min=10**400)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "tesla", "Insurance", amount_max=10**400)
+
+
+def test_add_rule_normalizes_overflow_day_bound_to_value_error(tmp_path):
+    # Symmetric with the amount path: an over-large day bound normalizes to
+    # ValueError rather than leaking OverflowError.
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "tesla", "Insurance", day_min=10**400)
+
+
+def test_empty_stored_match_mode_fails_closed(tmp_path):
+    # An empty-string match_mode is falsy but invalid; it must NOT default to
+    # substring matching. Only a NULL/missing mode (legacy) defaults to substring.
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, "
+        "priority, match_mode) VALUES ('tesla', 'any', 'Insurance', 0, 50, '')"
+    )
+    conn.commit()
+    txns = [_dated_txn("t1", desc="TESLA")]
+    categories.apply_categories(conn, txns)  # must not raise
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_non_string_stored_pattern_fails_closed(tmp_path):
+    # A BLOB pattern (hand-edited / affinity-corrupted) must not crash the pass
+    # in either substring or regex mode — it fails closed (matches nothing).
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, "
+        "priority, match_mode) VALUES (?, 'any', 'Insurance', 0, 50, 'substring')",
+        (b"tesla",),
+    )
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, "
+        "priority, match_mode) VALUES (?, 'any', 'Fee', 0, 51, 'regex')",
+        (b"tesla", ),
+    )
+    conn.commit()
+    txns = [_dated_txn("t1", desc="TESLA")]
+    categories.apply_categories(conn, txns)  # must not raise
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_amount_rule_fails_closed_on_negative_stored_bound(tmp_path):
+    # A negative stored amount bound is out of domain (magnitudes are >= 0) and
+    # only reachable via a hand-edited row. It must fail closed, not silently
+    # drop the lower bound and match everything.
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO category_rules (pattern, field, category, is_transfer, "
+        "priority, amount_min) VALUES ('tesla', 'any', 'Insurance', 0, 50, -5.0)"
+    )
+    conn.commit()
+    txns = [_dated_txn("t1", desc="TESLA", amount=-0.5)]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_categorization_survives_overflowing_transaction_amount(tmp_path):
+    # An over-large amount_float (float() raises OverflowError) must not crash
+    # the pass; the amount-constrained rule fails closed for that transaction.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla", "Insurance", amount_min=200, amount_max=350)
+    txns = [{"id": "big", "description": "TESLA", "payee": "", "amount_float": 10**400}]
+    categories.apply_categories(conn, txns)  # must not raise
+    assert txns[0]["category"] == categories.UNCATEGORIZED

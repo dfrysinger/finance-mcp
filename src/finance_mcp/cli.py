@@ -170,6 +170,15 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fmt_bound(v: float | int | None) -> str:
+    """Render an optional predicate bound: blank for an open (NULL) side."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
 def _cmd_rules(args: argparse.Namespace) -> int:
     conn = archive.connect()
     try:
@@ -182,6 +191,9 @@ def _cmd_rules(args: argparse.Namespace) -> int:
                     conn, args.pattern, args.category,
                     field=args.field, is_transfer=args.transfer, priority=args.priority,
                     account_id=args.account,
+                    amount_min=args.amount_min, amount_max=args.amount_max,
+                    day_min=args.day_min, day_max=args.day_max,
+                    match_mode=args.match_mode,
                 )
             except ValueError as exc:
                 print(f"Could not add rule: {exc}", file=sys.stderr)
@@ -205,8 +217,16 @@ def _cmd_rules(args: argparse.Namespace) -> int:
         for r in rules:
             t = " [transfer]" if r["is_transfer"] else ""
             a = f" @{r['account_id']}" if r.get("account_id") else ""
+            m = " [regex]" if (r.get("match_mode") == "regex") else ""
+            amt_lo, amt_hi = r.get("amount_min"), r.get("amount_max")
+            day_lo, day_hi = r.get("day_min"), r.get("day_max")
+            extra = ""
+            if amt_lo is not None or amt_hi is not None:
+                extra += f" amt[{_fmt_bound(amt_lo)}..{_fmt_bound(amt_hi)}]"
+            if day_lo is not None or day_hi is not None:
+                extra += f" day[{_fmt_bound(day_lo)}..{_fmt_bound(day_hi)}]"
             print(f"  {r['rule_id']:>4} p{r['priority']:<4} {r['field']:<11} "
-                  f"'{r['pattern']}' -> {r['category']}{t}{a}")
+                  f"'{r['pattern']}'{m} -> {r['category']}{t}{a}{extra}")
         return 0
     finally:
         conn.close()
@@ -732,6 +752,17 @@ def build_parser() -> argparse.ArgumentParser:
                          help="mark matches as transfers (excluded from spend)")
     p_rules.add_argument("--account",
                          help="scope the rule to one account_id (omit = any account)")
+    p_rules.add_argument("--match-mode", dest="match_mode",
+                         choices=["substring", "regex"], default="substring",
+                         help="merchant match mode (default: substring)")
+    p_rules.add_argument("--amount-min", dest="amount_min", type=float,
+                         help="match only when |amount| >= this magnitude")
+    p_rules.add_argument("--amount-max", dest="amount_max", type=float,
+                         help="match only when |amount| <= this magnitude")
+    p_rules.add_argument("--day-min", dest="day_min", type=int,
+                         help="match only when posted day-of-month >= this (1-31)")
+    p_rules.add_argument("--day-max", dest="day_max", type=int,
+                         help="match only when posted day-of-month <= this (1-31)")
     p_rules.add_argument("--rule-id", type=int)
     p_rules.add_argument("--json", action="store_true")
     p_rules.set_defaults(func=_cmd_rules)

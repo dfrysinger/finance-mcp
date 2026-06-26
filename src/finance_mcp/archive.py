@@ -81,6 +81,11 @@ CREATE TABLE IF NOT EXISTS category_rules (
     is_transfer INTEGER NOT NULL DEFAULT 0,     -- internal transfer, not real spend
     priority    INTEGER NOT NULL DEFAULT 100,   -- lower wins
     account_id  TEXT,                           -- NULL = any account; else scope to one account
+    amount_min  REAL,                           -- NULL = no lower bound; matched against |amount| (magnitude)
+    amount_max  REAL,                           -- NULL = no upper bound; matched against |amount| (magnitude)
+    day_min     INTEGER,                        -- NULL = no lower bound; posted day-of-month (1-31)
+    day_max     INTEGER,                        -- NULL = no upper bound; posted day-of-month (1-31)
+    match_mode  TEXT NOT NULL DEFAULT 'substring', -- merchant match: substring | regex
     created_at  TEXT
 );
 
@@ -224,9 +229,24 @@ def _apply_additive_migrations(conn: sqlite3.Connection) -> None:
         row["name"]
         for row in conn.execute("PRAGMA table_info(category_rules)").fetchall()
     }
-    if "account_id" not in cols:
+    # Each entry is (column-name, column-definition). Additive only: every new
+    # column is nullable, or NOT NULL with a constant default, so the ALTER is
+    # safe to run on every connect and is a no-op once applied.
+    additions = (
+        ("account_id", "TEXT"),
+        ("amount_min", "REAL"),
+        ("amount_max", "REAL"),
+        ("day_min", "INTEGER"),
+        ("day_max", "INTEGER"),
+        ("match_mode", "TEXT NOT NULL DEFAULT 'substring'"),
+    )
+    for name, decl in additions:
+        if name in cols:
+            continue
         try:
-            conn.execute("ALTER TABLE category_rules ADD COLUMN account_id TEXT")
+            # name/decl are hardcoded literals (never user input), so this
+            # f-string carries no injection risk.
+            conn.execute(f"ALTER TABLE category_rules ADD COLUMN {name} {decl}")
             conn.commit()
         except sqlite3.OperationalError as exc:
             # Two processes opening a freshly-upgraded archive at once (the

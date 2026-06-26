@@ -15,6 +15,8 @@ credit-card payments are not real spending, so budgets exclude them by default.
 
 from __future__ import annotations
 
+import math
+import re
 import sqlite3
 from datetime import datetime, timezone
 
@@ -385,6 +387,90 @@ def seed_default_rules(conn: sqlite3.Connection, *, force: bool = False) -> int:
         raise
 
 
+def _coerce_amount_bound(value: object) -> float:
+    """Coerce a user-supplied amount bound to a float, raising ``ValueError``
+    for anything that is not a real number.
+
+    ``bool`` is rejected outright (``True``/``False`` as a money magnitude is a
+    caller bug, and ``float(True)`` would silently store ``1.0``). ``float()``
+    raises ``TypeError`` for non-numeric, non-string types (e.g. a JSON array
+    from an MCP caller, where the ``float | None`` annotation is not
+    runtime-enforced); normalize that to ``ValueError`` so the entrypoint's
+    ``except ValueError`` handler catches it instead of crashing. Mirrors
+    ``_coerce_day_bound``.
+    """
+    if isinstance(value, bool):
+        raise ValueError("amount bounds must be numbers, not booleans")
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("amount bounds must be finite numbers") from exc
+
+
+def _validate_amount_bounds(
+    amount_min: float | None, amount_max: float | None
+) -> tuple[float | None, float | None]:
+    lo = None if amount_min is None else _coerce_amount_bound(amount_min)
+    hi = None if amount_max is None else _coerce_amount_bound(amount_max)
+    for v in (lo, hi):
+        if v is None:
+            continue
+        if not math.isfinite(v):
+            # NaN/inf slip past the < 0 and lo > hi checks below (every NaN
+            # comparison is False), so they would be stored and then silently
+            # neuter the predicate at match time. Reject them here.
+            raise ValueError("amount bounds must be finite numbers")
+        if v < 0:
+            raise ValueError("amount bounds are magnitudes and must be >= 0")
+    if lo is not None and hi is not None and lo > hi:
+        raise ValueError("amount_min must not exceed amount_max")
+    return lo, hi
+
+
+def _coerce_day_bound(value: object) -> int:
+    """Coerce a user-supplied day bound to an int in principle, raising
+    ``ValueError`` for anything that is not an exact whole number.
+
+    Callers may pass a plain ``int``, but a programmatic/MCP caller can also pass
+    a ``float``, ``Decimal``, or numeric string. ``int(value)`` would silently
+    truncate a fractional value and would raise ``OverflowError`` (not
+    ``ValueError``) for ``inf`` — escaping the caller's error handling. Normalize
+    every reject to ``ValueError`` and refuse fractional / non-finite inputs.
+    ``bool`` is rejected outright: ``True``/``False`` as a day is a caller bug.
+    """
+    if isinstance(value, bool):
+        raise ValueError("day bounds must be whole numbers, not booleans")
+    if isinstance(value, int):
+        return value
+    try:
+        f = float(value)  # float, Decimal, numeric str
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("day bounds must be integers between 1 and 31") from exc
+    if not math.isfinite(f):
+        raise ValueError("day bounds must be finite integers")
+    if not f.is_integer():
+        raise ValueError("day bounds must be whole numbers")
+    return int(f)
+
+
+def _validate_day_bounds(
+    day_min: int | None, day_max: int | None
+) -> tuple[int | None, int | None]:
+    out: list[int | None] = []
+    for v in (day_min, day_max):
+        if v is None:
+            out.append(None)
+            continue
+        iv = _coerce_day_bound(v)
+        if not 1 <= iv <= 31:
+            raise ValueError("day bounds must be between 1 and 31")
+        out.append(iv)
+    lo, hi = out
+    if lo is not None and hi is not None and lo > hi:
+        raise ValueError("day_min must not exceed day_max")
+    return lo, hi
+
+
 def add_rule(
     conn: sqlite3.Connection,
     pattern: str,
@@ -394,6 +480,11 @@ def add_rule(
     is_transfer: bool = False,
     priority: int = 100,
     account_id: str | None = None,
+    amount_min: float | None = None,
+    amount_max: float | None = None,
+    day_min: int | None = None,
+    day_max: int | None = None,
+    match_mode: str = "substring",
 ) -> int:
     """Add a single rule; returns its rule_id.
 
@@ -402,20 +493,59 @@ def add_rule(
     reclassify a generic descriptor — e.g. a loan payment that the bank labels
     only "FUNDS TRAN" — without touching the same descriptor elsewhere). When
     ``None`` the rule applies to every account, as before.
+
+    Beyond the merchant match, a rule may carry optional per-transaction
+    predicates; all supplied predicates must hold for the rule to match (AND):
+
+    - ``amount_min`` / ``amount_max`` bound the transaction's amount *magnitude*
+      (``abs(amount)``), so ``200``–``350`` matches a $304.76 charge regardless
+      of sign. A same-magnitude refund would also match, so pair an amount band
+      with a merchant pattern to disambiguate.
+    - ``day_min`` / ``day_max`` bound the posted day-of-month (1-31), e.g. a
+      mid-month recurring charge.
+    - ``match_mode='regex'`` matches ``pattern`` as a case-insensitive regular
+      expression (``re.search``) against the description/payee instead of a
+      plain substring. This lets a pattern survive inserted tokens like store
+      numbers. An invalid regex is rejected here so it fails loudly at creation
+      rather than silently never matching.
+
+    All predicates default to "match anything" (NULL / substring), so existing
+    callers and rules are unaffected.
     """
     if field not in ("description", "payee", "any"):
         raise ValueError("field must be description, payee, or any")
-    pat = (pattern or "").strip().lower()
-    cat = (category or "").strip()
-    if not pat:
+    if match_mode not in ("substring", "regex"):
+        raise ValueError("match_mode must be substring or regex")
+    raw = (pattern or "").strip()
+    if not raw:
         raise ValueError("pattern must not be empty")
+    # Substring patterns are stored lowercased and matched against lowercased
+    # transaction text. A regex must keep its original case so tokens like \D or
+    # [A-Z] survive being stored; case-insensitivity comes from re.IGNORECASE at
+    # match time instead. Validating the regex now turns a malformed pattern
+    # into a loud creation-time error rather than a rule that silently matches
+    # nothing forever.
+    if match_mode == "regex":
+        try:
+            re.compile(raw, re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError(f"invalid regex pattern: {exc}") from exc
+        pat = raw
+    else:
+        pat = raw.lower()
+    cat = (category or "").strip()
     if not cat:
         raise ValueError("category must not be empty")
+    amt_lo, amt_hi = _validate_amount_bounds(amount_min, amount_max)
+    day_lo, day_hi = _validate_day_bounds(day_min, day_max)
     acct = (account_id or "").strip() or None
     cur = conn.execute(
-        "INSERT INTO category_rules (pattern, field, category, is_transfer, priority, account_id, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (pat, field, cat, int(is_transfer), priority, acct, _now()),
+        "INSERT INTO category_rules "
+        "(pattern, field, category, is_transfer, priority, account_id, "
+        "amount_min, amount_max, day_min, day_max, match_mode, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (pat, field, cat, int(is_transfer), priority, acct,
+         amt_lo, amt_hi, day_lo, day_hi, match_mode, _now()),
     )
     conn.commit()
     return cur.lastrowid
@@ -491,23 +621,210 @@ def _manual_map(conn: sqlite3.Connection) -> dict[str, tuple[str, bool]]:
 def _compiled_rules(conn: sqlite3.Connection) -> list[dict]:
     rules = list_rules(conn)
     for r in rules:
-        r["_p"] = (r["pattern"] or "").lower()
+        raw_pattern = r["pattern"]
+        # A non-string pattern (BLOB / affinity-corrupted hand-edited row) is not
+        # an evaluable predicate. Normalize it to None now so every branch below
+        # fails closed instead of crashing on bytes in re.compile or `in`.
+        pattern = raw_pattern if isinstance(raw_pattern, str) else None
+        stored_mode = r.get("match_mode")
+        # Only a NULL/missing match_mode (legacy rows predating the column)
+        # defaults to substring. An empty string or any other non-regex,
+        # non-substring value is a corrupted row and must fail closed.
+        mode = "substring" if stored_mode is None else stored_mode
+        r["_mode"] = mode
+        if pattern is None:
+            r["_p"] = ""
+            r["_rx"] = None
+            continue
+        if mode == "regex":
+            try:
+                r["_rx"] = re.compile(pattern, re.IGNORECASE) if pattern else None
+            except re.error:
+                # A malformed regex (e.g. hand-edited straight into the DB,
+                # bypassing add_rule's validation) must never crash
+                # categorization; treat it as a rule that matches nothing.
+                r["_rx"] = None
+            r["_p"] = ""
+        elif mode == "substring":
+            r["_p"] = pattern.lower()
+            r["_rx"] = None
+        else:
+            # An unknown match_mode (hand-edited / affinity-corrupted row) is not
+            # an evaluable predicate. Fail closed — empty _p makes
+            # _match_merchant's substring path return False — rather than
+            # silently treating it as a substring match the author never chose.
+            r["_p"] = ""
+            r["_rx"] = None
     return rules
 
 
-def _match(rule: dict, desc: str, payee: str, account_id: str | None) -> bool:
-    acct = rule.get("account_id")
-    if acct is not None and acct != account_id:
-        return False
+def _match_merchant(rule: dict, desc: str, payee: str) -> bool:
+    field = rule["field"]
+    if rule.get("_mode") == "regex":
+        rx = rule.get("_rx")
+        if rx is None:
+            # Empty or malformed regex matches nothing (fail closed) rather than
+            # falling back to a substring match the author did not ask for.
+            return False
+        if field == "description":
+            return rx.search(desc) is not None
+        if field == "payee":
+            return rx.search(payee) is not None
+        return rx.search(desc) is not None or rx.search(payee) is not None
     pat = rule["_p"]
     if not pat:
         return False
-    field = rule["field"]
     if field == "description":
         return pat in desc
     if field == "payee":
         return pat in payee
     return pat in desc or pat in payee
+
+
+def _usable_bound(value: object) -> tuple[bool, float | None]:
+    """Classify a stored predicate bound read back from the rules table.
+
+    Returns ``(present, finite_value)``:
+
+    - ``(False, None)`` — no bound (the column was NULL).
+    - ``(True, <float>)`` — a usable finite bound.
+    - ``(True, None)`` — a bound is present but unusable: NaN, inf, or a
+      non-numeric value (e.g. a row hand-edited straight into the DB, putting
+      TEXT in a REAL/INTEGER column). The caller must fail closed — a present
+      bound that cannot be evaluated must never silently un-bound the predicate,
+      and reading it must never crash categorization.
+    """
+    if value is None:
+        return (False, None)
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return (True, None)
+    if not math.isfinite(f):
+        return (True, None)
+    return (True, f)
+
+
+def _match_amount(rule: dict, amount_mag: float | None) -> bool:
+    lo_present, lo = _usable_bound(rule.get("amount_min"))
+    hi_present, hi = _usable_bound(rule.get("amount_max"))
+    if not lo_present and not hi_present:
+        return True
+    # A present-but-unusable bound (NaN/inf/non-numeric) fails closed rather than
+    # silently turning a bounded rule unbounded or crashing the matcher.
+    if (lo_present and lo is None) or (hi_present and hi is None):
+        return False
+    # Amount bounds are magnitudes (>= 0); add_rule rejects negatives, so a
+    # negative stored bound only reaches here via a hand-edited/legacy row. Since
+    # amount_mag is always >= 0, a negative lower bound would silently never
+    # exclude anything — treat an out-of-domain bound as unusable and fail closed,
+    # mirroring the day path's 1..31 range guard.
+    if (lo is not None and lo < 0) or (hi is not None and hi < 0):
+        return False
+    if amount_mag is None or not math.isfinite(amount_mag):
+        # The rule constrains amount but the transaction's amount is missing or
+        # not a usable number — can't verify the predicate, so fail closed.
+        return False
+    if lo is not None and amount_mag < lo:
+        return False
+    if hi is not None and amount_mag > hi:
+        return False
+    return True
+
+
+def _match_day(rule: dict, day: int | None) -> bool:
+    lo_present, lo = _usable_bound(rule.get("day_min"))
+    hi_present, hi = _usable_bound(rule.get("day_max"))
+    if not lo_present and not hi_present:
+        return True
+    if (lo_present and lo is None) or (hi_present and hi is None):
+        return False
+    # Day bounds must be whole days in 1..31. Input validation enforces this, so
+    # a fractional or out-of-range stored value only reaches here via a
+    # hand-edited/legacy row; it is not a usable day threshold, so fail closed
+    # rather than match on a partial or impossible day-of-month.
+    if (lo is not None and (not lo.is_integer() or not 1 <= lo <= 31)) or (
+        hi is not None and (not hi.is_integer() or not 1 <= hi <= 31)
+    ):
+        return False
+    if day is None:
+        return False
+    if lo is not None and day < lo:
+        return False
+    if hi is not None and day > hi:
+        return False
+    return True
+
+
+def _usable_magnitude(value: object) -> float | None:
+    """Return ``abs(value)`` as a finite float, or ``None`` if the stored amount
+    is missing or not a usable number.
+
+    ``amount_float`` is a REAL column, but a malformed cached/hand-edited row
+    could hold non-numeric or non-finite content. Coercing it here (rather than
+    calling ``abs()`` blindly) keeps one bad transaction from crashing the whole
+    categorization pass — amount-constrained rules then fail closed via
+    ``_match_amount`` while amount-agnostic rules are unaffected.
+    """
+    if value is None or isinstance(value, bool):
+        # bool is an int subclass: True would coerce to abs(1.0) and silently
+        # satisfy an amount band. A boolean is not a usable amount — fail closed.
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return abs(f)
+
+
+def _match(
+    rule: dict,
+    desc: str,
+    payee: str,
+    account_id: str | None,
+    amount_mag: float | None,
+    day: int | None,
+) -> bool:
+    acct = rule.get("account_id")
+    if acct is not None and acct != account_id:
+        return False
+    # All supplied predicates must hold (AND). Merchant first — it is the
+    # cheapest and most selective check.
+    if not _match_merchant(rule, desc, payee):
+        return False
+    if not _match_amount(rule, amount_mag):
+        return False
+    if not _match_day(rule, day):
+        return False
+    return True
+
+
+def _day_of_month(txn: dict) -> int | None:
+    """Posted day-of-month (1-31) of a transaction, or None if it has no date.
+
+    Prefers ``posted_ts`` (epoch seconds at midnight UTC, as the importer
+    stores it) so the day matches how the rest of the app renders the date,
+    then falls back to parsing the ``posted`` / ``transacted_at`` date strings.
+    """
+    ts = txn.get("posted_ts")
+    if ts is not None and not isinstance(ts, bool):
+        # bool is an int subclass: int(True) == 1 would resolve to 1970-01-01
+        # (day 1) and silently satisfy a day predicate. Skip it and fall back.
+        try:
+            return datetime.fromtimestamp(int(ts), tz=timezone.utc).day
+        except (ValueError, OverflowError, OSError, TypeError):
+            pass
+    for key in ("posted", "transacted_at"):
+        v = txn.get(key)
+        if v:
+            for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+                try:
+                    return datetime.strptime(str(v).strip(), fmt).day
+                except ValueError:
+                    continue
+    return None
 
 
 def apply_categories(
@@ -554,9 +871,12 @@ def apply_categories(
         desc = (txn.get("description") or "").lower()
         payee = (txn.get("payee") or "").lower()
         account_id = txn.get("account_id")
+        amt = txn.get("amount_float")
+        amount_mag = _usable_magnitude(amt)
+        day = _day_of_month(txn)
         assigned = False
         for rule in rules:
-            if _match(rule, desc, payee, account_id):
+            if _match(rule, desc, payee, account_id, amount_mag, day):
                 txn["category"] = rule["category"]
                 txn["is_transfer"] = bool(rule["is_transfer"])
                 txn["category_source"] = "rule"

@@ -205,8 +205,13 @@ def add_category_rule(
     is_transfer: bool = False,
     priority: int = 100,
     account_id: str | None = None,
+    amount_min: float | None = None,
+    amount_max: float | None = None,
+    day_min: int | None = None,
+    day_max: int | None = None,
+    match_mode: str = "substring",
 ) -> dict[str, Any]:
-    """Add a category rule: a case-insensitive substring match -> category.
+    """Add a category rule: a merchant match (+ optional predicates) -> category.
 
     ``field`` is ``description``, ``payee``, or ``any``. ``priority`` is
     lowest-wins. Set ``is_transfer=True`` for internal transfers / card payments
@@ -214,6 +219,15 @@ def add_category_rule(
     rule to a single account (so a generic descriptor like "FUNDS TRAN" can be
     reclassified on one account without affecting the same text elsewhere);
     leave it ``None`` to apply to every account.
+
+    The merchant match defaults to a case-insensitive substring; set
+    ``match_mode='regex'`` to match ``pattern`` as a case-insensitive regular
+    expression instead (useful when a store number splits a merchant name).
+    Optional predicates further narrow a rule and must all hold to match:
+    ``amount_min``/``amount_max`` bound the amount magnitude (``abs(amount)``,
+    so 200-350 matches a $304 charge), and ``day_min``/``day_max`` bound the
+    posted day-of-month (1-31) — together they isolate a recurring charge like a
+    mid-month insurance premium from other charges at the same merchant.
     """
     conn = archive.connect()
     try:
@@ -221,6 +235,8 @@ def add_category_rule(
             conn, pattern, category,
             field=field, is_transfer=is_transfer, priority=priority,
             account_id=account_id,
+            amount_min=amount_min, amount_max=amount_max,
+            day_min=day_min, day_max=day_max, match_mode=match_mode,
         )
         return {"ok": True, "rule_id": rule_id}
     except ValueError as exc:
