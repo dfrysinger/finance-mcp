@@ -1428,3 +1428,135 @@ def test_categorization_survives_overflowing_transaction_amount(tmp_path):
     txns = [{"id": "big", "description": "TESLA", "payee": "", "amount_float": 10**400}]
     categories.apply_categories(conn, txns)  # must not raise
     assert txns[0]["category"] == categories.UNCATEGORIZED
+
+
+def test_add_rule_rejects_nested_quantifier_regex(tmp_path):
+    # A regex with a quantified group inside another quantifier can backtrack
+    # catastrophically. It compiles fine, so it must be rejected explicitly at
+    # creation time rather than silently hanging a later categorization pass.
+    conn = _conn(tmp_path)
+    for bad in ["(a+)+$", "(a*)*", "(.*)+", "([a-z]+)+x", "(.{1,9})+"]:
+        with pytest.raises(ValueError):
+            categories.add_rule(conn, bad, "Insurance", match_mode="regex")
+
+
+def test_add_rule_rejects_overlong_regex(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "a" * 201, "Insurance", match_mode="regex")
+
+
+def test_add_rule_accepts_safe_regex(tmp_path):
+    # Legitimate merchant regexes (quantifiers, alternation, char classes, and a
+    # quantified group whose body has no inner quantifier) are still accepted.
+    conn = _conn(tmp_path)
+    for good in [
+        r"tesla.*insurance",
+        r"^tesla, inc\. \d+ fremo",
+        r"amazon|amzn",
+        r"chase\s+card\s+\d{4}",
+        r"[a-z]{2,4} #\d+",
+        r"(amazon|amzn)\s+\d+",
+        r"(abc)+",
+    ]:
+        rid = categories.add_rule(conn, good, "Insurance", match_mode="regex")
+        assert rid > 0
+
+
+def test_nested_quantifier_guard_does_not_block_substring_rules(tmp_path):
+    # The safety check only applies to regex mode; a substring pattern that
+    # happens to contain '(a+)+' is a literal and must still be accepted.
+    conn = _conn(tmp_path)
+    rid = categories.add_rule(conn, "(a+)+", "Misc", match_mode="substring")
+    assert rid > 0
+
+
+def test_add_rule_rejects_quantified_alternation_regex(tmp_path):
+    # A quantified alternation group can backtrack catastrophically on overlap
+    # (e.g. (a|a)+). It compiles fine, so reject it explicitly at creation time.
+    conn = _conn(tmp_path)
+    for bad in ["(a|a)+", "(x|x)+y", "^(a|aa)+$", "(a|ab)*", "(a|a){2,}"]:
+        with pytest.raises(ValueError):
+            categories.add_rule(conn, bad, "Insurance", match_mode="regex")
+
+
+def test_add_rule_accepts_unquantified_alternation_regex(tmp_path):
+    # A non-repeated alternation group is fine — only a quantified one is the
+    # footgun.
+    conn = _conn(tmp_path)
+    rid = categories.add_rule(conn, r"(amazon|amzn)\s+\d+", "Shopping",
+                              match_mode="regex")
+    assert rid > 0
+
+
+def test_add_rule_accepts_atomic_and_possessive_rewrites(tmp_path):
+    # Atomic groups and possessive quantifiers do not backtrack, so they are the
+    # canonical safe rewrite for an overlapping alternation/nesting. The guard
+    # must accept them rather than block the very fix it asks the user to make.
+    conn = _conn(tmp_path)
+    for good in ["(?>amazon|amzn)+", "(?>a|aa)+", "(?:(?:a|a)++)+",
+                 "(?>(a+))+", "amzn++"]:
+        rid = categories.add_rule(conn, good, "Shopping", match_mode="regex")
+        assert rid > 0
+
+
+def test_add_rule_rejects_footgun_inside_atomic_group(tmp_path):
+    # The atomic boundary only stops an *outer* quantifier from driving
+    # backtracking; a nested footgun that backtracks within the group before it
+    # commits is still catastrophic and must still be rejected.
+    conn = _conn(tmp_path)
+    for bad in ["(?>(a+)+b)", "(?>(a|a)+b)"]:
+        with pytest.raises(ValueError):
+            categories.add_rule(conn, bad, "Insurance", match_mode="regex")
+
+
+def test_add_rule_rejects_many_unbounded_quantifiers(tmp_path):
+    # Several sequential unbounded quantifiers over overlapping text backtrack
+    # polynomially with degree equal to the quantifier count. Such a pattern
+    # compiles fine and isn't a nested/alternation footgun, but stored it would
+    # stall every categorization pass on a non-matching transaction string, so
+    # it must be rejected at creation time.
+    conn = _conn(tmp_path)
+    for bad in [".*" * 7 + "x", ".*" * 90 + "x", r"\d+\d+\d+\d+\d+x",
+                r"\w+\s+\w+\s+\w+\s+\d+"]:
+        with pytest.raises(ValueError):
+            categories.add_rule(conn, bad, "Insurance", match_mode="regex")
+
+
+def test_add_rule_accepts_few_unbounded_quantifiers(tmp_path):
+    # A handful of unbounded quantifiers is fine — realistic merchant patterns
+    # use a few (an optional-whitespace span, a digit run, one '.*'). Only the
+    # high-degree pileups are rejected.
+    conn = _conn(tmp_path)
+    for good in [".*" * 4 + "x", r"tesla.*insurance", r"chase\s+card\s+\d+",
+                 r"(amazon|amzn)\s+\d+"]:
+        rid = categories.add_rule(conn, good, "Shopping", match_mode="regex")
+        assert rid > 0
+
+
+
+def test_add_rule_rejects_overlong_regex_without_crashing(tmp_path):
+    # A pathologically long/nested pattern must be rejected with a clean
+    # ValueError before re.compile can raise RecursionError.
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "(" * 500, "Misc", match_mode="regex")
+
+
+def test_add_rule_rejects_wrapped_backtracking_regex(tmp_path):
+    # Wrapping the footgun in an extra group must not slip past the guard: the
+    # backtracking structure is the same no matter how many groups enclose it.
+    conn = _conn(tmp_path)
+    for bad in ["((a|a))+$", "((a+))+", "((a|ab))*", "((.*))+", "(?:(a|a))+"]:
+        with pytest.raises(ValueError):
+            categories.add_rule(conn, bad, "Insurance", match_mode="regex")
+
+
+def test_add_rule_rejects_oversized_repetition_count(tmp_path):
+    # A short pattern with a repetition count above the regex engine's limit
+    # makes re.compile raise OverflowError, not re.error; it must still surface
+    # as a clean ValueError rather than crashing the rule-creation call.
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        categories.add_rule(conn, "a{4294967296}", "Insurance", match_mode="regex")
+

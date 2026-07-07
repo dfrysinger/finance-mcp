@@ -471,6 +471,169 @@ def _validate_day_bounds(
     return lo, hi
 
 
+_MAX_REGEX_PATTERN_LEN = 200
+
+# Two classic catastrophic-backtracking footguns compile cleanly but can take
+# exponential time on a non-matching input — which, because categorization runs
+# on every read, would stall every subsequent pass:
+#   1. A backtracking quantifier whose body itself contains a quantifier:
+#      (a+)+, (a*)*, (.{1,9})+ ...
+#   2. A backtracking quantifier whose body contains an alternation: (a|a)+,
+#      (a|ab)* ... (the overlap between alternatives is what backtracks; we
+#      reject the whole quantified-alternation shape conservatively rather than
+#      try to prove overlap).
+# Both are detected by walking the *parsed* pattern tree rather than matching
+# the pattern source text: a source-text heuristic that scans for "(...)<quant>"
+# is defeated by an extra wrapping group (e.g. ((a|a))+), whereas the parse tree
+# exposes the same nested structure no matter how many groups wrap it.
+
+try:  # Python 3.11+ exposes the regex parser as re._parser
+    from re import _parser as _re_parser
+except ImportError:  # pragma: no cover - Python < 3.11 fallback
+    import sre_parse as _re_parser
+
+_SubPattern = _re_parser.SubPattern
+_MAXREPEAT = _re_parser.MAXREPEAT
+
+# Cap on the number of *unbounded* greedy/lazy quantifiers (``*``/``+``/``{n,}``)
+# in one pattern. Even without nesting, several sequential unbounded quantifiers
+# over overlapping character sets (``.*.*.*x``) backtrack polynomially with a
+# degree equal to the quantifier count, which — on a non-matching transaction
+# string, evaluated on every read — grows into a multi-second hang well under
+# the length cap. Realistic merchant patterns use only a few (``\s+``, ``\d+``,
+# one ``.*``); this bound leaves generous headroom for them while rejecting the
+# high-degree shapes that stall categorization. Bounded quantifiers (``?``,
+# ``{2,4}``, ``{3}``) and non-backtracking possessive repeats are exempt.
+_MAX_UNBOUNDED_REPEATS = 4
+
+# Greedy/lazy quantifiers backtrack; POSSESSIVE_REPEAT ((a+)++) and ATOMIC_GROUP
+# ((?>...)) do not, so they are not catastrophic-backtracking risks and must not
+# be flagged (rejecting them would block the very rewrite that fixes the risk).
+_BACKTRACKING_REPEAT_OPS = ("MAX_REPEAT", "MIN_REPEAT")
+
+# An atomic group or possessive repeat commits its match and cannot be forced to
+# backtrack by an enclosing quantifier, so it breaks the nesting chain: structure
+# inside it is not driven to catastrophic backtracking by an ancestor repeat
+# (e.g. (?>a|aa)+ is safe even though (a|aa)+ is not). The walk still recurses
+# into the body so a footgun that is self-contained inside the boundary — like
+# (?>(a+)+b) — is still caught on its own.
+_NON_BACKTRACKING_BOUNDARY_OPS = ("ATOMIC_GROUP", "POSSESSIVE_REPEAT")
+
+
+def _nested_subpatterns(av: object) -> list:
+    """Return every SubPattern nested anywhere in an opcode's argument tuple.
+
+    Walks generically rather than destructuring by index so it survives the
+    per-version differences in opcode argument shape (e.g. SUBPATTERN carries
+    flag fields on newer Pythons that older ones omit).
+    """
+    found: list = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, _SubPattern):
+            found.append(node)
+        elif isinstance(node, (tuple, list)):
+            for item in node:
+                visit(item)
+
+    visit(av)
+    return found
+
+
+def _check_backtracking(subpattern: object, inside_repeat: bool) -> None:
+    """Raise ValueError if a backtracking quantifier encloses another quantifier
+    or an alternation, anywhere in the tree (the catastrophic-backtracking core).
+    """
+    for op, av in subpattern:
+        name = getattr(op, "name", str(op))
+        is_repeat = name in _BACKTRACKING_REPEAT_OPS
+        if inside_repeat and is_repeat:
+            raise ValueError(
+                "regex pattern has nested quantifiers (e.g. '(a+)+') that can "
+                "cause catastrophic backtracking; rewrite it without a "
+                "quantified group inside another quantifier"
+            )
+        if inside_repeat and name == "BRANCH":
+            raise ValueError(
+                "regex pattern has a quantified alternation (e.g. '(a|a)+') "
+                "that can cause catastrophic backtracking; rewrite it without "
+                "repeating an alternation group"
+            )
+        # An atomic group / possessive repeat is a non-backtracking boundary:
+        # reset inside_repeat so its contents are not flagged merely for sitting
+        # under an ancestor quantifier. Self-contained footguns inside it are
+        # still caught because the walk continues into the body.
+        if name in _NON_BACKTRACKING_BOUNDARY_OPS:
+            child_inside = False
+        else:
+            child_inside = inside_repeat or is_repeat
+        for child in _nested_subpatterns(av):
+            _check_backtracking(child, child_inside)
+
+
+def _count_unbounded_repeats(subpattern: object) -> int:
+    """Count backtracking quantifiers with an unbounded upper limit, tree-wide.
+
+    Counts ``MAX_REPEAT``/``MIN_REPEAT`` nodes whose max is ``MAXREPEAT`` (``*``,
+    ``+``, ``{n,}``) anywhere in the parsed pattern, including inside atomic
+    groups (whose contents still backtrack internally before the group commits).
+    ``POSSESSIVE_REPEAT`` nodes do not backtrack, so they are not counted, but
+    their bodies are still traversed in case they contain backtracking repeats.
+    """
+    count = 0
+    for op, av in subpattern:
+        name = getattr(op, "name", str(op))
+        if name in _BACKTRACKING_REPEAT_OPS and isinstance(av, tuple) and (
+            len(av) == 3 and av[1] == _MAXREPEAT
+        ):
+            count += 1
+        for child in _nested_subpatterns(av):
+            count += _count_unbounded_repeats(child)
+    return count
+
+
+def _validate_regex_safety(raw: str) -> None:
+    """Reject regex patterns that are obvious catastrophic-backtracking risks.
+
+    Compilation alone does not bound execution time: a pattern like ``(a+)+$``
+    compiles fine but can backtrack exponentially on a non-matching input, and
+    because categorization runs on every read, one such stored rule would hang
+    every subsequent pass. Cap the pattern length, then walk the parsed pattern
+    tree and reject any backtracking quantifier that encloses another quantifier
+    or an alternation, plus any pattern carrying more than a handful of unbounded
+    quantifiers (whose sequential backtracking is polynomial in that count), so
+    the footgun surfaces as a creation-time ``ValueError`` (caught by the
+    MCP/CLI error envelope) rather than a silent runtime hang. Conservative, not
+    a proof: it rejects the structural footgun shapes (and a few benign
+    quantified alternations) without trying to prove non-overlap.
+
+    The length check is first so the parser only ever sees a bounded input;
+    parse errors (including ``RecursionError`` on deep nesting and
+    ``OverflowError`` on an oversized repetition count) are normalized to
+    ``ValueError`` so a malformed pattern never escapes as an unhandled crash.
+    """
+    if len(raw) > _MAX_REGEX_PATTERN_LEN:
+        raise ValueError(
+            f"regex pattern is too long (max {_MAX_REGEX_PATTERN_LEN} characters)"
+        )
+    try:
+        parsed = _re_parser.parse(raw)
+    except re.error as exc:
+        raise ValueError(f"invalid regex pattern: {exc}") from exc
+    except RecursionError as exc:
+        raise ValueError("regex pattern is too deeply nested") from exc
+    except OverflowError as exc:
+        raise ValueError(f"invalid regex pattern: {exc}") from exc
+    _check_backtracking(parsed, False)
+    if _count_unbounded_repeats(parsed) > _MAX_UNBOUNDED_REPEATS:
+        raise ValueError(
+            "regex pattern has too many unbounded quantifiers "
+            f"(max {_MAX_UNBOUNDED_REPEATS}); several sequential '*'/'+' "
+            "quantifiers can backtrack for seconds on a non-matching input. "
+            "Use bounded quantifiers (e.g. '{1,20}') or a more specific pattern"
+        )
+
+
 def add_rule(
     conn: sqlite3.Connection,
     pattern: str,
@@ -526,9 +689,18 @@ def add_rule(
     # into a loud creation-time error rather than a rule that silently matches
     # nothing forever.
     if match_mode == "regex":
+        # Validate safety (length + backtracking heuristics) BEFORE compiling so
+        # an over-long or deeply nested pattern is rejected cleanly rather than
+        # reaching the parser. RecursionError from a pathologically nested but
+        # under-length pattern is still normalized to ValueError defensively.
+        _validate_regex_safety(raw)
         try:
             re.compile(raw, re.IGNORECASE)
         except re.error as exc:
+            raise ValueError(f"invalid regex pattern: {exc}") from exc
+        except RecursionError as exc:
+            raise ValueError("regex pattern is too deeply nested") from exc
+        except OverflowError as exc:
             raise ValueError(f"invalid regex pattern: {exc}") from exc
         pat = raw
     else:
