@@ -3,7 +3,7 @@ name = "finance-mcp"
 version = "0.1.0"
 description = "SimpleFIN-backed transaction access for Copilot via MCP"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "dfrysinger" }]
