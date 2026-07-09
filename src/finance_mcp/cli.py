@@ -485,10 +485,10 @@ def _cmd_subscriptions(args: argparse.Namespace) -> int:
     cfg_path = Path(args.config).expanduser() if args.config else config.budget_config_path()
 
     if args.action == "detect":
-        from datetime import date, timedelta
+        from datetime import date
 
         e = end or date.today()
-        s = start or (e - timedelta(days=subscription.DEFAULT_WINDOW_DAYS))
+        s = start or subscription.default_start(e)
         try:
             view = store.load_archive_view()
             existing_cfg = (

@@ -320,3 +320,13 @@ def test_subscriptions_detect_honors_day_tolerance(tmp_path, monkeypatch, capsys
                    "--config", str(wide_cfg), "--json"])
     assert rc == 0
     assert json.loads(capsys.readouterr().out)["added"] == 0
+
+
+def test_subscriptions_detect_boundary_end_does_not_overflow(tmp_path, monkeypatch, capsys):
+    # An --end at date.min (parseable by the ISO date parser) makes the default
+    # start widen a year earlier, which underflowed date.min with an opaque
+    # OverflowError that terminated the CLI. It must now clamp and exit cleanly.
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    rc = cli.main(["subscriptions", "detect", "--end", "0001-01-01", "--json"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["added"] == 0

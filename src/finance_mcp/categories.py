@@ -830,16 +830,17 @@ def _compiled_rules(conn: sqlite3.Connection) -> list[dict]:
     return rules
 
 
-def _usable_merchant(value: object) -> str:
+def usable_merchant(value: object) -> str:
     """Lowercased merchant text for matching, or ``""`` when the field is not a
     usable string.
 
     ``description``/``payee`` are normally strings, but a malformed cached or
     hand-edited row could hold a truthy non-string (an int, list, or dict).
-    Calling ``.lower()`` on those raises ``AttributeError`` and aborts
-    categorization for the whole batch, not just the bad row. Coercing here keeps
+    Calling ``.lower()`` on those raises ``AttributeError`` and aborts the
+    matching pass for the whole batch, not just the bad row. Coercing here keeps
     one malformed transaction from crashing the pass — its merchant predicates
-    simply fail to match, mirroring the amount/day fail-closed paths.
+    simply fail to match, mirroring the amount/day fail-closed paths. Shared with
+    the red-flag debt-payment matcher so both read paths coerce identically.
     """
     if isinstance(value, str):
         return value.lower()
@@ -1062,8 +1063,8 @@ def apply_categories(
             )
             txn["is_income"] = False
             continue
-        desc = _usable_merchant(txn.get("description"))
-        payee = _usable_merchant(txn.get("payee"))
+        desc = usable_merchant(txn.get("description"))
+        payee = usable_merchant(txn.get("payee"))
         account_id = txn.get("account_id")
         amt = txn.get("amount_float")
         amount_mag = _usable_magnitude(amt)

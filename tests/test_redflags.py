@@ -483,6 +483,27 @@ def test_by_source_matches_payee_not_only_description():
     assert rep["flags"] == []
 
 
+def test_by_source_malformed_merchant_field_does_not_crash():
+    # A funding-account row whose description/payee is a non-string (int, list,
+    # dict) must not crash the red-flag scan: that row simply fails to match the
+    # payment substrings, while the good rows are still audited. Without the
+    # string coercion, .lower() on the bad field aborts the whole pass.
+    debt = DebtAccount(LOAN, "Loan", None, 1, payment_source=_mtg(FUND))
+    bad = _out("-1000.00", on="2026-05-01")
+    bad["description"] = ["MTG PMT"]  # non-string upstream/cache shape
+    bad["payee"] = {"m": "x"}
+    txns = [
+        _out("-1000.00", on="2026-04-01"),
+        bad,
+        _out("-1000.00", on="2026-06-01"),
+    ]
+    rep = _detect((debt,), txns)
+    # The malformed May row does not match, so May reads as a missed month; the
+    # scan completes rather than crashing on the bad field.
+    missed = {f["month"] for f in rep["flags"] if f["kind"] == "missed_payment"}
+    assert "2026-05" in missed
+
+
 def test_by_source_account_id_scopes_the_search():
     # An identically-described outflow on a different account must not count.
     debt = DebtAccount(LOAN, "Loan", None, 1, payment_source=_mtg(FUND))
@@ -544,3 +565,92 @@ def test_by_source_pending_outflow_does_not_count_as_paid():
     rep = _detect((debt,), txns)
     missed = {f["month"] for f in rep["flags"] if f["kind"] == "missed_payment"}
     assert "2026-05" in missed
+
+
+# --- boundary / malformed-input hardening -------------------------------------
+
+def test_on_account_returned_payment_malformed_description_does_not_crash():
+    # An on-account (no payment_source) returned-payment row whose description /
+    # payee is a non-string (int, list, dict) must not crash the whole scan when
+    # building the flag detail text: the row is still reported, with the merchant
+    # name simply omitted. Without the coercion, .strip() aborts the pass.
+    debts = (DebtAccount(LOAN, "Loan", 75224, 1),)
+    bad = _txn(LOAN, "-752.24", on="2026-05-06")
+    bad["description"] = ["MTG PMT REVERSED"]
+    bad["payee"] = {"m": "x"}
+    txns = [
+        _txn(LOAN, "752.24", on="2026-05-01"),
+        bad,
+        _txn(LOAN, "752.24", on="2026-05-20"),
+    ]
+    rep = _detect(debts, txns, as_of=date(2026, 6, 3))
+    returned = [f for f in rep["flags"] if f["kind"] == "returned_payment"]
+    assert len(returned) == 1
+    # The unusable merchant fields fail closed: the detail ends cleanly without a
+    # "(merchant)" suffix rather than crashing or rendering a repr.
+    assert returned[0]["detail"].endswith("on 2026-05-06.")
+
+
+def test_on_account_returned_payment_falls_back_to_payee_when_description_bad():
+    # If only the description is a bad type, a usable string payee is still shown.
+    debts = (DebtAccount(LOAN, "Loan", 75224, 1),)
+    bad = _txn(LOAN, "-752.24", on="2026-05-06")
+    bad["description"] = 12345
+    bad["payee"] = "MTG PMT REVERSED"
+    txns = [
+        _txn(LOAN, "752.24", on="2026-05-01"),
+        bad,
+        _txn(LOAN, "752.24", on="2026-05-20"),
+    ]
+    rep = _detect(debts, txns, as_of=date(2026, 6, 3))
+    returned = [f for f in rep["flags"] if f["kind"] == "returned_payment"]
+    assert len(returned) == 1
+    assert returned[0]["detail"].endswith("(MTG PMT REVERSED).")
+
+
+def test_boundary_as_of_at_date_min_does_not_overflow():
+    # An as_of at date.min (parseable via the ISO date parser) makes the default
+    # window start widen a year earlier, which underflowed date.min with an opaque
+    # OverflowError. It must now clamp and return a normal report rather than crash.
+    rep = redflags.detect_red_flags(
+        (DebtAccount(LOAN, "Loan", 75224, 1),), [], as_of=date.min
+    )
+    # A debt with no transactions is unauditable (not a crash, not a missed flag).
+    assert {f["kind"] for f in rep["flags"]} == {"unauditable"}
+
+
+def test_boundary_as_of_at_date_max_does_not_overflow(monkeypatch):
+    # An as_of at date.max makes the per-month overdue gate compute
+    # due_date + grace_days, which overflows date.max. due_day=31 puts the final
+    # month's due date on Dec 31 so the overflow actually fires, and a POSITIVE
+    # anchoring payment ensures the month walk runs (a returned-only debt would
+    # short-circuit at first_payment_month is None, never reaching the gate).
+    calls = []
+    real = redflags._not_overdue_yet
+
+    def spy(as_of, due, grace_days):
+        result = real(as_of, due, grace_days)
+        calls.append((due, grace_days, result))
+        return result
+
+    monkeypatch.setattr(redflags, "_not_overdue_yet", spy)
+    debt = DebtAccount(LOAN, "Loan", 75224, 31)
+    txn = _txn(LOAN, "752.24", on="9999-12-15")
+    rep = redflags.detect_red_flags((debt,), [txn], as_of=date.max, start=date.max)
+    # The audit completed instead of raising OverflowError.
+    assert isinstance(rep["flags"], list)
+    # The overflow-guarded gate was actually reached and clamped: Dec 31 + grace
+    # is beyond date.max, so the month reads as not-overdue-yet (True) rather than
+    # crashing. Without the fix, computing the threshold here raises OverflowError.
+    assert any(
+        due == date(9999, 12, 31) and result is True for due, _, result in calls
+    )
+
+
+def test_not_overdue_yet_grace_overflow_resolves_by_direction():
+    # The overflow guard must resolve by grace direction, not blindly return True.
+    # A positive grace overflowing above date.max is genuinely not overdue yet;
+    # a negative grace underflowing below date.min lies before every possible
+    # as_of, so that month is already overdue (False), not "not yet".
+    assert redflags._not_overdue_yet(date.max, date.max, 1) is True
+    assert redflags._not_overdue_yet(date.min, date.min, -1) is False

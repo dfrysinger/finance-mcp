@@ -33,6 +33,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 from .budget_config import BudgetConfig, DebtAccount
+from .categories import usable_merchant
 
 # How many days past a debt's nominal due day a month is given before its absent
 # payment counts as missed. Applied to every audited month: a month is evaluated
@@ -93,6 +94,17 @@ def _dollars(cents: int) -> float:
     return cents / 100.0
 
 
+def _usable_text(value: object) -> str:
+    """Stripped display text, or ``""`` when the field is not a usable string.
+
+    Mirrors ``categories.usable_merchant`` but preserves case for display: a
+    truthy non-string ``description``/``payee`` (an int, list, or dict from a
+    malformed cached/hand-edited row) would raise ``AttributeError`` on
+    ``.strip()`` and abort the whole red-flag scan, so coerce it to "" instead.
+    """
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _belongs_to_debt(txn: dict, debt: DebtAccount) -> bool:
     """Whether a transaction is one of this debt's payment-or-return rows.
 
@@ -109,8 +121,8 @@ def _belongs_to_debt(txn: dict, debt: DebtAccount) -> bool:
         return False
     if src.account_id is not None and txn.get("account_id") != src.account_id:
         return False
-    desc = (txn.get("description") or "").lower()
-    payee = (txn.get("payee") or "").lower()
+    desc = usable_merchant(txn.get("description"))
+    payee = usable_merchant(txn.get("payee"))
     return any(p.lower() in desc or p.lower() in payee for p in src.description_contains)
 
 
@@ -122,6 +134,38 @@ def _due_date(year: int, month: int, due_day: int) -> date:
     """The debt's due date in a given month, clamped to the month's length."""
     last = calendar.monthrange(year, month)[1]
     return date(year, month, min(due_day, last))
+
+
+def _shift_days(d: date, days: int) -> date:
+    """Shift ``d`` by ``days``, clamping to the representable date range instead
+    of raising ``OverflowError``.
+
+    The default audit window widens a year before ``as_of``; a pathological
+    ``as_of`` near ``date.min`` (reachable via the CLI/MCP date parsers) would
+    underflow the subtraction. Clamping keeps a boundary input from crashing the
+    public red-flags surface.
+    """
+    try:
+        return d + timedelta(days=days)
+    except OverflowError:
+        return date.max if days > 0 else date.min
+
+
+def _not_overdue_yet(as_of: date, due: date, grace_days: int) -> bool:
+    """Whether ``as_of`` has not yet reached ``due`` plus ``grace_days``.
+
+    ``due + grace_days`` can fall outside the representable date range for a
+    pathological ``as_of`` near a date boundary (reachable via the date parsers).
+    A positive grace pushes the threshold above ``date.max`` — later than every
+    possible ``as_of``, so the month is definitively not overdue yet (True). A
+    negative grace pushes it below ``date.min`` — earlier than every possible
+    ``as_of``, so the month is already overdue (False). Either way, resolve it
+    here rather than crash with ``OverflowError``.
+    """
+    try:
+        return as_of < due + timedelta(days=grace_days)
+    except OverflowError:
+        return grace_days > 0
 
 
 def detect_red_flags(
@@ -144,7 +188,7 @@ def detect_red_flags(
     or a payment fully reversed by a return) is missed. Returns a
     JSON-serializable report.
     """
-    start = start or (as_of - timedelta(days=DEFAULT_WINDOW_DAYS))
+    start = start or _shift_days(as_of, -DEFAULT_WINDOW_DAYS)
     # Audit whole months: align the window's lower bound to the first of its month
     # so the in-window row filter and the month-by-month walk agree. Without this,
     # a payment earlier in a partial boundary month would be excluded from that
@@ -267,7 +311,9 @@ def detect_red_flags(
         # Returned / reversed payments: any negative posting to the loan account.
         for d, cents, txn in rows:
             if cents < 0:
-                desc = (txn.get("description") or txn.get("payee") or "").strip()
+                desc = _usable_text(txn.get("description")) or _usable_text(
+                    txn.get("payee")
+                )
                 flags.append(
                     {
                         "kind": "returned_payment",
@@ -311,7 +357,7 @@ def detect_red_flags(
         y, m = first_month
         while (y, m) <= (as_of.year, as_of.month):
             due_day = debt.due_day or calendar.monthrange(y, m)[1]
-            if as_of < _due_date(y, m, due_day) + timedelta(days=grace_days):
+            if _not_overdue_yet(as_of, _due_date(y, m, due_day), grace_days):
                 # This month's payment isn't overdue yet — its due date plus grace
                 # has not passed. Applies to any month, not just the current one,
                 # because a month-end due date plus grace can land in the next

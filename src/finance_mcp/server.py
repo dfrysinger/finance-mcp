@@ -495,7 +495,7 @@ def subscriptions_detect(
     price from an already-tracked subscription — are reported under
     ``needs_review`` (each with a ``reason``) rather than written.
     """
-    from datetime import date, timedelta
+    from datetime import date
 
     from . import budget_config, store, subscription
 
@@ -504,7 +504,7 @@ def subscriptions_detect(
     except ValueError as exc:
         return {"ok": False, "error": f"invalid date: {exc}"}
     e = e or date.today()
-    s = s or (e - timedelta(days=subscription.DEFAULT_WINDOW_DAYS))
+    s = s or subscription.default_start(e)
     if e < s:
         return {"ok": False, "error": f"end {e} is before start {s}"}
     try:

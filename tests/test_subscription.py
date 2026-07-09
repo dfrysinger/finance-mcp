@@ -958,6 +958,19 @@ def test_detect_boundary_dates_do_not_overflow():
     assert out["bills"] == []
 
 
+def test_default_start_clamps_at_date_min():
+    # The detect/report surfaces widen an omitted start a year back from end.
+    # An end at/near date.min must clamp to the representable edge instead of
+    # underflowing with an opaque OverflowError.
+    import datetime
+
+    assert subscription.default_start(datetime.date.min) == datetime.date.min
+    assert subscription.default_start(datetime.date(1, 1, 1)) == datetime.date.min
+    assert subscription.default_start(datetime.date(2026, 7, 8)) == datetime.date(
+        2025, 7, 8
+    )
+
+
 def test_report_is_json_serializable():
     cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
     txns = [_txn("t1", "card", "-15.99", on="2026-03-10", desc="NETFLIX")]

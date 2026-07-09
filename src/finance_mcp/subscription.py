@@ -105,6 +105,20 @@ def _shift_days(d: date, days: int) -> date:
         return date.max if days > 0 else date.min
 
 
+def default_start(end: date) -> date:
+    """Default detection/report window start: ``DEFAULT_WINDOW_DAYS`` before
+    ``end``, clamped to the representable date range.
+
+    The detect and report surfaces widen an omitted ``start`` a year back from
+    ``end``. Doing that with raw ``date`` arithmetic underflows and raises an
+    opaque ``OverflowError`` when ``end`` is at/near ``date.min`` (reachable via
+    the CLI/MCP ISO date parsers). Routing every default-start computation
+    through this one clamped helper keeps a boundary ``end`` from crashing the
+    public surface.
+    """
+    return _shift_days(end, -DEFAULT_WINDOW_DAYS)
+
+
 @dataclass(frozen=True)
 class _Charge:
     """One observed debit (a candidate subscription payment)."""
@@ -1041,7 +1055,7 @@ def subscription_report(
     from . import store
 
     end = end or date.today()
-    start = start or _shift_days(end, -DEFAULT_WINDOW_DAYS)
+    start = start or default_start(end)
 
     view = store.load_archive_view()
     transactions = view["transactions"]

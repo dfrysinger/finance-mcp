@@ -350,6 +350,16 @@ def test_subscriptions_detect_splits_needs_review_from_unsupported_cadence(tmp_p
     assert any("generic" in r["reason"] for r in det["needs_review"])
 
 
+def test_subscriptions_detect_boundary_end_does_not_overflow(tmp_path, monkeypatch):
+    # An end at date.min (parseable via the ISO date parser) makes the default
+    # start widen a year earlier, which underflowed date.min with an opaque
+    # OverflowError. It must now clamp and return a normal structured result.
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    det = server.subscriptions_detect(end="0001-01-01")
+    assert det["ok"] is True
+    assert det["added"] == 0
+
+
 # --- bad-input error paths (must return structured errors, not raise) ----------
 
 def test_budget_burndown_out_of_range_month_returns_error(tmp_path, monkeypatch):
