@@ -830,8 +830,30 @@ def _compiled_rules(conn: sqlite3.Connection) -> list[dict]:
     return rules
 
 
+def _usable_merchant(value: object) -> str:
+    """Lowercased merchant text for matching, or ``""`` when the field is not a
+    usable string.
+
+    ``description``/``payee`` are normally strings, but a malformed cached or
+    hand-edited row could hold a truthy non-string (an int, list, or dict).
+    Calling ``.lower()`` on those raises ``AttributeError`` and aborts
+    categorization for the whole batch, not just the bad row. Coercing here keeps
+    one malformed transaction from crashing the pass — its merchant predicates
+    simply fail to match, mirroring the amount/day fail-closed paths.
+    """
+    if isinstance(value, str):
+        return value.lower()
+    return ""
+
+
 def _match_merchant(rule: dict, desc: str, payee: str) -> bool:
     field = rule["field"]
+    # add_rule validates field to description/payee/any, but a hand-edited or
+    # corrupted stored row could hold any value. An unrecognized field is not a
+    # usable match target, so fail closed rather than silently widening the
+    # predicate to the any-field (desc OR payee) branch.
+    if field not in ("description", "payee", "any"):
+        return False
     if rule.get("_mode") == "regex":
         rx = rule.get("_rx")
         if rx is None:
@@ -1040,8 +1062,8 @@ def apply_categories(
             )
             txn["is_income"] = False
             continue
-        desc = (txn.get("description") or "").lower()
-        payee = (txn.get("payee") or "").lower()
+        desc = _usable_merchant(txn.get("description"))
+        payee = _usable_merchant(txn.get("payee"))
         account_id = txn.get("account_id")
         amt = txn.get("amount_float")
         amount_mag = _usable_magnitude(amt)

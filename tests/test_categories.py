@@ -1560,3 +1560,64 @@ def test_add_rule_rejects_oversized_repetition_count(tmp_path):
     with pytest.raises(ValueError):
         categories.add_rule(conn, "a{4294967296}", "Insurance", match_mode="regex")
 
+
+
+def test_malformed_merchant_field_does_not_crash_the_batch(tmp_path):
+    # A single transaction whose description/payee is a non-string (int, list,
+    # dict) must not abort categorization for the whole batch: it fails closed
+    # (its merchant predicates don't match) while the good rows still resolve.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "harmons", "Groceries")
+    txns = [
+        {"id": "t1", "description": 12345, "payee": "", "amount_float": -10.0},
+        {"id": "t2", "description": ["TESLA"], "payee": None, "amount_float": -10.0},
+        {"id": "t3", "description": {"m": "x"}, "payee": {"m": "y"}, "amount_float": -10.0},
+        {"id": "t4", "description": "HARMONS #123", "payee": "", "amount_float": -10.0},
+    ]
+    categories.apply_categories(conn, txns)
+    by_id = {t["id"]: t for t in txns}
+    assert by_id["t1"]["category"] == "Uncategorized"
+    assert by_id["t2"]["category"] == "Uncategorized"
+    assert by_id["t3"]["category"] == "Uncategorized"
+    assert by_id["t4"]["category"] == "Groceries"
+
+
+def test_malformed_merchant_field_does_not_match_substring_rule(tmp_path):
+    # A non-string field that happens to contain the pattern text in its repr
+    # must not match — coercion is by type, not by stringification.
+    conn = _conn(tmp_path)
+    categories.add_rule(conn, "tesla", "Insurance")
+    txns = [{"id": "t1", "description": ["TESLA"], "payee": "", "amount_float": -10.0}]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Uncategorized"
+
+
+def test_corrupted_stored_field_fails_closed(tmp_path):
+    # add_rule validates field, but a hand-edited/corrupted stored row could hold
+    # an unrecognized field. At match time that must fail closed (match nothing)
+    # rather than silently widening to the any-field (desc OR payee) branch.
+    conn = _conn(tmp_path)
+    rid = categories.add_rule(conn, "harmons", "Groceries", field="description")
+    conn.execute("UPDATE category_rules SET field='bogus' WHERE rule_id=?", (rid,))
+    conn.commit()
+    txns = [
+        {"id": "t1", "description": "HARMONS #123", "payee": "", "amount_float": -10.0},
+        {"id": "t2", "description": "", "payee": "harmons market", "amount_float": -10.0},
+    ]
+    categories.apply_categories(conn, txns)
+    by_id = {t["id"]: t for t in txns}
+    assert by_id["t1"]["category"] == "Uncategorized"
+    assert by_id["t2"]["category"] == "Uncategorized"
+
+
+def test_corrupted_stored_field_fails_closed_regex(tmp_path):
+    # Same fail-closed contract for the regex match path.
+    conn = _conn(tmp_path)
+    rid = categories.add_rule(
+        conn, "harmons", "Groceries", field="description", match_mode="regex"
+    )
+    conn.execute("UPDATE category_rules SET field='bogus' WHERE rule_id=?", (rid,))
+    conn.commit()
+    txns = [{"id": "t1", "description": "HARMONS #123", "payee": "", "amount_float": -10.0}]
+    categories.apply_categories(conn, txns)
+    assert txns[0]["category"] == "Uncategorized"
