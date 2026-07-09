@@ -169,6 +169,22 @@ def test_budget_forecast_inverted_window_returns_error(tmp_path, monkeypatch):
     assert out["ok"] is False
 
 
+def test_budget_forecast_boundary_as_of_does_not_overflow(tmp_path, monkeypatch):
+    # An as_of at date.max (parseable via the ISO date parser) makes the default
+    # `through` widen a fixed horizon later, which overflowed date.max with an
+    # OverflowError the surrounding `except ValueError` did not catch. It must
+    # now clamp and return a normal structured result.
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    archive.connect().close()
+    _write_budget(monkeypatch, tmp_path, {
+        "version": 1,
+        "envelopes": [{"name": "Groceries", "accounts": ["g"]}],
+    })
+    out = server.budget_forecast(as_of="9999-12-31")
+    assert out["as_of"] == "9999-12-31"
+    assert "summary" in out
+
+
 def test_allocation_audit_report_tool(tmp_path, monkeypatch):
     monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
     archive.connect().close()

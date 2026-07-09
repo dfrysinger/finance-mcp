@@ -346,7 +346,6 @@ def _parse_date(value: str):
 
 
 def _cmd_forecast(args: argparse.Namespace) -> int:
-    from datetime import timedelta
     from pathlib import Path
 
     from . import budget_config, forecast
@@ -362,7 +361,7 @@ def _cmd_forecast(args: argparse.Namespace) -> int:
 
         as_of = _date.today()
     if through is None:
-        through = as_of + timedelta(days=forecast.DEFAULT_HORIZON_DAYS)
+        through = forecast.default_through(as_of)
     if through < as_of:
         print(
             f"Invalid window: --through {through} is before --as-of {as_of}",

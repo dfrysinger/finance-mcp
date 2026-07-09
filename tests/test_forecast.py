@@ -1,6 +1,6 @@
 """Tests for envelope sufficiency / forecast."""
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -55,6 +55,19 @@ def test_monthly_dates_window_is_closed_on_both_ends():
 
 
 # --- forecast(): core verdicts ------------------------------------------------
+
+
+def test_default_through_shifts_by_horizon():
+    assert forecast.default_through(date(2026, 3, 1)) == date(2026, 3, 1) + timedelta(
+        days=forecast.DEFAULT_HORIZON_DAYS
+    )
+
+
+def test_default_through_clamps_at_date_max():
+    # A near-date.max as_of would overflow raw date arithmetic; the helper must
+    # clamp to the representable edge instead of raising OverflowError.
+    assert forecast.default_through(date.max) == date.max
+    assert forecast.default_through(date(9999, 12, 1)) == date.max
 
 
 def test_sufficient_when_balance_covers_bills():

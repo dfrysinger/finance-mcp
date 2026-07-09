@@ -346,13 +346,13 @@ def budget_forecast(
     later. Each envelope gets a verdict (``ok`` / ``at_risk`` / ``balance_unknown``)
     with the projected minimum balance and, when at risk, the date and shortfall.
     """
-    from datetime import date, timedelta
+    from datetime import date
 
     from . import budget_config, forecast
 
     try:
         start = _parse_iso(as_of) or date.today()
-        end = _parse_iso(through) or (start + timedelta(days=forecast.DEFAULT_HORIZON_DAYS))
+        end = _parse_iso(through) or forecast.default_through(start)
     except ValueError as exc:
         return {"ok": False, "error": f"invalid date: {exc}"}
     if end < start:

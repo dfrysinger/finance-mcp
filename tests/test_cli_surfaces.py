@@ -330,3 +330,18 @@ def test_subscriptions_detect_boundary_end_does_not_overflow(tmp_path, monkeypat
     rc = cli.main(["subscriptions", "detect", "--end", "0001-01-01", "--json"])
     assert rc == 0
     assert json.loads(capsys.readouterr().out)["added"] == 0
+
+
+def test_forecast_boundary_as_of_does_not_overflow(tmp_path, monkeypatch, capsys):
+    # An --as-of at date.max (parseable by the ISO date parser) makes the default
+    # --through widen a fixed horizon later, which overflowed date.max with an
+    # OverflowError that terminated the CLI. It must now clamp and exit cleanly.
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    archive.connect().close()
+    cfg = _write_budget(tmp_path, {
+        "version": 1,
+        "envelopes": [{"name": "Groceries", "accounts": ["g"]}],
+    })
+    rc = cli.main(["forecast", "--as-of", "9999-12-31", "--config", str(cfg), "--json"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["as_of"] == "9999-12-31"

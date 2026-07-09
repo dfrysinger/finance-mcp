@@ -49,6 +49,36 @@ from .normalize import amount_to_cents
 DEFAULT_HORIZON_DAYS = 60
 
 
+def _shift_days(d: date, days: int) -> date:
+    """Shift ``d`` by ``days``, clamping to the representable date range instead
+    of raising ``OverflowError``.
+
+    The forecast window only ever widens *forward* from ``as_of`` (a fixed
+    horizon projection), so clamping a pathological boundary date (e.g.
+    ``date.max``, reachable via the CLI/MCP date parsers) to the representable
+    edge yields a correct zero/degenerate window while keeping the public
+    surface from raising an opaque ``OverflowError``.
+    """
+    try:
+        return d + timedelta(days=days)
+    except OverflowError:
+        return date.max if days > 0 else date.min
+
+
+def default_through(as_of: date) -> date:
+    """Default forecast window end: ``DEFAULT_HORIZON_DAYS`` past ``as_of``,
+    clamped to the representable date range.
+
+    The forecast surfaces widen an omitted ``through`` a fixed horizon past
+    ``as_of``. Doing that with raw ``date`` arithmetic overflows and raises an
+    opaque ``OverflowError`` when ``as_of`` is at/near ``date.max`` (reachable
+    via the CLI/MCP ISO date parsers). Routing every default-through
+    computation through this one clamped helper keeps a boundary ``as_of`` from
+    crashing the public surface.
+    """
+    return _shift_days(as_of, DEFAULT_HORIZON_DAYS)
+
+
 def _cents(amount: int) -> float:
     return round(amount / 100, 2)
 
@@ -260,7 +290,7 @@ def forecast_report(
     from . import store
 
     as_of = as_of or date.today()
-    through = through or (as_of + timedelta(days=DEFAULT_HORIZON_DAYS))
+    through = through or default_through(as_of)
     view = store.load_archive_view()
     balances = account_balances_cents(view.get("accounts", []))
     return forecast(config, balances, as_of=as_of, through=through)
