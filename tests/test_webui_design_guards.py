@@ -94,8 +94,11 @@ def test_spending_group_by_is_subtabs_not_dropdown():
     """INV-WEBUI-002: Spending exposes group_by as subtabs, not a dropdown."""
     summary = _tab_block("summary")
     assert 'subtabs:{k:"group_by"' in summary
-    assert '{k:"group_by",type:"select"' not in SCRIPT
-    assert '{k:"group_by",type:"dropdown"' not in SCRIPT
+    # Scoped to the Spending tab: the invariant is about how Spending renders
+    # group_by, not a repo-wide ban on the word (another tab may legitimately
+    # gain a group_by control later without violating this rule).
+    assert '{k:"group_by",type:"select"' not in summary
+    assert '{k:"group_by",type:"dropdown"' not in summary
 
 
 def test_last_tab_is_persisted_to_localstorage():

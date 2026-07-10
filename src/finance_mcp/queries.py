@@ -19,8 +19,9 @@ def _parse_date(value: str | None, *, end_of_day: bool = False) -> int | None:
 
     When ``end_of_day`` is set and the value is a bare calendar date (no time
     component), the returned timestamp is the last second of that day, so a
-    date-only upper bound is inclusive of transactions posted at any time on
-    that day (archived rows are stamped at noon UTC).
+    date-only upper bound is inclusive of every transaction posted on that day
+    regardless of its intra-day time (rows carry a second-level ``posted_ts``,
+    e.g. midday for the SimpleFIN archive).
     """
     if not value:
         return None
@@ -32,7 +33,7 @@ def _parse_date(value: str | None, *, end_of_day: bool = False) -> int | None:
                 dt = dt.replace(tzinfo=timezone.utc)
             ts = int(dt.timestamp())
             if end_of_day and fmt == "%Y-%m-%d":
-                ts += 86399
+                ts += 86_400 - 1  # extend to 23:59:59 of that day (inclusive)
             return ts
         except ValueError:
             continue
