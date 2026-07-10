@@ -24,6 +24,7 @@ See design: [`docs/design/webui-date-navigation.md`](../design/webui-date-naviga
 | INV-WEBUI-007 | Spending's `group_by` subtabs list `envelope` first, so Envelope is the leftmost subtab and the default grouping when no prior selection is stored | structural | `tests/test_webui_design_guards.py::test_spending_defaults_to_envelope_grouping` |
 | INV-WEBUI-008 | The Subscriptions "missing expected charges" table reuses the tracked-row Mark control, resolving each missing row to its tracked bill by name | structural | `tests/test_webui_design_guards.py::test_missing_charges_reuse_tracked_mark_control` |
 | INV-WEBUI-009 | A `bool` filter renders as a checkbox that applies instantly on change (`onchange` = `load`); a tab whose only manual filter is a toggle renders no Load button | behavioral | `tests/test_webui_design_guards.py::test_bool_filters_are_instant_checkboxes` |
+| INV-WEBUI-010 | The Red-flags view groups resolved deficits under a "Made good" section keyed on the `cleared` severity, and keeps the red table filtered to `red` severity so the banner/red count excludes made-good items | structural | `tests/test_webui_design_guards.py::test_redflags_groups_made_good_separately_from_red` |
 
 ## Queries (`src/finance_mcp/queries.py`)
 
