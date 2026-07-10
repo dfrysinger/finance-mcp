@@ -14,8 +14,14 @@ from typing import Any
 from .categories import UNCATEGORIZED
 
 
-def _parse_date(value: str | None) -> int | None:
-    """Parse a YYYY-MM-DD (or ISO) date string into a UTC Unix timestamp."""
+def _parse_date(value: str | None, *, end_of_day: bool = False) -> int | None:
+    """Parse a YYYY-MM-DD (or ISO) date string into a UTC Unix timestamp.
+
+    When ``end_of_day`` is set and the value is a bare calendar date (no time
+    component), the returned timestamp is the last second of that day, so a
+    date-only upper bound is inclusive of transactions posted at any time on
+    that day (archived rows are stamped at noon UTC).
+    """
     if not value:
         return None
     text = value.strip()
@@ -24,7 +30,10 @@ def _parse_date(value: str | None) -> int | None:
             dt = datetime.strptime(text, fmt)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            return int(dt.timestamp())
+            ts = int(dt.timestamp())
+            if end_of_day and fmt == "%Y-%m-%d":
+                ts += 86399
+            return ts
         except ValueError:
             continue
     return None
@@ -47,7 +56,7 @@ def filter_transactions(
 ) -> list[dict]:
     """Return transactions matching all supplied filters (AND semantics)."""
     start_ts = _parse_date(start_date)
-    end_ts = _parse_date(end_date)
+    end_ts = _parse_date(end_date, end_of_day=True)
     needle = search.lower().strip() if search else None
     want_cat = category.strip().lower() if category else None
 
