@@ -39,6 +39,62 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    """Parse ``HH:MM`` into ``(hour, minute)``, raising on malformed input."""
+    parts = value.split(":")
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        raise ValueError(f"expected HH:MM, got {value!r}")
+    hour, minute = int(parts[0]), int(parts[1])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"time out of range: {value!r}")
+    return hour, minute
+
+
+def _cmd_schedule(args: argparse.Namespace) -> int:
+    from . import schedule
+
+    action = "status"
+    if args.install:
+        action = "install"
+    elif args.uninstall:
+        action = "uninstall"
+    days = args.days if args.days is not None else schedule.DEFAULT_SYNC_DAYS
+    try:
+        if action == "install":
+            hour, minute = (
+                _parse_hhmm(args.at)
+                if args.at
+                else (schedule.DEFAULT_HOUR, schedule.DEFAULT_MINUTE)
+            )
+            result = schedule.install(hour=hour, minute=minute, days=days)
+            print(
+                f"Installed daily auto-sync at {hour:02d}:{minute:02d} "
+                f"(last {days} days).\n  plist: {result['plist']}\n"
+                f"  logs:  {result['stdout']}"
+            )
+        elif action == "uninstall":
+            result = schedule.uninstall()
+            print(
+                "Removed daily auto-sync."
+                if result["plist_removed"]
+                else "Daily auto-sync was not installed; nothing to remove."
+            )
+        else:
+            result = schedule.status()
+            if result["plist_present"]:
+                state = "loaded" if result["loaded"] else "present but NOT loaded"
+                print(f"Daily auto-sync: {state}.\n  plist: {result['plist']}")
+            else:
+                print(
+                    "Daily auto-sync: not installed. Run "
+                    "`finance-mcp schedule --install` to enable it."
+                )
+    except (ValueError, schedule.ScheduleError) as exc:
+        print(f"Schedule {action} failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _cmd_accounts(args: argparse.Namespace) -> int:
     cache = store.load_archive_view()
     if args.json:
@@ -708,6 +764,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--days", type=int, default=120)
     p_sync.add_argument("--no-pending", action="store_true")
     p_sync.set_defaults(func=_cmd_sync)
+
+    p_sched = sub.add_parser(
+        "schedule",
+        help="install/remove a daily automatic sync (macOS launchd)",
+    )
+    p_sched.add_argument(
+        "--install", action="store_true", help="install the daily auto-sync agent"
+    )
+    p_sched.add_argument(
+        "--uninstall", action="store_true", help="remove the daily auto-sync agent"
+    )
+    p_sched.add_argument(
+        "--status", action="store_true",
+        help="report whether the daily auto-sync agent is installed/loaded (default)",
+    )
+    p_sched.add_argument(
+        "--at", metavar="HH:MM",
+        help="local time to run daily (default 06:30)",
+    )
+    p_sched.add_argument(
+        "--days", type=int, default=None,
+        help="look-back window each run passes to sync (default 30)",
+    )
+    p_sched.set_defaults(func=_cmd_schedule)
 
     p_acct = sub.add_parser("accounts", help="list cached accounts + balances")
     p_acct.add_argument("--json", action="store_true")

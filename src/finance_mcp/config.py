@@ -46,6 +46,17 @@ def load_access_url() -> str | None:
     env = os.environ.get("SIMPLEFIN_ACCESS_URL")
     if env:
         return env.strip()
+    return load_access_url_file()
+
+
+def load_access_url_file() -> str | None:
+    """Return the access URL persisted to the 0600 file, ignoring the env var.
+
+    The scheduled (launchd) sync runs with a minimal environment that does not
+    carry ``SIMPLEFIN_ACCESS_URL``, so it depends solely on this file; callers
+    that need to know whether that file-backed credential exists must not be
+    fooled by an env var set only in the interactive shell.
+    """
     path = access_url_path()
     if not path.exists():
         return None
