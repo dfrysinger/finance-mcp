@@ -2082,3 +2082,262 @@ def test_lock_acquisition_failure_fails_closed(tmp_path, monkeypatch):
     # The config was not modified by the refused write.
     cfg = budget_config.load_config(path)
     assert cfg.recurring[0].lifecycle == "active"
+
+
+# --- broadened detection: amount tolerance, CV guard, cadence bands -----------
+
+
+def test_penny_jitter_amounts_group_into_one_stream():
+    # A stable monthly price that wobbles by a cent ($26.85 / $26.86 / $26.85)
+    # must group into ONE recurring stream. Grouping on exact cents (the prior
+    # behavior) split this below the 3-occurrence threshold and missed it.
+    cfg = _config([CARD], [])
+    txns = [
+        _txn("a", "card", "-26.85", on="2026-01-21", desc="BIGGREEN"),
+        _txn("b", "card", "-26.86", on="2026-02-21", desc="BIGGREEN"),
+        _txn("c", "card", "-26.85", on="2026-03-21", desc="BIGGREEN"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert len(report["candidate_new"]) == 1
+    cand = report["candidate_new"][0]
+    assert cand["occurrences"] == 3
+    assert cand["cadence"] == "monthly"
+    assert cand["amount"] == "26.85"  # median of the cluster
+
+
+def test_amount_clustered_stream_with_regular_spacing_surfaces():
+    # Paired control for the CV guard: same jittered amounts, but evenly spaced
+    # monthly — this is a real subscription and must surface.
+    cfg = _config([CARD], [])
+    txns = [
+        _txn("a", "card", "-10.00", on="2026-01-05", desc="WOBBLECO"),
+        _txn("b", "card", "-10.30", on="2026-02-05", desc="WOBBLECO"),
+        _txn("c", "card", "-10.00", on="2026-03-05", desc="WOBBLECO"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert [c["occurrences"] for c in report["candidate_new"]] == [3]
+
+
+def test_amount_clustered_stream_with_erratic_spacing_is_rejected():
+    # Same merchant and jittered amounts, but erratic spacing (10 then 55 days).
+    # The median gap still lands in the monthly band by coincidence, so the
+    # interval-regularity (CV) guard is what must reject it — a merely habitual
+    # merchant is not a subscription.
+    cfg = _config([CARD], [])
+    txns = [
+        _txn("a", "card", "-10.00", on="2026-01-05", desc="HABITUAL"),
+        _txn("b", "card", "-10.30", on="2026-01-15", desc="HABITUAL"),
+        _txn("c", "card", "-10.00", on="2026-03-11", desc="HABITUAL"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert report["candidate_new"] == []
+
+
+def test_biweekly_cadence_surfaces():
+    cfg = _config([CARD], [])
+    txns = [
+        _txn("a", "card", "-5.00", on="2026-01-01", desc="BIWK"),
+        _txn("b", "card", "-5.00", on="2026-01-15", desc="BIWK"),
+        _txn("c", "card", "-5.00", on="2026-01-29", desc="BIWK"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert [c["cadence"] for c in report["candidate_new"]] == ["biweekly"]
+
+
+def test_quarterly_cadence_surfaces():
+    cfg = _config([CARD], [])
+    txns = [
+        _txn("a", "card", "-30.00", on="2025-01-15", desc="QTRLY"),
+        _txn("b", "card", "-30.00", on="2025-04-15", desc="QTRLY"),
+        _txn("c", "card", "-30.00", on="2025-07-15", desc="QTRLY"),
+    ]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2025, 1, 1), end=date(2025, 12, 31)
+    )
+    assert [c["cadence"] for c in report["candidate_new"]] == ["quarterly"]
+
+
+def test_annual_stream_matures_at_two_occurrences():
+    # An annual subscription rarely shows 3 charges in a year of history, so a
+    # yearly-spaced pair is enough to surface (Plaid matures ANNUALLY at 2).
+    cfg = _config([CARD], [])
+    txns = [
+        _txn("a", "card", "-99.00", on="2024-06-01", desc="YEARLYSUB"),
+        _txn("b", "card", "-99.00", on="2025-06-01", desc="YEARLYSUB"),
+    ]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2024, 1, 1), end=date(2025, 12, 31)
+    )
+    assert len(report["candidate_new"]) == 1
+    assert report["candidate_new"][0]["cadence"] == "yearly"
+    assert report["candidate_new"][0]["occurrences"] == 2
+
+
+def test_two_prices_at_one_merchant_stay_separate_streams():
+    # A $21.49 and a $214.90 plan at the same merchant must NOT merge into one
+    # stream just because they share a merchant identity — amount clustering
+    # keeps genuinely different prices apart.
+    cfg = _config([CARD], [])
+    txns = []
+    for i, on in enumerate(("2026-01-06", "2026-02-06", "2026-03-06")):
+        txns.append(_txn(f"big{i}", "card", "-214.90", on=on, desc="ANTHROPIC"))
+    for i, on in enumerate(("2026-01-11", "2026-02-11", "2026-03-11")):
+        txns.append(_txn(f"sml{i}", "card", "-21.49", on=on, desc="ANTHROPIC"))
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    amounts = sorted(c["amount"] for c in report["candidate_new"])
+    assert amounts == ["21.49", "214.90"]
+
+
+def test_erratic_exact_price_stream_is_not_locked_as_monthly():
+    # Regression: three EXACT-price charges whose median gap only coincidentally
+    # lands in the (widened) monthly band but whose spacing is wildly irregular
+    # (1 day, then ~2.5 months) must NOT surface. The exact-price phase must use
+    # the legacy cadence bands so it cannot admit a stream the pre-broadening
+    # detector rejected as irregular, and the recovery phase's regularity guard
+    # rejects it too.
+    cfg = _config([CARD], [])
+    txns = [
+        _txn("a", "card", "-9.99", on="2026-01-01", desc="ERRATIC"),
+        _txn("b", "card", "-9.99", on="2026-01-02", desc="ERRATIC"),
+        _txn("c", "card", "-9.99", on="2026-03-18", desc="ERRATIC"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert report["candidate_new"] == []
+
+
+def test_adjacent_price_tiers_do_not_chain_into_one_fabricated_amount():
+    # Regression: amount clustering must be complete-linkage, not chained off a
+    # running median. A run of prices each within tolerance of a moving median
+    # ($20.00 / $21.50, spanning >5%) must NOT collapse into one stream whose
+    # median ($20.75) matches no real charge. The amounts wobble by a cent so
+    # neither tier reaches three exact occurrences and both go through the
+    # recovery phase's clustering.
+    cfg = _config([CARD], [])
+    txns = []
+    lo = [("-20.00", "2026-01-05"), ("-20.01", "2026-02-05"), ("-20.00", "2026-03-05")]
+    hi = [("-21.49", "2026-01-20"), ("-21.50", "2026-02-20"), ("-21.49", "2026-03-20")]
+    for i, (amt, on) in enumerate(lo + hi):
+        txns.append(_txn(f"x{i}", "card", amt, on=on, desc="TIERCO"))
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    amounts = sorted(c["amount"] for c in report["candidate_new"])
+    assert amounts == ["20.00", "21.49"]
+    assert "20.75" not in amounts
+
+
+def test_descriptor_fragmented_exact_stream_survives_regularity_guard():
+    # Regression: an EXACT-price stream the pre-broadening detector surfaced must
+    # still surface even when descriptor fragmentation keeps each exact bucket
+    # below the threshold (so phase 1 can't lock it) AND its spacing is irregular
+    # (gaps 10 then 55 days). The old detector had no regularity guard, so the
+    # recovery phase must NOT apply the CV guard to a single-exact-amount cluster
+    # — otherwise a candidate the old code emitted would be silently dropped.
+    cfg = _config([CARD], [])
+    txns = [
+        _txn("a", "card", "-10.00", on="2026-01-05", desc="NETFLIX"),
+        _txn("b", "card", "-10.00", on="2026-01-15", desc="NETFLIX"),
+        _txn("c", "card", "-10.00", on="2026-03-11", desc="NETFLIX COM"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    assert len(report["candidate_new"]) == 1
+    cand = report["candidate_new"][0]
+    assert cand["amount"] == "10.00"
+    assert cand["occurrences"] == 3
+    assert cand["cadence"] == "monthly"
+
+
+def test_stray_nearby_priced_charge_does_not_suppress_exact_stream():
+    # Regression (monotonicity): a descriptor-fragmented exact-price stream must
+    # still surface when an UNRELATED charge at a nearby (within-tolerance) price
+    # is present at the same merchant. The near-priced stray gets absorbed into
+    # the same amount cluster, but the exact stream is evaluated on its own
+    # exact-amount subset, so adding the stray can never remove a subscription
+    # the detector would otherwise surface.
+    cfg = _config([CARD], [])
+    txns = [
+        _txn("a", "card", "-10.00", on="2026-01-05", desc="NETFLIX"),
+        _txn("b", "card", "-10.00", on="2026-01-15", desc="NETFLIX"),
+        _txn("c", "card", "-10.00", on="2026-03-11", desc="NETFLIX COM"),
+        _txn("d", "card", "-10.30", on="2026-01-20", desc="NETFLIX"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    exact = [c for c in report["candidate_new"] if c["amount"] == "10.00"]
+    assert len(exact) == 1
+    assert exact[0]["occurrences"] == 3
+    assert exact[0]["cadence"] == "monthly"
+
+
+def test_two_close_priced_exact_streams_surface_separately():
+    # Regression: two distinct subscriptions at one merchant whose prices are
+    # within the amount-clustering tolerance of each other, each descriptor-
+    # fragmented so phase 1 can't lock either, must BOTH surface as monthly.
+    # The amount grouping pulls them into one cluster, but each exact amount
+    # recurs on its own, so the whole-cluster recovery test must NOT collapse
+    # them into a single (biweekly) candidate — the legacy exact-cents merge
+    # emitted two separate monthly subs and that must be preserved.
+    cfg = _config([CARD], [])
+    txns = [
+        _txn("a", "card", "-10.00", on="2026-01-05", desc="NETFLIX"),
+        _txn("b", "card", "-10.00", on="2026-02-04", desc="NETFLIX"),
+        _txn("c", "card", "-10.00", on="2026-03-06", desc="NETFLIX COM"),
+        _txn("d", "card", "-10.40", on="2026-01-18", desc="NETFLIX"),
+        _txn("e", "card", "-10.40", on="2026-02-17", desc="NETFLIX"),
+        _txn("f", "card", "-10.40", on="2026-03-19", desc="NETFLIX COM"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    got = sorted(
+        (c["amount"], c["occurrences"], c["cadence"]) for c in report["candidate_new"]
+    )
+    assert got == [("10.00", 3, "monthly"), ("10.40", 3, "monthly")]
+
+
+def test_single_legacy_stream_is_not_masked_by_nearby_recurring_charges():
+    # Regression: even ONE legacy exact stream must survive when nearby
+    # in-tolerance charges (themselves recurring) are absorbed into the cluster.
+    # A $10.00 monthly stream plus two mid-month $10.30 charges must still
+    # surface the $10.00 monthly candidate rather than collapsing everything
+    # into one biweekly candidate that writes no bill.
+    cfg = _config([CARD], [])
+    txns = [
+        _txn("a", "card", "-10.00", on="2026-01-05", desc="NETFLIX"),
+        _txn("b", "card", "-10.00", on="2026-02-04", desc="NETFLIX"),
+        _txn("c", "card", "-10.00", on="2026-03-06", desc="NETFLIX COM"),
+        _txn("d", "card", "-10.30", on="2026-01-20", desc="NETFLIX"),
+        _txn("e", "card", "-10.30", on="2026-02-19", desc="NETFLIX"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    exact = [c for c in report["candidate_new"] if c["amount"] == "10.00"]
+    assert len(exact) == 1
+    assert exact[0]["occurrences"] == 3
+    assert exact[0]["cadence"] == "monthly"
+
+
+def test_price_step_yields_one_bill_not_two_competing_keyword_bills():
+    # A single subscription whose price steps within amount tolerance mid-window
+    # ($9.99 for three months, then $10.49 for three) leaves two exact streams at
+    # one merchant that share a match keyword. They must NOT become two bills with
+    # the same keyword (both would match every future charge and double-count the
+    # spend). One bill is proposed at the most-recent price; the older price is
+    # surfaced for the user to resolve.
+    txns = _monthly("nf", "card", "-9.99", day=10, months=[1, 2, 3], desc="NETFLIX")
+    txns += _monthly("nf2", "card", "-10.49", day=10, months=[4, 5, 6], desc="NETFLIX")
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 6, 30)
+    )
+    assert len(out["bills"]) == 1
+    bill = out["bills"][0]
+    assert bill["amount"] == "10.49"
+    assert bill["match"] == "netflix"
+    review = [s for s in out["skipped"] if s["kind"] == "needs_review"]
+    assert any("9.99" in s["reason"] and "price change" in s["reason"] for s in review)
+
+
+def test_distinct_merchants_still_yield_separate_bills():
+    # The same-keyword merge must not collapse two genuinely different merchants:
+    # different keywords stay separate bills.
+    txns = _monthly("nf", "card", "-15.99", day=10, months=[1, 2, 3, 4], desc="NETFLIX")
+    txns += _monthly("sp", "card", "-9.99", day=15, months=[1, 2, 3, 4], desc="SPOTIFY")
+    out = subscription.detect_subscriptions(
+        txns, start=date(2026, 1, 1), end=date(2026, 5, 31)
+    )
+    matches = sorted(b["match"] for b in out["bills"])
+    assert matches == ["netflix", "spotify"]

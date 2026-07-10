@@ -32,9 +32,13 @@ strictly more reliable (it survives the charge landing on a different card), so
 it is recommended for anything you want a dependable missing-charge alert on.
 
 Money is carried in integer cents throughout and rendered to dollars only at the
-report edge. Candidate amounts are grouped on exact cents because a stable price
-is the subscription signal; a mid-window price change therefore splits a merchant
-into two groups.
+report edge. Candidate charges are grouped by merchant identity and then split
+into near-equal-amount clusters (within a small absolute-or-percentage
+tolerance), so a stable price that wobbles by a cent or two — sales-tax rounding,
+foreign-currency conversion, metered usage — stays one stream instead of
+fragmenting below the occurrence threshold. Two genuinely different prices at the
+same merchant (e.g. a $21.49 and a $214.90 plan) still separate into distinct
+streams.
 """
 
 from __future__ import annotations
@@ -76,13 +80,60 @@ _MAX_TOLERANCE_DAYS = 366
 
 # Median-spacing bands (in days) used to label a candidate's cadence. A group
 # whose median gap falls outside every band is treated as irregular, not a
-# subscription, and is dropped from the candidate list.
+# subscription, and is dropped from the candidate list. Bands follow the cadence
+# taxonomy documented by Plaid's recurring-transactions product (weekly ~7,
+# biweekly ~14, monthly ~30, annual ~365); quarterly (~91) is added for bills
+# like some insurance/software plans. Monthly is widened to 24-38 days so a
+# charge still groups across 28-to-31-day month-length drift plus a few days of
+# weekend/holiday posting shift.
 _CADENCE_BANDS: tuple[tuple[str, int, int], ...] = (
+    ("weekly", 5, 9),
+    ("biweekly", 12, 16),
+    ("monthly", 24, 38),
+    ("quarterly", 78, 104),
+    ("yearly", 350, 380),
+)
+_CADENCE_ORDER = {"weekly": 0, "biweekly": 1, "monthly": 2, "quarterly": 3, "yearly": 4}
+
+# The cadence bands the detector used before amount-tolerant clustering was
+# added. Phase 1 of candidate detection classifies exact-price streams with
+# THESE bands (not the broadened ones above) so that locking a stream in phase 1
+# reproduces the pre-broadening behavior exactly: the wider monthly window and
+# the new biweekly/quarterly bands admit a stream only through phase 2, which is
+# guarded by the interval-regularity (CV) check. Widening what phase 1 accepts
+# would let an erratic exact-price run (e.g. two charges a day apart then one
+# months later, median coincidentally ~monthly) surface with no regularity check.
+_LEGACY_CADENCE_BANDS: tuple[tuple[str, int, int], ...] = (
     ("weekly", 5, 9),
     ("monthly", 24, 35),
     ("yearly", 350, 380),
 )
-_CADENCE_ORDER = {"weekly": 0, "monthly": 1, "yearly": 2}
+
+# Amount tolerance for grouping near-identical charges into one recurring stream.
+# A stable price is the subscription signal, but real charges wobble by a cent or
+# two (sales-tax rounding, foreign-currency conversion, metered usage) — so
+# grouping on EXACT cents splits e.g. a $26.85 / $26.86 / $26.85 monthly charge
+# into sub-threshold fragments and misses it entirely. Charges within
+# ``max(flat, pct * cluster median)`` are treated as one stream. The
+# max(absolute, percentage) shape follows the open-source bank2excel-finance
+# detector; the percentage is tightened to a subscription-appropriate 5% (that
+# detector uses 20%, which is aimed at variable utility bills).
+_CANDIDATE_AMOUNT_TOL_CENTS = 50
+_CANDIDATE_AMOUNT_TOL_PCT = 0.05
+
+# Maximum coefficient of variation (stddev / mean) of the inter-charge gaps for
+# an amount-clustered candidate to still count as a regular cadence. Widening the
+# amount tolerance admits more clusters, so this regularity guard keeps a merely
+# habitual merchant (one hit ~monthly by coincidence, with erratic spacing) from
+# being mislabeled a subscription. A clean monthly stream sits near CV 0.05-0.15
+# even with a skipped cycle; 0.40 is a lenient upper bound. (Author heuristic —
+# see docs/roadmap.md; no published PFM-specific cutoff exists.)
+_MAX_INTERVAL_CV = 0.40
+
+# Occurrences required to call a stream recurring. Plaid matures most cadences at
+# 3 occurrences but annual streams at 2 (a year of history rarely shows 3), so a
+# yearly-spaced pair is enough to surface for review.
+_ANNUAL_MIN_OCCURRENCES = 2
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _DIGITS_ONLY = re.compile(r"^\d+$")
@@ -326,8 +377,11 @@ def _median(values: list[int]) -> float:
     return (ordered[mid - 1] + ordered[mid]) / 2
 
 
-def _cadence_label(median_days: float) -> str:
-    for name, lo, hi in _CADENCE_BANDS:
+def _cadence_label(
+    median_days: float,
+    bands: tuple[tuple[str, int, int], ...] = _CADENCE_BANDS,
+) -> str:
+    for name, lo, hi in bands:
         if lo <= median_days <= hi:
             return name
     return "irregular"
@@ -749,30 +803,89 @@ def subscription_audit(
     }
 
 
-def _summarize_group(members: list["_Charge"]) -> tuple[list[date], float, str]:
+def _summarize_group(
+    members: list["_Charge"],
+    bands: tuple[tuple[str, int, int], ...] = _CADENCE_BANDS,
+) -> tuple[list[date], float, str]:
     """Return ``(sorted_dates, median_gap_days, cadence_label)`` for a group."""
     dates = sorted(c.on for c in members)
     gaps = [(b - a).days for a, b in zip(dates, dates[1:])]
     median_gap = _median(gaps) if gaps else 0.0
-    return dates, median_gap, _cadence_label(median_gap)
+    return dates, median_gap, _cadence_label(median_gap, bands)
 
 
-def _recurs(members: list["_Charge"], min_occurrences: int) -> bool:
-    """True when a group has enough occurrences AND a non-irregular cadence."""
-    if len(members) < min_occurrences:
+def _interval_cv(dates: list[date]) -> float:
+    """Coefficient of variation (stddev / mean) of the gaps between sorted dates.
+
+    A dimensionless measure of how regular the spacing is: 0 is perfectly even,
+    higher is more erratic. Fewer than two gaps (i.e. <=2 charges) has no spread
+    to measure, so it is treated as trivially regular (``0.0``) rather than
+    rejected — this keeps two-occurrence annual streams and small clusters from
+    being discarded by the regularity guard. A non-positive mean gap (identical
+    dates) is maximally irregular.
+    """
+    gaps = [(b - a).days for a, b in zip(dates, dates[1:])]
+    if len(gaps) < 2:
+        return 0.0
+    mean = sum(gaps) / len(gaps)
+    if mean <= 0:
+        return float("inf")
+    variance = sum((g - mean) ** 2 for g in gaps) / len(gaps)
+    return (variance ** 0.5) / mean
+
+
+def _recurs(
+    members: list["_Charge"],
+    min_occurrences: int,
+    *,
+    max_cv: float | None = None,
+    bands: tuple[tuple[str, int, int], ...] = _CADENCE_BANDS,
+    annual_matures_at_two: bool = True,
+) -> bool:
+    """True when a group recurs on a regular cadence.
+
+    A group qualifies when it has enough occurrences for its cadence and its
+    median gap lands in a known cadence ``band``. When ``annual_matures_at_two``
+    is set, annual streams mature at :data:`_ANNUAL_MIN_OCCURRENCES`; every other
+    cadence (and every cadence when the flag is off) matures at
+    ``min_occurrences``. When ``max_cv`` is given, the group is additionally
+    rejected if its inter-charge spacing is too erratic (coefficient of variation
+    above ``max_cv``) — used to keep the broadened amount-tolerant clustering from
+    admitting a merely habitual merchant that only lands in a cadence band by
+    median coincidence.
+
+    Phase 1 of :func:`_candidate_new` calls this with the *legacy* cadence bands,
+    no CV guard, and ``annual_matures_at_two=False`` so locking an exact-price
+    stream reproduces the pre-broadening detector exactly and can never surface a
+    group the old code did not. The broadened bands, CV guard, and 2-occurrence
+    annual maturity apply only to phase 2's recovery of near-miss streams.
+    """
+    if len(members) < 2:
         return False
-    return _summarize_group(members)[2] != "irregular"
+    dates, _, cadence = _summarize_group(members, bands)
+    if cadence == "irregular":
+        return False
+    if cadence == "yearly" and annual_matures_at_two:
+        needed = _ANNUAL_MIN_OCCURRENCES
+    else:
+        needed = min_occurrences
+    if len(members) < needed:
+        return False
+    if max_cv is not None and _interval_cv(dates) > max_cv:
+        return False
+    return True
 
 
-def _merge_subset_buckets(
-    buckets: dict[tuple[int, frozenset[str]], list["_Charge"]],
-) -> dict[tuple[int, frozenset[str]], list["_Charge"]]:
-    """Merge a token-set group into its *unique* maximal superset at the same amount.
+def _merge_identity(
+    by_tokens: dict[frozenset[str], list["_Charge"]],
+) -> dict[frozenset[str], list["_Charge"]]:
+    """Fold each identity token set into its *unique* maximal superset.
 
     The same merchant can yield different identity token sets across charges when
     an auxiliary field (e.g. payee) is populated on only some rows — e.g.
     ``{"netflix"}`` on one charge and ``{"netflix", "com"}`` on another. When a
-    subset has exactly one maximal superset, folding it in reunites the merchant.
+    subset has exactly one maximal superset, folding it in reunites the merchant
+    so its charges are grouped (and then amount-clustered) as one stream.
 
     A subset that sits under *two or more* incomparable maximal supersets is
     ambiguous generic noise (e.g. a bare ``{"pos","purchase"}`` under both
@@ -782,26 +895,109 @@ def _merge_subset_buckets(
     dates and could hide that merchant or fake a cadence. Two distinct merchants
     therefore never merge, and neither is contaminated by ambiguous remnants.
 
-    The caller only feeds this the *sub-threshold* buckets (those that do not
-    already recur on their own) and only adopts a merge that yields a recurring
-    group, so a bucket that already meets the occurrence threshold can never be
-    demoted by being folded into an off-cadence superset.
+    Unlike the earlier exact-amount merge this predecessor replaced, folding here
+    is amount-blind: reuniting a merchant's descriptor variants is desirable
+    regardless of price, because the subsequent amount clustering (not the token
+    set) is what separates two differently-priced plans at the same merchant.
     """
-    by_amount: dict[int, list[frozenset[str]]] = {}
-    for amount_cents, tokens in buckets:
-        by_amount.setdefault(amount_cents, []).append(tokens)
-
-    merged: dict[tuple[int, frozenset[str]], list[_Charge]] = {}
-    for amount_cents, token_sets in by_amount.items():
-        for tokens in token_sets:
-            supersets = [s for s in token_sets if s != tokens and tokens < s]
-            # Keep only the maximal supersets (those under no other superset).
-            maximal = [s for s in supersets if not any(s < other for other in supersets)]
-            root = maximal[0] if len(maximal) == 1 else tokens
-            merged.setdefault((amount_cents, root), []).extend(
-                buckets[(amount_cents, tokens)]
-            )
+    token_sets = list(by_tokens.keys())
+    merged: dict[frozenset[str], list[_Charge]] = {}
+    for tokens in token_sets:
+        supersets = [s for s in token_sets if s != tokens and tokens < s]
+        # Keep only the maximal supersets (those under no other superset).
+        maximal = [s for s in supersets if not any(s < other for other in supersets)]
+        root = maximal[0] if len(maximal) == 1 else tokens
+        merged.setdefault(root, []).extend(by_tokens[tokens])
     return merged
+
+
+def _amount_clusters(members: list["_Charge"]) -> list[list["_Charge"]]:
+    """Partition charges that already share a merchant identity into clusters of
+    near-equal amount, so a stable price that wobbles by a cent or two stays one
+    stream instead of splitting below the occurrence threshold.
+
+    Greedy single pass over amount-sorted charges. A charge joins the current
+    cluster only if doing so keeps the cluster's *total* span (max minus min)
+    within ``max(flat, pct * cluster median)`` — complete-linkage, not distance
+    to a running median. Complete-linkage matters because a running-median test
+    lets a monotonic run chain arbitrarily far (each step within tolerance of a
+    median that keeps re-centering), collapsing two genuinely distinct prices
+    into one cluster whose median then matches neither charge. Capping the span
+    guarantees every member is within the tolerance of every other, so the
+    cluster's median is a faithful representative amount. Because the input is a
+    single merchant, distinct plans/tiers (e.g. $21.49 vs $214.90) still fall
+    into separate clusters while penny jitter around one price stays together.
+    """
+    if not members:
+        return []
+    ordered = sorted(members, key=lambda c: c.amount_cents)
+    clusters: list[list[_Charge]] = [[ordered[0]]]
+    for charge in ordered[1:]:
+        current = clusters[-1]
+        cluster_min = current[0].amount_cents  # input is amount-sorted ascending
+        median_cents = _median([c.amount_cents for c in current])
+        tolerance = max(
+            _CANDIDATE_AMOUNT_TOL_CENTS,
+            round(_CANDIDATE_AMOUNT_TOL_PCT * median_cents),
+        )
+        if charge.amount_cents - cluster_min <= tolerance:
+            current.append(charge)
+        else:
+            clusters.append([charge])
+    return clusters
+
+
+def _recurring_subgroups(
+    cluster: list["_Charge"], min_occurrences: int
+) -> list[list["_Charge"]]:
+    """Phase-2 keep test for one amount cluster: return the member groups to emit
+    as candidates (empty list = nothing recurring here).
+
+    The pre-broadening detector grouped on exact cents, so any *distinct exact
+    amount* that recurs on its own (legacy bands, no CV guard, no annual-at-2) is
+    a stream the old code surfaced. Those exact streams are computed FIRST and, if
+    any exist, are ALWAYS emitted: a legacy exact stream must never be masked by a
+    nearby in-tolerance charge that the amount grouping happened to pull into the
+    same cluster. The CV guard is deliberately not applied to them — the old code
+    emitted them regardless of spacing regularity.
+
+    The whole-cluster amount-tolerant recovery grouping (broader/extra cadence
+    bands, 2-occurrence annual maturity, WITH the CV guard) is the genuinely new
+    capability. It runs:
+
+    * on the whole cluster when NO exact amount recurs on its own — this groups a
+      single price that wobbles a cent or two across postings into one stream; or
+    * only on the members NOT claimed by any legacy stream otherwise — so the new
+      matching can still surface a jittery leftover stream without ever dropping,
+      splitting, or re-cadencing a legacy exact stream.
+
+    Because legacy streams partition the cluster by exact amount and recovery runs
+    only on the unclaimed remainder, no charge is ever emitted in two groups.
+    """
+    by_amount: dict[int, list[_Charge]] = {}
+    for member in cluster:
+        by_amount.setdefault(member.amount_cents, []).append(member)
+    legacy_streams: list[list[_Charge]] = []
+    claimed_tids: set = set()
+    for amount_cents in sorted(by_amount):
+        subset = by_amount[amount_cents]
+        if _recurs(
+            subset,
+            min_occurrences,
+            bands=_LEGACY_CADENCE_BANDS,
+            annual_matures_at_two=False,
+        ):
+            legacy_streams.append(subset)
+            claimed_tids.update(m.tid for m in subset)
+    if not legacy_streams:
+        if _recurs(cluster, min_occurrences, max_cv=_MAX_INTERVAL_CV):
+            return [cluster]
+        return []
+    subgroups = list(legacy_streams)
+    leftover = [m for m in cluster if m.tid not in claimed_tids]
+    if leftover and _recurs(leftover, min_occurrences, max_cv=_MAX_INTERVAL_CV):
+        subgroups.append(leftover)
+    return subgroups
 
 
 # Structural payment/banking tokens that are never a merchant identity on their
@@ -843,11 +1039,11 @@ def _candidate_new(
     expected-missing matching); those are excluded here so candidate detection is
     scoped strictly to the requested window.
     """
-    # Bucket surviving charges by (amount, merchant-identity token set). Grouping
-    # on the identity tokens (not the display key) means a merchant named only in
-    # the payee under a numeric/junk description still groups, and two distinct
-    # merchants that merely share a generic description are kept apart.
-    buckets: dict[tuple[int, frozenset[str]], list[_Charge]] = {}
+    # Keep only the charges eligible to become a NEW candidate: inside the
+    # window, carrying a merchant identity, not already consumed by a tracked
+    # bill, and not suppressed by a tracked keyword. (Identity/suppression rules
+    # unchanged from the exact-bucket predecessor.)
+    kept: list[_Charge] = []
     for charge in charges:
         if charge.tid in consumed:
             continue
@@ -867,49 +1063,74 @@ def _candidate_new(
         # substring) so only a genuine merchant overlap suppresses it.
         if any(ts <= charge.match_tokens for ts in tracked_token_sets):
             continue
-        buckets.setdefault((charge.amount_cents, charge.match_tokens), []).append(charge)
+        kept.append(charge)
 
-    # Two-phase grouping so that a merge can only ever *help* (defragment a
-    # split merchant), never *demote* one. Phase 1: any bucket that already meets
-    # the occurrence threshold with a recurring cadence is emitted on its own and
-    # is never folded into a superset (folding an off-cadence remnant in could
-    # otherwise corrupt its cadence and hide it). Phase 2: only the remaining
-    # sub-threshold buckets are subset-merged, and a merged group is kept only if
-    # it now recurs — so a one-off remnant that fails to reunite a real merchant
-    # simply drops out instead of faking or hiding a candidate.
-    groups: dict[tuple[int, frozenset[str]], list[_Charge]] = {}
-    pending: dict[tuple[int, frozenset[str]], list[_Charge]] = {}
-    for key, members in buckets.items():
-        if _recurs(members, min_occurrences):
-            groups[key] = members
-        else:
-            pending[key] = members
-    for key, members in _merge_subset_buckets(pending).items():
-        if _recurs(members, min_occurrences):
-            groups.setdefault(key, []).extend(members)
+    # Two-phase grouping designed so the broadening can only ever ADD streams,
+    # never drop or change one the pre-broadening detector already surfaced.
+    #
+    # The old detector surfaced a stream when charges sharing ONE exact amount
+    # (across descriptor variants) had a median gap in the legacy cadence bands
+    # and enough occurrences — with no regularity (CV) guard. We must keep every
+    # one of those. The broadening ADDS: wider/extra cadence bands, 2-occurrence
+    # annual maturity, and amount-tolerant clustering (a price that wobbles by a
+    # cent or two stays one stream) — but those additions are gated by the CV
+    # guard so the looser matching cannot admit a merely habitual merchant.
+    #
+    # Phase 1 — lock exact streams that qualify under the LEGACY test verbatim
+    # (legacy bands, no CV, no annual-at-2). Locked charges are removed from
+    # further grouping so nothing they contain can be regrouped or double-counted.
+    #
+    # Phase 2 — regroup the leftovers by merchant identity (`_merge_identity`
+    # reunites descriptor variants of one merchant), split each identity into
+    # near-equal-amount clusters, and keep a cluster when it qualifies under
+    # EITHER path: the legacy test (only for a cluster at a single exact amount —
+    # this recovers an exact stream the old code surfaced but that phase 1 missed
+    # because descriptor fragmentation kept each exact bucket below the
+    # threshold; the CV guard must NOT apply here or an irregular-but-real stream
+    # the old code emitted would be lost), OR the broadened test with the CV
+    # guard (the genuinely new capability — wider cadences and amount tolerance,
+    # regularity-checked).
+    groups: list[tuple[frozenset[str], list[_Charge]]] = []
+    claimed: set[str] = set()
+    exact_buckets: dict[tuple[int, frozenset[str]], list[_Charge]] = {}
+    for charge in kept:
+        exact_buckets.setdefault(
+            (charge.amount_cents, charge.match_tokens), []
+        ).append(charge)
+    for (_amount_cents, tokens), members in exact_buckets.items():
+        if _recurs(
+            members,
+            min_occurrences,
+            bands=_LEGACY_CADENCE_BANDS,
+            annual_matures_at_two=False,
+        ):
+            groups.append((tokens, members))
+            claimed.update(m.tid for m in members)
+
+    by_tokens: dict[frozenset[str], list[_Charge]] = {}
+    for charge in kept:
+        if charge.tid in claimed:
+            continue
+        by_tokens.setdefault(charge.match_tokens, []).append(charge)
+    for tokens, members in _merge_identity(by_tokens).items():
+        for cluster in _amount_clusters(members):
+            for subgroup in _recurring_subgroups(cluster, min_occurrences):
+                groups.append((tokens, subgroup))
 
     candidates: list[dict] = []
-    for (amount_cents, tokens), members in groups.items():
+    for tokens, members in groups:
         dates, median_gap, cadence = _summarize_group(members)
+        amount_cents = round(_median([m.amount_cents for m in members]))
         merchant_key = " ".join(sorted(tokens))
         # The stable match key is the identity tokens shared by *every* charge in
         # the group: it is a subset of each member, so it is guaranteed to match
         # every grouped charge (the audit matches a keyword by token-subset) on
         # the group's own billing day, and it drops per-charge volatile tokens
-        # (auth codes, store ids) that appear on only some rows. It is derived
-        # only from the group's own recurring members — never widened by a
-        # sub-threshold sibling at the same amount, because doing so can (a)
-        # collapse two distinct same-amount merchants that share a generic prefix
-        # (e.g. "POS PURCHASE / HULU" and "POS PURCHASE / DISNEY") down to the
-        # bare "pos purchase", which then false-matches unrelated charges, and (b)
-        # pin a keyword to a sibling charge that posts on a different day than the
-        # group, producing a false "missing" the keyword-suppression would then
-        # hide. A merchant that genuinely changes its descriptor surfaces as a new
-        # candidate in the audit rather than being mis-pinned here. When the group
-        # itself has no token common to all members (a genuinely disjoint cluster),
-        # this is empty and the merchant cannot be pinned by any single subset
-        # keyword — the caller skips auto-tracking it rather than fabricate a
-        # keyword that would miss the merchant's own charges and cry "missing".
+        # (auth codes, store ids) that appear on only some rows. When the group
+        # has no token common to all members (a genuinely disjoint cluster), this
+        # is empty and the merchant cannot be pinned by any single subset keyword
+        # — the caller skips auto-tracking it rather than fabricate a keyword that
+        # would miss the merchant's own charges and cry "missing".
         shared = frozenset.intersection(*(m.match_tokens for m in members))
         match_key = " ".join(sorted(shared))
         candidates.append(
@@ -1177,6 +1398,7 @@ def detect_subscriptions(
     )
     bills: list[dict] = []
     skipped: list[dict] = []
+    billable: list[dict] = []
     for cand in candidates:
         if cand["cadence"] != "monthly":
             skipped.append(
@@ -1215,15 +1437,49 @@ def detect_subscriptions(
                 }
             )
             continue
+        billable.append(cand)
+
+    # Two monthly candidates that resolve to the SAME match keyword cannot both
+    # become bills: one keyword cannot route a future charge to two different
+    # bills, so a second same-keyword bill would double-count the merchant's
+    # recurring spend while one bill perpetually reports a missing occurrence.
+    # This happens when a single subscription's price steps within tolerance
+    # mid-window (leaving two exact streams at one merchant) or when a merchant
+    # genuinely runs two look-alike plans. Keep the most-recent price as the bill
+    # and surface the rest for the user to resolve as a price change or a separate
+    # subscription — the same treatment an already-tracked keyword's price
+    # mismatch receives below. Dict insertion order (following the sorted
+    # candidate list) keeps bill output deterministic.
+    by_match: dict[str, list[dict]] = {}
+    for cand in billable:
+        by_match.setdefault(cand["match_key"], []).append(cand)
+    for group in by_match.values():
+        primary = max(group, key=lambda c: (c["last_seen"], c["amount"]))
         bills.append(
             {
-                "name": cand["merchant"],
-                "match": cand["match_key"],
-                "amount": cand["amount"],
+                "name": primary["merchant"],
+                "match": primary["match_key"],
+                "amount": primary["amount"],
                 "cadence": "monthly",
-                "day": date.fromisoformat(cand["last_seen"]).day,
+                "day": date.fromisoformat(primary["last_seen"]).day,
             }
         )
+        for other in group:
+            if other is primary:
+                continue
+            skipped.append(
+                {
+                    "merchant": other["merchant"],
+                    "cadence": other["cadence"],
+                    "kind": "needs_review",
+                    "reason": (
+                        f"a recurring charge of ${other['amount']} matches the "
+                        f"same keyword as a proposed ${primary['amount']} monthly "
+                        f"bill for {primary['merchant']} — review whether this is a "
+                        "price change or a separate subscription"
+                    ),
+                }
+            )
     # A recurring charge that shares a tracked keyword but posts at a different
     # price is not a "new merchant" (it's suppressed above) yet must not vanish:
     # surface it for review so the user can update the bill amount or add a second
