@@ -20,6 +20,7 @@ See design: [`docs/design/webui-date-navigation.md`](../design/webui-date-naviga
 | INV-WEBUI-003 | Last tab is persisted/restored via `localStorage` key `fmcp.lastTab` | structural | `tests/test_webui_design_guards.py::test_last_tab_is_persisted_to_localstorage` |
 | INV-WEBUI-004 | Embedded UI script is syntactically valid JavaScript | structural | `tests/test_webui_design_guards.py::test_embedded_script_is_valid_javascript` |
 | INV-WEBUI-005 | Date helpers compute correct month bounds and wrap year boundaries | behavioral | `tests/test_webui_design_guards.py::test_date_helpers_compute_correct_bounds_and_year_wrap` |
+| INV-WEBUI-006 | When Spending's active subtab groups by month, its navigator steps by year and scopes to whole-calendar-year bounds (`YYYY-01-01`..`YYYY-12-31`) | behavioral | `tests/test_webui_design_guards.py::test_year_navigator_wiring_resolves_year_bounds_for_month_subtab` |
 
 ## Queries (`src/finance_mcp/queries.py`)
 

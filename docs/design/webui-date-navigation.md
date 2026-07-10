@@ -30,7 +30,10 @@ further friction points:
    range) is one click away — not the default clutter.
 3. **Spending**'s `group_by` becomes a row of **subtabs**
    (`category / account / envelope / org / month`) instead of a dropdown, and
-   the chosen grouping is remembered.
+   the chosen grouping is remembered. When the **`month`** grouping is active,
+   grouping by month within a single-month window is meaningless, so the
+   navigator switches to **year** granularity (‹ YYYY ›, whole-calendar-year
+   bounds) instead of month granularity.
 4. The UI **remembers the last tab** the user was on across reloads.
 5. **Audit-window** tabs (Subscriptions, Allocation) load populated by default
    without being forced into a single month.
@@ -119,6 +122,10 @@ Enforcement truth lives in the invariant register
 - **INV-WEBUI-005** (behavioral) — The date helpers compute correct bounds:
   a month resolves to its true first/last day, and stepping crosses year
   boundaries correctly (Jan ‹ → Dec of prior year; Dec › → Jan of next year).
+- **INV-WEBUI-006** (behavioral) — When Spending's active subtab groups by
+  month, the navigator steps by **year** and scopes to whole-calendar-year
+  bounds (`YYYY-01-01`..`YYYY-12-31`); the summary tab declares this via
+  `subtabs:{..., yearNav:"month"}`.
 - **INV-QUERIES-001** (behavioral) — `filter_transactions` treats a bare
   `YYYY-MM-DD` `end_date` as inclusive through the end of that day, so a
   transaction stored at noon on the last day of the range is returned.

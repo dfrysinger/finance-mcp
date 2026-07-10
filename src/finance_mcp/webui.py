@@ -671,7 +671,7 @@ const TABS = [
       {k:"limit",type:"number",def:200} ] },
   { id:"summary",       label:"Spending",
       range:{start:"start_date",end:"end_date"},
-      subtabs:{k:"group_by",opts:["category","account","envelope","org","month"]},
+      subtabs:{k:"group_by",opts:["category","account","envelope","org","month"],yearNav:"month"},
       filters:[
       {k:"exclude_income",type:"bool",label:"exclude income",def:true} ] },
   { id:"networth",      label:"Net worth",     filters:[] },
@@ -803,6 +803,12 @@ function shiftMonth(st, delta) {
   while (m > 11) { m -= 12; y++; }
   st.m = m; st.y = y;
 }
+// Whole-calendar-year bounds, used when a tab groups by month (grouping by
+// month only makes sense across a span of months, so its navigator steps by
+// year rather than by month).
+function yearBounds(y) {
+  return { start: y + "-01-01", end: y + "-12-31", label: String(y) };
+}
 function setHidden(wrap, key, val) {
   let el = $("f_" + key);
   if (!el) { el = document.createElement("input"); el.type = "hidden"; el.id = "f_" + key; wrap.appendChild(el); }
@@ -830,8 +836,24 @@ function renderSubtabs(t, wrap) {
     b.textContent = o;
     if (o === st.value) b.classList.add("active");
     b.onclick = () => {
+      const prev = st.value;
       st.value = o;
       try { localStorage.setItem("fmcp.sub." + t.id, o); } catch (e) {}
+      // A yearNav tab's navigator granularity (month vs year) depends on the
+      // active subtab, so only a subtab change that crosses the month<->year
+      // boundary needs the navigator rebuilt. Rebuild only on that crossing,
+      // and carry manual filter values across the rebuild so switching subtabs
+      // never resets user-entered filters (e.g. exclude_income).
+      const crosses = t.subtabs.yearNav &&
+        ((prev === t.subtabs.yearNav) !== (o === t.subtabs.yearNav));
+      if (crosses) {
+        const saved = {};
+        for (const f of t.filters) { const el = $("f_" + f.k); if (el) saved[f.k] = el.value; }
+        buildFilters();
+        for (const f of t.filters) { const el = $("f_" + f.k); if (el && f.k in saved) el.value = saved[f.k]; }
+        load();
+        return;
+      }
       for (const bb of buttons) bb.classList.toggle("active", bb.textContent === o);
       setHidden(wrap, t.subtabs.k, o);
       load();
@@ -843,12 +865,17 @@ function renderSubtabs(t, wrap) {
 }
 function renderMonthNav(t, wrap) {
   const st = navFor(t);
+  // Year granularity when the active subtab groups by month (see yearBounds).
+  const yearMode = !!(t.subtabs && t.subtabs.yearNav && subState(t).value === t.subtabs.yearNav);
   const nav = document.createElement("div"); nav.className = "monthnav";
   wrap.appendChild(nav);
   function resolveHidden() {
     if (st.mode === "custom") {
       if (t.range) { setHidden(wrap, t.range.start, st.custom.start); setHidden(wrap, t.range.end, st.custom.end); }
       if (t.month) { setHidden(wrap, t.month, st.custom.start ? st.custom.start.slice(0,7) : ""); }
+    } else if (yearMode) {
+      const b = yearBounds(st.y);
+      if (t.range) { setHidden(wrap, t.range.start, b.start); setHidden(wrap, t.range.end, b.end); }
     } else {
       const b = monthBounds(st.y, st.m);
       if (t.range) { setHidden(wrap, t.range.start, b.start); setHidden(wrap, t.range.end, b.end); }
@@ -881,17 +908,26 @@ function renderMonthNav(t, wrap) {
       nav.append(c, cal, back);
     } else {
       const prev = document.createElement("button"); prev.className = "arrow";
-      prev.title = "Previous month"; prev.textContent = "\u2039";
       const next = document.createElement("button"); next.className = "arrow";
-      next.title = "Next month"; next.textContent = "\u203A";
       const lbl = document.createElement("span"); lbl.className = "mlabel";
-      lbl.textContent = monthBounds(st.y, st.m).label;
-      prev.onclick = () => { shiftMonth(st, -1); resolveHidden(); draw(); load(); };
-      next.onclick = () => { shiftMonth(st, 1); resolveHidden(); draw(); load(); };
+      if (yearMode) {
+        prev.title = "Previous year"; prev.textContent = "\u2039";
+        next.title = "Next year"; next.textContent = "\u203A";
+        lbl.textContent = yearBounds(st.y).label;
+        prev.onclick = () => { st.y -= 1; resolveHidden(); draw(); load(); };
+        next.onclick = () => { st.y += 1; resolveHidden(); draw(); load(); };
+      } else {
+        prev.title = "Previous month"; prev.textContent = "\u2039";
+        next.title = "Next month"; next.textContent = "\u203A";
+        lbl.textContent = monthBounds(st.y, st.m).label;
+        prev.onclick = () => { shiftMonth(st, -1); resolveHidden(); draw(); load(); };
+        next.onclick = () => { shiftMonth(st, 1); resolveHidden(); draw(); load(); };
+      }
       cal.onclick = () => {
         st.mode = "custom";
         if (!st.custom.start || !st.custom.end) {
-          const b = monthBounds(st.y, st.m); st.custom.start = b.start; st.custom.end = b.end;
+          const b = yearMode ? yearBounds(st.y) : monthBounds(st.y, st.m);
+          st.custom.start = b.start; st.custom.end = b.end;
         }
         resolveHidden(); draw(); load();
       };
