@@ -123,6 +123,116 @@ def test_last_seen_reports_most_recent_match():
     assert march["last_seen"] == "2026-02-10"
 
 
+def test_missing_uncovered_leading_edge_is_suppressed():
+    # An occurrence whose in-tolerance payment window begins before our earliest
+    # transaction is unknowable, not missing: an early payment could have posted
+    # before our data starts. This is the just-started-bill case (window opens
+    # days before the first charge) that showed "missing ... last seen never"
+    # beside a real tracked last-seen. earliest_txn is set by an UNRELATED charge
+    # so the boundary is data coverage, not the bill's own first charge.
+    cfg = _config([CARD], [_bill("MyChart", "Card", 50.00, 25, match="MYCHART")])
+    txns = [
+        _txn("coffee", "card", "-4.00", on="2026-02-21", desc="COFFEE SHOP"),
+        _txn("t1", "card", "-50.00", on="2026-03-25", desc="MYCHART"),
+        _txn("t2", "card", "-50.00", on="2026-04-25", desc="MYCHART"),
+        _txn("t3", "card", "-50.00", on="2026-05-25", desc="MYCHART"),
+    ]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 2, 21), end=date(2026, 5, 31)
+    )
+    tracked = next(t for t in report["tracked"] if t["name"] == "MyChart")
+    assert tracked["last_seen"] == "2026-05-25"
+    # Feb 25's window [Feb 18, ...] begins before earliest_txn (Feb 21): suppressed.
+    missing_dates = _names(report["expected_missing"], "expected_date")
+    assert "2026-02-25" not in missing_dates, missing_dates
+
+
+def test_missing_covered_leading_edge_reported_when_window_narrower_than_archive():
+    # The default UI case: a narrow trailing audit window over an archive that
+    # holds older history. earliest_txn (Nov) precedes window_start (Jan), so the
+    # coverage floor is the archive, not the requested window. A skipped Jan
+    # payment whose window [late Dec, mid Jan] is fully covered by that older data
+    # MUST still be reported — suppressing it (comparing to window_start) would
+    # silently hide a genuine miss in the high-stakes alert.
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 5, match="NETFLIX")])
+    txns = [
+        _txn("n1", "card", "-15.99", on="2025-11-05", desc="NETFLIX"),
+        _txn("n2", "card", "-15.99", on="2025-12-05", desc="NETFLIX"),
+        # January skipped.
+        _txn("n3", "card", "-15.99", on="2026-02-05", desc="NETFLIX"),
+        _txn("n4", "card", "-15.99", on="2026-03-05", desc="NETFLIX"),
+    ]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 1, 1), end=date(2026, 3, 31)
+    )
+    jan = next(
+        (m for m in report["expected_missing"] if m["expected_date"] == "2026-01-05"),
+        None,
+    )
+    assert jan is not None, _names(report["expected_missing"], "expected_date")
+    # A reported miss never claims a last_seen after its own due date.
+    if jan["last_seen"] is not None:
+        assert jan["last_seen"] <= jan["expected_date"]
+
+
+def test_missing_covered_occurrence_is_reported_even_without_prior_charge():
+    # A covered occurrence with no charge IS a real miss and must be reported,
+    # even when it precedes the bill's first observed charge — the data covers
+    # its whole payment window, so its absence is a proven gap, not unknowable.
+    # Guards against hiding genuine early misses.
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
+    txns = [
+        _txn("coffee", "card", "-4.00", on="2026-01-01", desc="COFFEE SHOP"),
+        _txn("t2", "card", "-15.99", on="2026-02-10", desc="NETFLIX"),
+        _txn("t3", "card", "-15.99", on="2026-03-10", desc="NETFLIX"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    missing_dates = _names(report["expected_missing"], "expected_date")
+    # Jan 10's window [Jan 3, ...] is fully covered (data from Jan 1) and unpaid.
+    assert "2026-01-10" in missing_dates, missing_dates
+
+
+def test_missing_never_reports_last_seen_after_its_due_date():
+    # A genuine mid-history skip (charge Jan and Mar, Feb skipped) IS reported
+    # missing, and its last_seen is the prior charge (Jan) — never a later charge
+    # that postdates the gap. Pins the invariant that a missing row's last_seen
+    # is always on or before its own expected_date.
+    cfg = _config([CARD], [_bill("Netflix", "Card", 15.99, 10, match="NETFLIX")])
+    txns = [
+        _txn("t1", "card", "-15.99", on="2026-01-10", desc="NETFLIX"),
+        _txn("t3", "card", "-15.99", on="2026-03-10", desc="NETFLIX"),
+    ]
+    report = subscription.subscription_audit(cfg, txns, start=WIN_START, end=WIN_END)
+    feb = next(m for m in report["expected_missing"] if m["expected_date"] == "2026-02-10")
+    assert feb["last_seen"] == "2026-01-10"
+    for m in report["expected_missing"]:
+        if m["last_seen"] is not None:
+            assert m["last_seen"] <= m["expected_date"], (
+                f"missing {m['expected_date']} claims a later last_seen {m['last_seen']}"
+            )
+
+
+def test_missing_last_seen_never_postdates_due_under_large_tolerance():
+    # With a large (but valid) day_tolerance, greedy earliest-first matching can
+    # assign a later charge to an earlier occurrence: a day-31 bill with only a
+    # Mar 1 charge lets the Jan 31 occurrence consume it (drift 29 <= 31). The
+    # Feb occurrence is then missing, and its last_seen MUST NOT report the Mar 1
+    # charge that postdates it — that self-contradictory row ("missing Feb, last
+    # seen March") is exactly what a missing row's last_seen must never show.
+    cfg = _config([CARD], [_bill("Rent", "Card", 100.00, 31, match="RENT")])
+    txns = [_txn("c1", "card", "-100.00", on="2026-03-01", desc="RENT")]
+    report = subscription.subscription_audit(
+        cfg, txns, start=date(2026, 1, 1), end=date(2026, 4, 30), day_tolerance=31
+    )
+    assert report["expected_missing"], "expected at least one missing occurrence"
+    for m in report["expected_missing"]:
+        if m["last_seen"] is not None:
+            assert m["last_seen"] < m["expected_date"], (
+                f"missing {m['expected_date']} claims last_seen {m['last_seen']} "
+                "on or after its own due date"
+            )
+
+
 # --- matching modes (keyword vs envelope) ------------------------------------
 
 

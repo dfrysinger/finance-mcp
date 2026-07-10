@@ -530,6 +530,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .filters input, .filters select { background:var(--panel); color:var(--fg);
         border:1px solid var(--line); border-radius:6px; padding:5px 7px; font-size:13px; }
   .filters input[type=text], .filters input[type=date] { min-width:130px; }
+  .filters label.check { flex-direction:row; align-items:center; gap:6px; font-size:13px;
+                         color:var(--fg); padding-bottom:5px; cursor:pointer; }
+  .filters label.check input[type=checkbox] { width:auto; margin:0; cursor:pointer; }
   .subtabs { display:flex; gap:4px; width:100%; margin-bottom:4px; }
   .subtabs button { background:transparent; color:var(--muted); border:1px solid var(--line);
         border-radius:6px; padding:4px 12px; cursor:pointer; font-size:12px; text-transform:capitalize; }
@@ -671,7 +674,7 @@ const TABS = [
       {k:"limit",type:"number",def:200} ] },
   { id:"summary",       label:"Spending",
       range:{start:"start_date",end:"end_date"},
-      subtabs:{k:"group_by",opts:["category","account","envelope","org","month"],yearNav:"month"},
+      subtabs:{k:"group_by",opts:["envelope","category","account","org","month"],yearNav:"month"},
       filters:[
       {k:"exclude_income",type:"bool",label:"exclude income",def:true} ] },
   { id:"networth",      label:"Net worth",     filters:[] },
@@ -848,9 +851,9 @@ function renderSubtabs(t, wrap) {
         ((prev === t.subtabs.yearNav) !== (o === t.subtabs.yearNav));
       if (crosses) {
         const saved = {};
-        for (const f of t.filters) { const el = $("f_" + f.k); if (el) saved[f.k] = el.value; }
+        for (const f of t.filters) { const el = $("f_" + f.k); if (el) saved[f.k] = filterVal(el); }
         buildFilters();
-        for (const f of t.filters) { const el = $("f_" + f.k); if (el && f.k in saved) el.value = saved[f.k]; }
+        for (const f of t.filters) { const el = $("f_" + f.k); if (el && f.k in saved) setFilterVal(el, saved[f.k]); }
         load();
         return;
       }
@@ -942,20 +945,32 @@ function buildFilters() {
   const wrap = $("filters"); wrap.innerHTML = "";
   if (current.subtabs) renderSubtabs(current, wrap);
   if (current.range || current.month) renderMonthNav(current, wrap);
-  let hasManual = false;
+  // A bool filter is an instant checkbox (applies on change); every other
+  // filter is deferred and only takes effect on the Load button. The button is
+  // rendered only when at least one deferred filter exists, so a tab whose only
+  // manual filter is a toggle needs no Load click.
+  let hasLoadable = false;
   for (const f of current.filters) {
-    hasManual = true;
     const lab = document.createElement("label");
-    lab.textContent = f.label || f.k;
     let el;
+    if (f.type === "bool") {
+      lab.className = "check";
+      el = document.createElement("input");
+      el.type = "checkbox";
+      el.checked = f.def !== false;
+      el.onchange = load;
+      el.id = "f_" + f.k;
+      lab.appendChild(el);
+      lab.appendChild(document.createTextNode(" " + (f.label || f.k)));
+      wrap.appendChild(lab);
+      continue;
+    }
+    hasLoadable = true;
+    lab.textContent = f.label || f.k;
     if (f.type === "select") {
       el = document.createElement("select");
       for (const o of f.opts)
         el.appendChild(new Option(o === "" ? "(all)" : o, o));
-    } else if (f.type === "bool") {
-      el = document.createElement("select");
-      el.appendChild(new Option("yes","true")); el.appendChild(new Option("no","false"));
-      el.value = f.def === false ? "false" : "true";
     } else {
       el = document.createElement("input");
       el.type = f.type === "month" ? "month" : f.type;
@@ -966,11 +981,24 @@ function buildFilters() {
     el.id = "f_" + f.k;
     lab.appendChild(el); wrap.appendChild(lab);
   }
-  if (hasManual) {
+  if (hasLoadable) {
     const go = document.createElement("button");
     go.className = "go"; go.textContent = "Load"; go.onclick = load;
     wrap.appendChild(go);
   }
+}
+// Read/write a filter control's logical value uniformly. A bool checkbox
+// carries its state in ``checked`` (its ``value`` is the static "on"), so it
+// needs special handling wherever filter state is serialized or preserved.
+function filterVal(el) {
+  if (!el) return undefined;
+  if (el.type === "checkbox") return el.checked ? "true" : "false";
+  return el.value;
+}
+function setFilterVal(el, v) {
+  if (!el) return;
+  if (el.type === "checkbox") el.checked = (v === "true");
+  else el.value = v;
 }
 function collectParams() {
   const p = new URLSearchParams();
@@ -980,7 +1008,7 @@ function collectParams() {
   if (current.month) keys.push(current.month);
   for (const f of current.filters) keys.push(f.k);
   for (const k of keys) {
-    const v = ($("f_" + k) || {}).value;
+    const v = filterVal($("f_" + k));
     if (v !== undefined && v !== "") p.set(k, v);
   }
   return p.toString();
@@ -1190,6 +1218,13 @@ const RENDER = {
       {label:"Expected",num:true,money:true,get:r=>r.expected_amount},
       {label:"Due",get:r=>r.expected_date},
       {label:"Last seen",get:r=>r.last_seen||"never"},
+      {label:"",html:true,get:r=>{
+        // Reuse the tracked-row Mark component: a missing charge always belongs
+        // to a tracked bill, matched here by name so the user can mark its
+        // lifecycle without hunting for it in the tracked list above.
+        const i = _trackedRows.findIndex(t=>t.name===r.name);
+        return i>=0 ? `<button class="mini" onclick="openMark(${i})">Mark&hellip;</button>` : "";
+      }},
     ]);
     out += `<h2>Untracked recurring candidates</h2>`;
     out += table(d.candidate_new||[], [
