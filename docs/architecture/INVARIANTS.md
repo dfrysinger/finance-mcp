@@ -21,6 +21,9 @@ See design: [`docs/design/webui-date-navigation.md`](../design/webui-date-naviga
 | INV-WEBUI-004 | Embedded UI script is syntactically valid JavaScript | structural | `tests/test_webui_design_guards.py::test_embedded_script_is_valid_javascript` |
 | INV-WEBUI-005 | Date helpers compute correct month bounds and wrap year boundaries | behavioral | `tests/test_webui_design_guards.py::test_date_helpers_compute_correct_bounds_and_year_wrap` |
 | INV-WEBUI-006 | When Spending's active subtab groups by month, its navigator steps by year and scopes to whole-calendar-year bounds (`YYYY-01-01`..`YYYY-12-31`) | behavioral | `tests/test_webui_design_guards.py::test_year_navigator_wiring_resolves_year_bounds_for_month_subtab` |
+| INV-WEBUI-007 | Spending's `group_by` subtabs list `envelope` first, so Envelope is the leftmost subtab and the default grouping when no prior selection is stored | structural | `tests/test_webui_design_guards.py::test_spending_defaults_to_envelope_grouping` |
+| INV-WEBUI-008 | The Subscriptions "missing expected charges" table reuses the tracked-row Mark control, resolving each missing row to its tracked bill by name | structural | `tests/test_webui_design_guards.py::test_missing_charges_reuse_tracked_mark_control` |
+| INV-WEBUI-009 | A `bool` filter renders as a checkbox that applies instantly on change (`onchange` = `load`); a tab whose only manual filter is a toggle renders no Load button | behavioral | `tests/test_webui_design_guards.py::test_bool_filters_are_instant_checkboxes` |
 
 ## Queries (`src/finance_mcp/queries.py`)
 

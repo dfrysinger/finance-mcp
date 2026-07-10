@@ -292,3 +292,100 @@ def test_year_navigator_wiring_resolves_year_bounds_for_month_subtab():
     )
     res = _run_node(harness)
     assert res.returncode == 0, res.stderr + res.stdout
+
+
+def test_spending_defaults_to_envelope_grouping():
+    """INV-WEBUI-007: Spending's group_by subtabs list Envelope first.
+
+    The first option is both the leftmost subtab and the default grouping when
+    no prior selection is stored (``subState`` seeds from ``opts[0]``), so this
+    single structural check pins "Envelope is the default Spending view".
+    """
+    summary = _tab_block("summary")
+    m = re.search(r'subtabs:\{k:"group_by",opts:\[(.*?)\]', summary)
+    assert m, "Spending must declare group_by subtab options"
+    first = m.group(1).split(",")[0].strip().strip('"')
+    assert first == "envelope", f"first Spending grouping must be envelope, got {first!r}"
+
+
+def test_missing_charges_reuse_tracked_mark_control():
+    """INV-WEBUI-008: the missing-charges table offers the same Mark control as
+    the tracked list, resolved to the tracked row by bill name.
+
+    A missing charge always belongs to a tracked bill; the convenience is to
+    mark it without scrolling up to find the parent. This pins that the missing
+    table maps its row to a tracked index by name and reuses ``openMark`` rather
+    than duplicating the mark modal wiring.
+    """
+    m = re.search(r'out \+= `<h2>Missing expected charges</h2>`;(.*?)\]\);', SCRIPT, re.DOTALL)
+    assert m, "SCRIPT must render a Missing expected charges table"
+    block = m.group(1)
+    assert "_trackedRows.findIndex(t=>t.name===r.name)" in block, \
+        "missing rows must resolve their tracked index by bill name"
+    assert "openMark(" in block, "missing table must reuse the openMark control"
+
+
+@_needs_node
+def test_bool_filters_are_instant_checkboxes():
+    """INV-WEBUI-009 (behavioral): a bool filter renders as a checkbox that
+    applies on change (its ``onchange`` is ``load``), starts at its declared
+    default, and reads back through ``filterVal`` as ``"true"``/``"false"``.
+
+    A tab whose only manual filter is a bool renders NO Load button (the toggle
+    is instant); a tab that also has a deferred filter (text/select/date) still
+    renders Load. This fails if the toggle reverts to a Load-gated <select> or
+    if the Load button reappears for a toggle-only tab.
+    """
+    harness = (
+        _extract_function("buildFilters")
+        + "\n"
+        + _extract_function("filterVal")
+        + "\n"
+        + textwrap.dedent(
+            """
+            const assert = (c, m) => { if (!c) { console.error("FAIL: " + m); process.exit(1); } };
+            const created = [];
+            const makeEl = () => {
+              const e = { className:"", textContent:"", type:"", value:"", id:"", checked:false,
+                placeholder:"", innerHTML:"", onclick:null, onchange:null,
+                appendChild(){}, append(){} };
+              created.push(e); return e;
+            };
+            const document = { createElement: () => makeEl(),
+                               createTextNode: (s) => ({ text:s }) };
+            const filtersWrap = { innerHTML:"", appendChild(){}, append(){} };
+            const $ = (id) => id === "filters" ? filtersWrap : null;
+            function load(){ load.calls = (load.calls || 0) + 1; }
+
+            // Toggle-only tab: instant checkbox, no Load button.
+            let current = { id:"x",
+              filters:[ {k:"exclude_income", type:"bool", label:"exclude income", def:true} ] };
+            buildFilters();
+            const cb = created.find(e => e.type === "checkbox");
+            assert(cb, "bool filter must render a checkbox");
+            assert(cb.onchange === load, "checkbox must apply on change via load()");
+            assert(cb.checked === true, "def:true checkbox starts checked");
+            assert(filterVal(cb) === "true", "checked checkbox reads as 'true'");
+            cb.checked = false;
+            assert(filterVal(cb) === "false", "unchecked checkbox reads as 'false'");
+            assert(!created.find(e => e.textContent === "Load"),
+                   "no Load button when the only manual filter is a toggle");
+
+            // Mixed tab: a deferred filter still gets a Load button; def:false
+            // bool starts unchecked.
+            created.length = 0;
+            current = { id:"y",
+              filters:[ {k:"search", type:"text"},
+                        {k:"transfers", type:"bool", label:"transfers", def:false} ] };
+            buildFilters();
+            const cb2 = created.find(e => e.type === "checkbox");
+            assert(cb2 && cb2.checked === false, "def:false checkbox starts unchecked");
+            assert(created.find(e => e.textContent === "Load"),
+                   "Load button present when a deferred filter exists");
+
+            console.log("OK");
+            """
+        )
+    )
+    res = _run_node(harness)
+    assert res.returncode == 0, res.stderr + res.stdout

@@ -477,6 +477,16 @@ def _match_tracked_bills(
     tracked: list[dict] = []
     for bill, bill_tokens in zip(config.recurring, bill_token_sets):
         last_seen: date | None = None
+        # Posting dates of every charge matched to this bill, in scan order. A
+        # missing row derives its "last seen" from this list (the most recent
+        # match strictly before that occurrence) rather than from the running
+        # ``last_seen`` above: greedy earliest-first matching can assign a charge
+        # to an EARLIER occurrence than the one it best fits (e.g. a large
+        # ``day_tolerance`` lets a March charge satisfy a January occurrence), so
+        # the running ``last_seen`` may already hold a charge that postdates a
+        # later missing occurrence. Selecting strictly-before keeps a missing
+        # row's last_seen on or before its own due date in every case.
+        matched_ons: list[date] = []
         # The amount of the charge that set ``last_seen`` (the most recent matched
         # charge). Surfaced for variable bills, whose stored ``amount_cents`` is
         # only a typical figure — the UI shows what was actually charged.
@@ -558,6 +568,7 @@ def _match_tracked_bills(
                     best, best_key = charge, cand_key
             if best is not None:
                 consumed.add(best.tid)
+                matched_ons.append(best.on)
                 if last_seen is None or best.on > last_seen:
                     last_seen = best.on
                     last_amount_cents = best.amount_cents
@@ -568,15 +579,50 @@ def _match_tracked_bills(
             # overdue; an occurrence still inside the grace window may post late.
             if (end - occ).days < grace:
                 continue
-            # A pre-window occurrence (only reachable via the status look-back)
-            # still informs status above, but the missing alert stays scoped to
-            # the requested audit window.
-            if occ < window_start:
-                continue
             # A canceled/canceling bill's absence on or after its effective date
             # is expected, not a problem — do not report it missing.
             if occ_after_cancel:
                 continue
+            # A pre-window occurrence (only reachable via the status look-back)
+            # informs status above, but the missing alert stays scoped to the
+            # requested audit window.
+            if occ < window_start:
+                continue
+            # Only assert a charge is MISSING when our data fully covers the span
+            # in which it could have posted. A charge for ``occ`` may clear as
+            # early as ``occ - day_tolerance``; we hold complete data from
+            # ``coverage_start`` — the earlier of the earliest transaction we hold
+            # and the requested window start (before the earliest transaction no
+            # charge exists; before the window start the caller queried nothing).
+            # In production these coincide, because subscription_report clamps the
+            # query start forward to the earliest transaction — but the archive is
+            # loaded whole and can begin well before a narrow trailing window, so
+            # ``earliest_txn`` (not ``window_start``) is the real coverage floor
+            # there. If the earliest-possible payment date falls before
+            # ``coverage_start`` part of the payment window lies before our data —
+            # an early payment there would be unobserved, making the occurrence's
+            # absence unknowable rather than a proven miss. This is the
+            # just-started-bill leading edge (the window opens days before the
+            # bill's first charge): reporting those occurrences as
+            # "missing … last seen never" beside a real ``tracked`` last-seen was
+            # the reported discrepancy. A genuine, fully-covered skip — including
+            # one before the bill's first observed charge — is still reported.
+            # Gated on holding data at all: with an empty archive
+            # (``earliest_txn is None``) there is no data boundary to fall before,
+            # so every in-window occurrence is still reported — the absence of any
+            # charge is itself the signal.
+            if earliest_txn is not None:
+                coverage_start = min(window_start, earliest_txn)
+                if day_tolerance > (occ - date.min).days or (
+                    occ - timedelta(days=day_tolerance)
+                ) < coverage_start:
+                    continue
+            # The most recent matched charge strictly before this occurrence.
+            # Derived from ``matched_ons`` (not the running ``last_seen``) so a
+            # charge greedily assigned to an earlier occurrence can never make a
+            # missing row report a "last seen" on or after its own due date.
+            # ``None`` -> "never" for a genuine no-prior-charge gap.
+            prior_seen = max((d for d in matched_ons if d < occ), default=None)
             expected_missing.append(
                 {
                     "name": bill.name,
@@ -584,7 +630,7 @@ def _match_tracked_bills(
                     "expected_amount": _dollars(bill.amount_cents),
                     "expected_date": occ.isoformat(),
                     "match": bill.match,
-                    "last_seen": last_seen.isoformat() if last_seen is not None else None,
+                    "last_seen": prior_seen.isoformat() if prior_seen is not None else None,
                 }
             )
         # Current status from the most recent should-have-posted occurrence: behind
