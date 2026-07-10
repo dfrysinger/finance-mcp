@@ -126,8 +126,8 @@ spurious biweekly candidate proves confusing in practice.
 
 ## Surfacing a sub-threshold subscription price step at proposal time
 
-**Tracking:** issue — "Proposed bill shows stale price during a sub-threshold
-subscription price step."
+**Tracking:** issue #8 — "Surface a sub-threshold subscription price step at
+proposal time."
 
 ### Problem
 
