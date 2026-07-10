@@ -189,3 +189,22 @@ def test_spending_summary_missing_category_is_unclassified_inflow():
     assert result["total_unclassified_inflow"] == 75.0
     assert result["net"] == 0.0
 
+
+
+def test_bare_end_date_is_inclusive_through_end_of_day():
+    # INV-QUERIES-001: a bare-date end_date must include every transaction on
+    # that day whatever its intra-day time (posted_ts is second-level; it used
+    # to parse to midnight, so a same-day row posted later was dropped). A
+    # representative midday row is included; the following day stays excluded.
+    from datetime import datetime, timezone
+
+    noon = int(datetime(2026, 6, 30, 12, 0, tzinfo=timezone.utc).timestamp())
+    next_day = int(datetime(2026, 7, 1, 0, 0, tzinfo=timezone.utc).timestamp())
+    txns = [
+        {**_txn("lastday", "ACT-main", -10.0, "Groceries"), "posted_ts": noon},
+        {**_txn("nextday", "ACT-main", -20.0, "Groceries"), "posted_ts": next_day},
+    ]
+    rows = queries.filter_transactions(txns, end_date="2026-06-30")
+    ids = {t["id"] for t in rows}
+    assert "lastday" in ids  # noon on the boundary day is included
+    assert "nextday" not in ids  # the next day is still excluded

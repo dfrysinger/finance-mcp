@@ -530,6 +530,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .filters input, .filters select { background:var(--panel); color:var(--fg);
         border:1px solid var(--line); border-radius:6px; padding:5px 7px; font-size:13px; }
   .filters input[type=text], .filters input[type=date] { min-width:130px; }
+  .subtabs { display:flex; gap:4px; width:100%; margin-bottom:4px; }
+  .subtabs button { background:transparent; color:var(--muted); border:1px solid var(--line);
+        border-radius:6px; padding:4px 12px; cursor:pointer; font-size:12px; text-transform:capitalize; }
+  .subtabs button:hover { color:var(--fg); }
+  .subtabs button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .monthnav { display:flex; align-items:center; gap:6px; width:100%; flex-wrap:wrap; }
+  .monthnav .arrow { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+        border-radius:6px; width:30px; height:30px; cursor:pointer; font-size:16px; line-height:1; padding:0; }
+  .monthnav .arrow:hover { border-color:var(--accent); }
+  .monthnav .mlabel { min-width:150px; text-align:center; font-weight:600; font-size:14px; }
+  .monthnav .cal { background:var(--panel); color:var(--muted); border:1px solid var(--line);
+        border-radius:6px; height:30px; padding:0 9px; cursor:pointer; font-size:14px; }
+  .monthnav .cal:hover, .monthnav .cal.active { border-color:var(--accent); color:var(--fg); }
+  .monthnav .custom { display:flex; align-items:center; gap:6px; }
+  .monthnav .custom input { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+        border-radius:6px; padding:4px 7px; font-size:13px; }
   button.go { background:var(--accent); color:#fff; border:none; border-radius:6px;
               padding:7px 14px; cursor:pointer; font-size:13px; height:31px; }
   button.go:hover { filter:brightness(1.1); }
@@ -631,37 +647,53 @@ INDEX_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 <script>
+// Pure date helpers (also used to seed the audit tabs' trailing-window
+// defaults, so they are defined before TABS).
+function isoDate(d) {
+  return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") +
+         "-" + String(d.getDate()).padStart(2,"0");
+}
+function todayIso() { return isoDate(new Date()); }
+// First day of the month N months before the current month.
+function monthsAgoStart(n) {
+  const d = new Date();
+  return isoDate(new Date(d.getFullYear(), d.getMonth() - n, 1));
+}
 const TABS = [
   { id:"accounts",      label:"Accounts",      filters:[] },
   { id:"redflags",      label:"Red flags",     filters:[ {k:"as_of",type:"date"} ] },
-  { id:"transactions",  label:"Transactions",  filters:[
+  { id:"transactions",  label:"Transactions",
+      range:{start:"start_date",end:"end_date"},
+      filters:[
       {k:"search",type:"text",ph:"merchant / memo"},
       {k:"category",type:"text",ph:"category"},
-      {k:"start_date",type:"date"}, {k:"end_date",type:"date"},
       {k:"include_transfers",type:"bool",label:"transfers",def:false},
       {k:"limit",type:"number",def:200} ] },
-  { id:"summary",       label:"Spending",      filters:[
-      {k:"group_by",type:"select",opts:["category","account","envelope","org","month"]},
-      {k:"start_date",type:"date"}, {k:"end_date",type:"date"},
+  { id:"summary",       label:"Spending",
+      range:{start:"start_date",end:"end_date"},
+      subtabs:{k:"group_by",opts:["category","account","envelope","org","month"]},
+      filters:[
       {k:"exclude_income",type:"bool",label:"exclude income",def:true} ] },
   { id:"networth",      label:"Net worth",     filters:[] },
   { id:"transfers",     label:"Transfers",     filters:[
       {k:"status",type:"select",opts:["","unconfirmed","inferred","confirmed","unmatched"]} ] },
-  { id:"burndown",      label:"Burn-down",     filters:[
-      {k:"month",type:"month"} ] },
+  { id:"burndown",      label:"Burn-down",     month:"month", filters:[] },
   { id:"forecast",      label:"Forecast",      filters:[
       {k:"as_of",type:"date"}, {k:"through",type:"date"} ] },
+  // Allocation and Subscriptions are multi-month audit windows, not month-scoped
+  // views: a single month can't detect a recurring cadence and would falsely
+  // report tracked bills as missing. They keep an explicit date range, defaulted
+  // to a trailing ~6 months so the view loads populated.
   { id:"allocation",    label:"Allocation",    filters:[
-      {k:"start",type:"date"}, {k:"end",type:"date"},
+      {k:"start",type:"date",def:monthsAgoStart(5)}, {k:"end",type:"date",def:todayIso()},
       {k:"day_tolerance",type:"number",def:7} ] },
   { id:"subscriptions", label:"Subscriptions", filters:[
-      {k:"start",type:"date"}, {k:"end",type:"date"},
+      {k:"start",type:"date",def:monthsAgoStart(5)}, {k:"end",type:"date",def:todayIso()},
       {k:"day_tolerance",type:"number",def:7},
       {k:"min_occurrences",type:"number",def:3} ] },
 ];
 
 let current = TABS[0];
-let DEFAULTS = {};
 const $ = (id) => document.getElementById(id);
 
 function money(v) {
@@ -747,9 +779,136 @@ async function submitMark() {
   }
 }
 
+// Per-tab month-navigator state (session-only). Every range/monthly tab starts
+// on the CURRENT calendar month; the arrows walk months and the calendar icon
+// swaps in a custom start/end range. State persists while the page is open so
+// flipping between tabs keeps your place, but a reload returns to this month.
+const NAVSTATE = {};
+function navFor(t) {
+  if (!NAVSTATE[t.id]) {
+    const n = new Date();
+    NAVSTATE[t.id] = { mode:"month", y:n.getFullYear(), m:n.getMonth(), custom:{start:"",end:""} };
+  }
+  return NAVSTATE[t.id];
+}
+function monthBounds(y, m) {
+  const start = new Date(y, m, 1), end = new Date(y, m+1, 0);
+  return { start:isoDate(start), end:isoDate(end),
+           ym: y + "-" + String(m+1).padStart(2,"0"),
+           label: start.toLocaleString(undefined, {month:"long", year:"numeric"}) };
+}
+function shiftMonth(st, delta) {
+  let m = st.m + delta, y = st.y;
+  while (m < 0) { m += 12; y--; }
+  while (m > 11) { m -= 12; y++; }
+  st.m = m; st.y = y;
+}
+function setHidden(wrap, key, val) {
+  let el = $("f_" + key);
+  if (!el) { el = document.createElement("input"); el.type = "hidden"; el.id = "f_" + key; wrap.appendChild(el); }
+  el.value = (val == null) ? "" : val;
+}
+
+// Per-tab subtab selection (e.g. Spending's group-by). Persisted so the tab
+// reopens on the same grouping it was last viewed with.
+const SUBSTATE = {};
+function subState(t) {
+  if (!SUBSTATE[t.id]) {
+    let v = t.subtabs.opts[0];
+    try { const s = localStorage.getItem("fmcp.sub." + t.id);
+          if (s && t.subtabs.opts.includes(s)) v = s; } catch (e) {}
+    SUBSTATE[t.id] = { value:v };
+  }
+  return SUBSTATE[t.id];
+}
+function renderSubtabs(t, wrap) {
+  const st = subState(t);
+  const row = document.createElement("div"); row.className = "subtabs";
+  const buttons = [];
+  for (const o of t.subtabs.opts) {
+    const b = document.createElement("button");
+    b.textContent = o;
+    if (o === st.value) b.classList.add("active");
+    b.onclick = () => {
+      st.value = o;
+      try { localStorage.setItem("fmcp.sub." + t.id, o); } catch (e) {}
+      for (const bb of buttons) bb.classList.toggle("active", bb.textContent === o);
+      setHidden(wrap, t.subtabs.k, o);
+      load();
+    };
+    buttons.push(b); row.appendChild(b);
+  }
+  wrap.appendChild(row);
+  setHidden(wrap, t.subtabs.k, st.value);
+}
+function renderMonthNav(t, wrap) {
+  const st = navFor(t);
+  const nav = document.createElement("div"); nav.className = "monthnav";
+  wrap.appendChild(nav);
+  function resolveHidden() {
+    if (st.mode === "custom") {
+      if (t.range) { setHidden(wrap, t.range.start, st.custom.start); setHidden(wrap, t.range.end, st.custom.end); }
+      if (t.month) { setHidden(wrap, t.month, st.custom.start ? st.custom.start.slice(0,7) : ""); }
+    } else {
+      const b = monthBounds(st.y, st.m);
+      if (t.range) { setHidden(wrap, t.range.start, b.start); setHidden(wrap, t.range.end, b.end); }
+      if (t.month) { setHidden(wrap, t.month, b.ym); }
+    }
+  }
+  function draw() {
+    nav.innerHTML = "";
+    const cal = document.createElement("button");
+    cal.className = "cal" + (st.mode === "custom" ? " active" : "");
+    cal.title = "Custom date range"; cal.textContent = "\uD83D\uDCC5";
+    if (st.mode === "custom") {
+      const c = document.createElement("div"); c.className = "custom";
+      if (t.range) {
+        const s = document.createElement("input"); s.type = "date"; s.value = st.custom.start;
+        const e = document.createElement("input"); e.type = "date"; e.value = st.custom.end;
+        s.onchange = () => { st.custom.start = s.value; resolveHidden(); load(); };
+        e.onchange = () => { st.custom.end = e.value; resolveHidden(); load(); };
+        c.append(s, document.createTextNode("\u2192"), e);
+      } else if (t.month) {
+        const mi = document.createElement("input"); mi.type = "month";
+        mi.value = st.custom.start ? st.custom.start.slice(0,7) : monthBounds(st.y, st.m).ym;
+        mi.onchange = () => { st.custom.start = mi.value ? mi.value + "-01" : ""; resolveHidden(); load(); };
+        c.append(mi);
+      }
+      const back = document.createElement("button"); back.className = "arrow";
+      back.title = "Back to month view"; back.textContent = "\u21A9";
+      back.onclick = () => { st.mode = "month"; resolveHidden(); draw(); load(); };
+      cal.onclick = () => { st.mode = "month"; resolveHidden(); draw(); load(); };
+      nav.append(c, cal, back);
+    } else {
+      const prev = document.createElement("button"); prev.className = "arrow";
+      prev.title = "Previous month"; prev.textContent = "\u2039";
+      const next = document.createElement("button"); next.className = "arrow";
+      next.title = "Next month"; next.textContent = "\u203A";
+      const lbl = document.createElement("span"); lbl.className = "mlabel";
+      lbl.textContent = monthBounds(st.y, st.m).label;
+      prev.onclick = () => { shiftMonth(st, -1); resolveHidden(); draw(); load(); };
+      next.onclick = () => { shiftMonth(st, 1); resolveHidden(); draw(); load(); };
+      cal.onclick = () => {
+        st.mode = "custom";
+        if (!st.custom.start || !st.custom.end) {
+          const b = monthBounds(st.y, st.m); st.custom.start = b.start; st.custom.end = b.end;
+        }
+        resolveHidden(); draw(); load();
+      };
+      nav.append(prev, lbl, next, cal);
+    }
+  }
+  resolveHidden();
+  draw();
+}
+
 function buildFilters() {
   const wrap = $("filters"); wrap.innerHTML = "";
+  if (current.subtabs) renderSubtabs(current, wrap);
+  if (current.range || current.month) renderMonthNav(current, wrap);
+  let hasManual = false;
   for (const f of current.filters) {
+    hasManual = true;
     const lab = document.createElement("label");
     lab.textContent = f.label || f.k;
     let el;
@@ -766,24 +925,27 @@ function buildFilters() {
       el.type = f.type === "month" ? "month" : f.type;
       if (f.ph) el.placeholder = f.ph;
       let def = f.def;
-      // A month filter with no explicit default lands on the archive's latest
-      // month (where the data actually is), so the view loads populated instead
-      // of on an empty month the browser would otherwise pick.
-      if (def === undefined && f.type === "month" && DEFAULTS.month) def = DEFAULTS.month;
       if (def !== undefined) el.value = def;
     }
     el.id = "f_" + f.k;
     lab.appendChild(el); wrap.appendChild(lab);
   }
-  const go = document.createElement("button");
-  go.className = "go"; go.textContent = "Load"; go.onclick = load;
-  wrap.appendChild(go);
+  if (hasManual) {
+    const go = document.createElement("button");
+    go.className = "go"; go.textContent = "Load"; go.onclick = load;
+    wrap.appendChild(go);
+  }
 }
 function collectParams() {
   const p = new URLSearchParams();
-  for (const f of current.filters) {
-    const v = ($("f_" + f.k) || {}).value;
-    if (v !== undefined && v !== "") p.set(f.k, v);
+  const keys = [];
+  if (current.subtabs) keys.push(current.subtabs.k);
+  if (current.range) keys.push(current.range.start, current.range.end);
+  if (current.month) keys.push(current.month);
+  for (const f of current.filters) keys.push(f.k);
+  for (const k of keys) {
+    const v = ($("f_" + k) || {}).value;
+    if (v !== undefined && v !== "") p.set(k, v);
   }
   return p.toString();
 }
@@ -1005,7 +1167,10 @@ const RENDER = {
   },
 };
 
+let loadSeq = 0;
 async function load() {
+  const myseq = ++loadSeq;
+  const activeId = current.id;
   $("content").innerHTML = `<span class="muted">Loading&hellip;</span>`;
   $("rawWrap").hidden = true;
   const q = collectParams();
@@ -1016,9 +1181,13 @@ async function load() {
     status = res.status;
     data = await res.json();
   } catch (e) {
+    if (myseq !== loadSeq) return;
     $("content").innerHTML = `<div class="notice err">Request failed: ${esc(e)}</div>`;
     return;
   }
+  // Discard a response that lost the race to a newer load() (rapid month
+  // navigation or tab switching), so the view always reflects the last request.
+  if (myseq !== loadSeq) return;
   $("raw").textContent = JSON.stringify(data, null, 2);
   $("rawWrap").hidden = false;
   if (data && data.ok === false) {
@@ -1026,11 +1195,11 @@ async function load() {
     return;
   }
   try {
-    $("content").innerHTML = (RENDER[current.id] || (() => ""))(data) || "";
+    $("content").innerHTML = (RENDER[activeId] || (() => ""))(data) || "";
   } catch (e) {
     $("content").innerHTML = `<div class="notice err">Render error: ${esc(e)}</div>`;
   }
-  if (current.id === "redflags") applyRedFlags(data);
+  if (activeId === "redflags") applyRedFlags(data);
 }
 
 // Keep the always-visible banner and the nav-button badge in sync with the
@@ -1059,6 +1228,7 @@ function applyRedFlags(d) {
 
 function selectTab(t) {
   current = t;
+  try { localStorage.setItem("fmcp.lastTab", t.id); } catch (e) {}
   for (const b of $("tabs").children) b.classList.toggle("active", b.dataset.id === t.id);
   buildFilters();
   load();
@@ -1071,13 +1241,14 @@ function init() {
     b.onclick = () => selectTab(t);
     nav.appendChild(b);
   }
-  // Learn the latest month present in the archive so month-filtered views
-  // (burn-down) default to where the data is. Best-effort: any failure just
-  // leaves the browser's own default in place.
-  fetch("/api/stats").then(r => r.json()).then(s => {
-    const latest = s && s.latest_transaction;
-    if (typeof latest === "string" && latest.length >= 7) DEFAULTS.month = latest.slice(0, 7);
-  }).catch(() => {}).finally(() => selectTab(TABS[0]));
+  // Restore the last tab the user was on (falls back to the first tab).
+  let startTab = TABS[0];
+  try {
+    const id = localStorage.getItem("fmcp.lastTab");
+    const found = TABS.find(t => t.id === id);
+    if (found) startTab = found;
+  } catch (e) {}
+  selectTab(startTab);
   // Loud-from-anywhere red-flag banner + nav badge, refreshed on load.
   fetch("/api/redflags").then(r => r.json()).then(d => { if (d && d.ok !== false) applyRedFlags(d); }).catch(() => {});
 }
