@@ -1,0 +1,28 @@
+# Architecture invariants — enforcement register
+
+Canonical source of enforcement truth for finance-mcp. Each row is an invariant
+the codebase must hold, paired with the deterministic check that enforces it in
+CI. Design docs reference these `INV-*` IDs rather than re-stating the rule, so
+the rule and its enforcement can't drift apart.
+
+Checks are deterministic (never an LLM judge). A check is either **structural**
+(build/parse-time shape) or **behavioral** (runtime output). Every check runs in
+the `pytest -q` CI job.
+
+## Web UI (`src/finance_mcp/webui.py`)
+
+See design: [`docs/design/webui-date-navigation.md`](../design/webui-date-navigation.md).
+
+| ID | Invariant | Class | Enforcing check |
+|---|---|---|---|
+| INV-WEBUI-001 | Month-scoped tabs Transactions and Spending declare `range:` and do not render `start`/`end` as manual filters; Burn-down declares `month:`. (Subscriptions/Allocation are audit-window tabs and keep explicit date filters.) | structural | `tests/test_webui_design_guards.py::test_month_scoped_tabs_use_navigator_not_manual_date_filters` |
+| INV-WEBUI-002 | Spending exposes `group_by` as `subtabs`, not a `select` dropdown | structural | `tests/test_webui_design_guards.py::test_spending_group_by_is_subtabs_not_dropdown` |
+| INV-WEBUI-003 | Last tab is persisted/restored via `localStorage` key `fmcp.lastTab` | structural | `tests/test_webui_design_guards.py::test_last_tab_is_persisted_to_localstorage` |
+| INV-WEBUI-004 | Embedded UI script is syntactically valid JavaScript | structural | `tests/test_webui_design_guards.py::test_embedded_script_is_valid_javascript` |
+| INV-WEBUI-005 | Date helpers compute correct month bounds and wrap year boundaries | behavioral | `tests/test_webui_design_guards.py::test_date_helpers_compute_correct_bounds_and_year_wrap` |
+
+## Queries (`src/finance_mcp/queries.py`)
+
+| ID | Invariant | Class | Enforcing check |
+|---|---|---|---|
+| INV-QUERIES-001 | A bare `YYYY-MM-DD` `end_date` is inclusive through the end of that day (a noon-stamped last-day transaction is returned) | behavioral | `tests/test_queries.py::test_bare_end_date_is_inclusive_through_end_of_day` |
