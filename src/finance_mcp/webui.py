@@ -1019,10 +1019,12 @@ const RENDER = {
     const s = d.summary || {};
     const flags = d.flags || [];
     const red = flags.filter(f => f.severity === "red");
+    const cleared = flags.filter(f => f.severity === "cleared");
     const info = flags.filter(f => f.severity === "info");
     let out = `<div class="cards">
       <div class="card"><div class="k">returned</div><div class="v">${s.returned||0}</div></div>
       <div class="card"><div class="k">missed</div><div class="v">${s.missed||0}</div></div>
+      <div class="card"><div class="k">made good</div><div class="v">${s.made_good||0}</div></div>
       <div class="card"><div class="k">can&rsquo;t audit</div><div class="v">${s.unauditable||0}</div></div>
     </div>`;
     if (!d.debt_account_count) {
@@ -1030,7 +1032,7 @@ const RENDER = {
       return out;
     }
     if (!red.length) {
-      out += `<div class="notice ok">No returned or missed debt payments since ${esc(d.start||"")}. &#10003;</div>`;
+      out += `<div class="notice ok">No outstanding returned or missed debt payments since ${esc(d.start||"")}. &#10003;</div>`;
     } else {
       out += `<div class="notice err"><strong>&#9888; ${red.length} debt-payment red flag${red.length>1?'s':''}.</strong> A loan payment was returned or missed &mdash; the debt may not have been paid.</div>`;
       out += table(red, [
@@ -1038,6 +1040,16 @@ const RENDER = {
         {label:"Account",get:r=>r.account_label},
         {label:"When",get:r=>r.date || r.month},
         {label:"Amount",num:true,money:true,get:r=>r.actual},
+        {label:"What happened",get:r=>r.detail},
+      ]);
+    }
+    if (cleared.length) {
+      out += `<h2>Made good</h2>`;
+      out += `<p class="muted">These were returned or missed, then covered by a later or extra payment &mdash; the debt caught back up.</p>`;
+      out += table(cleared, [
+        {label:"Flag",html:true,get:r=>pill(r.kind_label||r.kind,"good")},
+        {label:"Account",get:r=>r.account_label},
+        {label:"When",get:r=>r.date || r.month},
         {label:"What happened",get:r=>r.detail},
       ]);
     }

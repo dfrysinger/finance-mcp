@@ -389,3 +389,25 @@ def test_bool_filters_are_instant_checkboxes():
     )
     res = _run_node(harness)
     assert res.returncode == 0, res.stderr + res.stdout
+
+
+def test_redflags_groups_made_good_separately_from_red():
+    """INV-WEBUI-010: the Red-flags view renders resolved deficits under a
+    dedicated "Made good" grouping keyed on the ``cleared`` severity, so a
+    returned/missed payment that was later re-made is shown as resolved rather
+    than as an outstanding red flag.
+
+    This pins the shared contract between the detector (which downgrades a
+    resolved flag's ``severity`` to ``"cleared"``) and the UI grouping. It fails
+    if the renderer stops splitting ``cleared`` out of the red table or the
+    severity value is renamed on one side only.
+    """
+    m = re.search(r"redflags\(d\)\s*\{(.*?)\n  \},", SCRIPT, re.DOTALL)
+    assert m, "SCRIPT must define a redflags(d) renderer"
+    block = m.group(1)
+    assert 'f.severity === "cleared"' in block, \
+        "redflags renderer must select the 'cleared' severity into its own group"
+    assert "Made good" in block, "redflags renderer must render a 'Made good' section"
+    # The red table must exclude cleared rows (banner/red count integrity).
+    assert 'f.severity === "red"' in block, \
+        "redflags renderer must still filter the red group by severity 'red'"

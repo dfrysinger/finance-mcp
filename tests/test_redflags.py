@@ -38,7 +38,7 @@ def _kinds(rep):
 
 # --- returned payments --------------------------------------------------------
 
-def test_negative_posting_is_a_returned_payment():
+def test_negative_posting_re_made_same_month_is_made_good():
     debts = (DebtAccount(LOAN, "Loan", 75224, 1),)
     txns = [
         _txn(LOAN, "752.24", on="2026-05-01"),
@@ -48,11 +48,14 @@ def test_negative_posting_is_a_returned_payment():
     rep = _detect(debts, txns, as_of=date(2026, 6, 3))
     returned = [f for f in rep["flags"] if f["kind"] == "returned_payment"]
     assert len(returned) == 1
-    assert returned[0]["severity"] == "red"
+    # The reversal was re-made the same month, so the debt still received the
+    # payment: the returned flag is downgraded to "cleared" and no longer counts
+    # as an outstanding red flag.
+    assert returned[0]["severity"] == "cleared"
+    assert returned[0]["made_good"] is True
     assert returned[0]["date"] == "2026-05-06"
-    assert returned[0]["actual"] == -752.24
-    # Net for May is +752.24 (paid, returned, re-paid), so it is NOT missed even
-    # though a return happened — the returned flag still fires independently.
+    assert rep["summary"]["red"] == 0
+    assert rep["summary"]["made_good"] == 1
     # As-of June 3 is before June's due-day-1 + grace, so the empty current month
     # is not yet evaluated.
     assert not any(f["kind"] == "missed_payment" for f in rep["flags"])
@@ -74,7 +77,165 @@ def test_payment_then_return_nets_zero_is_a_missed_month():
     assert missed[0]["actual"] == 0.0
 
 
-def test_partial_payment_counts_as_paid():
+# --- make-good reconciliation -------------------------------------------------
+
+def test_missed_month_made_good_by_later_double_payment():
+    # April paid, May missed entirely, then June carries two payments. The extra
+    # June payment covers the May miss, so May is downgraded to "cleared" and the
+    # debt shows no outstanding red flag.
+    debts = (DebtAccount(LOAN, "Loan", 50000, 1),)
+    txns = [
+        _txn(LOAN, "500.00", on="2026-04-01"),
+        # nothing in May
+        _txn(LOAN, "500.00", on="2026-06-02"),
+        _txn(LOAN, "500.00", on="2026-06-20"),  # extra payment covers May
+    ]
+    rep = _detect(debts, txns)
+    missed = [f for f in rep["flags"] if f["kind"] == "missed_payment"]
+    assert len(missed) == 1
+    assert missed[0]["month"] == "2026-05"
+    assert missed[0]["severity"] == "cleared"
+    assert missed[0]["made_good"] is True
+    assert rep["summary"]["red"] == 0
+    assert rep["summary"]["made_good"] == 1
+
+
+def test_returned_that_sank_a_month_is_made_good_by_later_extra():
+    # May's only payment was reversed (net zero → returned AND missed). A later
+    # double payment in June makes the May month good, so BOTH the returned and the
+    # missed flag for May clear together.
+    debts = (DebtAccount(LOAN, "Loan", 50000, 1),)
+    txns = [
+        _txn(LOAN, "500.00", on="2026-04-01"),
+        _txn(LOAN, "500.00", on="2026-05-01"),
+        _txn(LOAN, "-500.00", on="2026-05-06", desc="Reversal"),
+        _txn(LOAN, "500.00", on="2026-06-02"),
+        _txn(LOAN, "500.00", on="2026-06-20"),  # extra payment covers May
+    ]
+    rep = _detect(debts, txns)
+    may = [f for f in rep["flags"] if f["month"] == "2026-05"]
+    assert {f["kind"] for f in may} == {"returned_payment", "missed_payment"}
+    assert all(f["severity"] == "cleared" and f["made_good"] for f in may)
+    assert rep["summary"]["red"] == 0
+    assert rep["summary"]["made_good"] == 2
+
+
+def test_two_misses_one_makeup_clears_only_the_oldest():
+    # March anchors the schedule, April and May are both missed, and June has one
+    # extra payment. A single make-up can only cover one deficit, so the OLDEST
+    # miss (April) clears while the newer one (May) stays red.
+    debts = (DebtAccount(LOAN, "Loan", 50000, 1),)
+    txns = [
+        _txn(LOAN, "500.00", on="2026-03-01"),
+        # nothing in April, nothing in May
+        _txn(LOAN, "500.00", on="2026-06-02"),
+        _txn(LOAN, "500.00", on="2026-06-20"),  # one extra payment
+    ]
+    rep = _detect(debts, txns)
+    missed = {f["month"]: f for f in rep["flags"] if f["kind"] == "missed_payment"}
+    assert missed["2026-04"]["severity"] == "cleared"
+    assert missed["2026-04"]["made_good"] is True
+    assert missed["2026-05"]["severity"] == "red"
+    assert missed["2026-05"]["made_good"] is False
+    assert rep["summary"]["red"] == 1
+    assert rep["summary"]["made_good"] == 1
+
+
+def test_extra_payment_before_a_miss_also_makes_it_good():
+    # An extra payment need not come after the miss: April was double-paid and May
+    # was skipped. The debt is net current across the window, so the May miss is
+    # made good by April's surplus.
+    debts = (DebtAccount(LOAN, "Loan", 50000, 1),)
+    txns = [
+        _txn(LOAN, "500.00", on="2026-04-01"),
+        _txn(LOAN, "500.00", on="2026-04-20"),  # extra, ahead of the miss
+        # nothing in May
+    ]
+    rep = _detect(debts, txns, as_of=date(2026, 5, 22))
+    missed = [f for f in rep["flags"] if f["kind"] == "missed_payment"]
+    assert len(missed) == 1
+    assert missed[0]["month"] == "2026-05"
+    assert missed[0]["severity"] == "cleared"
+    assert rep["summary"]["red"] == 0
+
+
+def test_genuine_miss_with_no_extra_stays_red():
+    # No make-up anywhere: a real missed month must remain a red flag. Guards
+    # against the reconciliation over-clearing when there is no surplus payment.
+    debts = (DebtAccount(LOAN, "Loan", 50000, 1),)
+    txns = [
+        _txn(LOAN, "500.00", on="2026-04-01"),
+        _txn(LOAN, "500.00", on="2026-05-01"),
+        # nothing in June
+    ]
+    rep = _detect(debts, txns)
+    missed = [f for f in rep["flags"] if f["kind"] == "missed_payment"]
+    assert len(missed) == 1
+    assert missed[0]["month"] == "2026-06"
+    assert missed[0]["severity"] == "red"
+    assert rep["summary"]["red"] == 1
+    assert rep["summary"]["made_good"] == 0
+
+
+def test_net_negative_month_does_not_fund_its_own_clearing():
+    # A month can look busy (several small postings) yet net negative after a large
+    # reversal — it is a genuine missed month. Because make-goods are reconciled on
+    # net dollars, that month cannot fund a make-up credit, and neither it nor an
+    # earlier genuine miss is cleared. Guards the count-vs-dollars mismatch.
+    debts = (DebtAccount(LOAN, "Loan", 50000, 1),)
+    txns = [
+        _txn(LOAN, "500.00", on="2026-03-01"),  # March anchors the schedule
+        # April: nothing — genuinely missed
+        _txn(LOAN, "1.00", on="2026-05-02"),
+        _txn(LOAN, "1.00", on="2026-05-03"),
+        _txn(LOAN, "1.00", on="2026-05-04"),
+        _txn(LOAN, "-100.00", on="2026-05-06", desc="Reversal"),  # May net -97
+    ]
+    rep = _detect(debts, txns)
+    missed = {f["month"]: f for f in rep["flags"] if f["kind"] == "missed_payment"}
+    assert missed["2026-04"]["severity"] == "red"
+    assert missed["2026-05"]["severity"] == "red"
+    assert rep["summary"]["made_good"] == 0
+
+
+def test_split_payment_does_not_create_a_false_make_good():
+    # One monthly payment that posts as two rows (a split) must not be mistaken for
+    # an extra payment that clears an earlier genuine miss. Summed dollars for the
+    # split month equal one payment, so the June miss stays red.
+    debts = (DebtAccount(LOAN, "Loan", 50000, 1),)
+    txns = [
+        _txn(LOAN, "300.00", on="2026-04-01"),  # April paid as a split...
+        _txn(LOAN, "200.00", on="2026-04-02"),  # ...totalling one 500 payment
+        _txn(LOAN, "500.00", on="2026-05-01"),
+        # nothing in June — genuinely missed
+    ]
+    rep = _detect(debts, txns)
+    missed = [f for f in rep["flags"] if f["kind"] == "missed_payment"]
+    assert len(missed) == 1
+    assert missed[0]["month"] == "2026-06"
+    assert missed[0]["severity"] == "red"
+    assert rep["summary"]["red"] == 1
+    assert rep["summary"]["made_good"] == 0
+
+
+def test_missed_not_cleared_without_expected_amount():
+    # With no configured payment amount the audit cannot tell a make-up payment
+    # from ordinary activity, so it conservatively leaves the miss flagged rather
+    # than risk hiding an unpaid month — even when a later month was double-paid.
+    debts = (DebtAccount(LOAN, "Loan", None, 1),)
+    txns = [
+        _txn(LOAN, "500.00", on="2026-04-01"),
+        # nothing in May
+        _txn(LOAN, "500.00", on="2026-06-02"),
+        _txn(LOAN, "500.00", on="2026-06-20"),
+    ]
+    rep = _detect(debts, txns)
+    missed = [f for f in rep["flags"] if f["kind"] == "missed_payment"]
+    assert len(missed) == 1
+    assert missed[0]["month"] == "2026-05"
+    assert missed[0]["severity"] == "red"
+    assert rep["summary"]["red"] == 1
+    assert rep["summary"]["made_good"] == 0
     # Amount is never judged: a payment that posts for any amount counts as paid,
     # so an underpaid month is not a red flag — only a month with no payment is.
     debts = (DebtAccount(LOAN, "Loan", 75224, 1),)
@@ -586,9 +747,10 @@ def test_on_account_returned_payment_malformed_description_does_not_crash():
     rep = _detect(debts, txns, as_of=date(2026, 6, 3))
     returned = [f for f in rep["flags"] if f["kind"] == "returned_payment"]
     assert len(returned) == 1
-    # The unusable merchant fields fail closed: the detail ends cleanly without a
-    # "(merchant)" suffix rather than crashing or rendering a repr.
-    assert returned[0]["detail"].endswith("on 2026-05-06.")
+    # The unusable merchant fields fail closed: the base detail ends cleanly
+    # without a "(merchant)" suffix rather than crashing or rendering a repr.
+    assert "returned or reversed on 2026-05-06." in returned[0]["detail"]
+    assert "MTG PMT REVERSED" not in returned[0]["detail"]
 
 
 def test_on_account_returned_payment_falls_back_to_payee_when_description_bad():
@@ -605,7 +767,7 @@ def test_on_account_returned_payment_falls_back_to_payee_when_description_bad():
     rep = _detect(debts, txns, as_of=date(2026, 6, 3))
     returned = [f for f in rep["flags"] if f["kind"] == "returned_payment"]
     assert len(returned) == 1
-    assert returned[0]["detail"].endswith("(MTG PMT REVERSED).")
+    assert "(MTG PMT REVERSED)." in returned[0]["detail"]
 
 
 def test_boundary_as_of_at_date_min_does_not_overflow():

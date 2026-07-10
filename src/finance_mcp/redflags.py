@@ -22,6 +22,19 @@ money leaving and a return is money coming back. A debt with neither its own
 postings nor a configured payment source is surfaced as an explicit "can't
 audit" note rather than silently skipped.
 
+A returned or missed payment can be **made good** later: if a returned payment is
+re-made the same month (the month's net goes back positive), or later payments
+bring the debt current again. Make-goods are reconciled on cumulative dollars,
+not posting counts: over the audited months a debt owes one expected payment per
+month, and if the net dollars received meet or beat that total the debt has
+caught back up, so the oldest arrears clear first and only a genuine remaining
+shortfall (in whole payments) stays red. Summing dollars means a split payment
+cannot fake a surplus and a missed month lowers the total instead of clearing
+itself. This reconciliation needs a configured payment amount; without one a
+missed month is left flagged rather than risk hiding an unpaid month. A resolved
+flag is downgraded from ``red`` to ``cleared`` (``made_good=True``): it drops out
+of the red count while remaining visible for the audit trail.
+
 The detector is a pure function over a :class:`~finance_mcp.budget_config.DebtAccount`
 list and a transaction list; the report loader wires it to the durable archive.
 """
@@ -244,6 +257,7 @@ def detect_red_flags(
                     "kind": "data_quality",
                     "kind_label": "Data issue",
                     "severity": "info",
+                    "made_good": False,
                     "account_id": debt.account_id,
                     "account_label": debt.label,
                     "date": None,
@@ -283,6 +297,7 @@ def detect_red_flags(
                     "kind": "unauditable",
                     "kind_label": "Can't audit",
                     "severity": "info",
+                    "made_good": False,
                     "account_id": debt.account_id,
                     "account_label": debt.label,
                     "date": None,
@@ -308,41 +323,53 @@ def detect_red_flags(
             )
             continue
 
+        # Per-month net dollars. A payment is any positive posting and a return
+        # any negative one; amount is never compared for miss/return detection.
+        net_by_month: dict[tuple[int, int], int] = {}
+        for d, cents, _ in rows:
+            k = _month_key(d)
+            net_by_month[k] = net_by_month.get(k, 0) + cents
+
         # Returned / reversed payments: any negative posting to the loan account.
+        # Collected rather than emitted directly so a return that was re-made can be
+        # reconciled to a "made good" state before the report is built.
+        returned_flags: list[tuple[tuple[int, int], dict]] = []
         for d, cents, txn in rows:
             if cents < 0:
                 desc = _usable_text(txn.get("description")) or _usable_text(
                     txn.get("payee")
                 )
-                flags.append(
-                    {
-                        "kind": "returned_payment",
-                        "kind_label": "Returned",
-                        "severity": "red",
-                        "account_id": debt.account_id,
-                        "account_label": debt.label,
-                        "date": d.isoformat(),
-                        "month": f"{d.year:04d}-{d.month:02d}",
-                        "expected": None,
-                        "actual": _dollars(cents),
-                        "shortfall": None,
-                        "detail": (
-                            f"A payment of {_dollars(-cents):.2f} was returned or "
-                            f"reversed on {d.isoformat()}"
-                            + (f" ({desc})." if desc else ".")
-                        ),
-                    }
+                returned_flags.append(
+                    (
+                        _month_key(d),
+                        {
+                            "kind": "returned_payment",
+                            "kind_label": "Returned",
+                            "severity": "red",
+                            "made_good": False,
+                            "account_id": debt.account_id,
+                            "account_label": debt.label,
+                            "date": d.isoformat(),
+                            "month": f"{d.year:04d}-{d.month:02d}",
+                            "expected": None,
+                            "actual": _dollars(cents),
+                            "shortfall": None,
+                            "detail": (
+                                f"A payment of {_dollars(-cents):.2f} was returned or "
+                                f"reversed on {d.isoformat()}"
+                                + (f" ({desc})." if desc else ".")
+                            ),
+                        },
+                    )
                 )
 
         # A missed month needs an observed payment to anchor the schedule's start.
         # Without one there is nothing to miss against (a balance-only debt is
-        # surfaced as unauditable above).
+        # surfaced as unauditable above). With no payment ever observed, no return
+        # can have been re-made, so the collected returns stand as red.
         if first_payment_month is None:
+            flags.extend(flag for _, flag in returned_flags)
             continue
-
-        net_by_month: dict[tuple[int, int], int] = {}
-        for d, cents, _ in rows:
-            net_by_month[_month_key(d)] = net_by_month.get(_month_key(d), 0) + cents
 
         # Audit from the later of the window start and the month the debt's first
         # payment was observed. Clamping to the window start (when the first payment
@@ -353,7 +380,13 @@ def detect_red_flags(
         start_month = (start.year, start.month)
         first_month = max(start_month, first_payment_month)
 
-        # Walk every month from the audit origin through the as-of month.
+        # Walk every month from the audit origin through the as-of month. Track the
+        # count of audited (overdue-by-grace) months and the net dollars observed
+        # across them, so the make-good reconciliation can compare cumulative
+        # payments against the cumulative amount owed.
+        missed_flags: list[tuple[tuple[int, int], dict]] = []
+        due_count = 0
+        paid_cents = 0
         y, m = first_month
         while (y, m) <= (as_of.year, as_of.month):
             due_day = debt.due_day or calendar.monthrange(y, m)[1]
@@ -362,53 +395,113 @@ def detect_red_flags(
                 # has not passed. Applies to any month, not just the current one,
                 # because a month-end due date plus grace can land in the next
                 # month, so the prior month must not be flagged the instant it ends.
+                # Its postings are intentionally left out of the reconciliation
+                # below: neither owed (due_count) nor paid (paid_cents) yet. A
+                # payment made early in such a month can't be told apart from that
+                # month's own on-time payment, so crediting it toward earlier
+                # arrears would risk clearing a still-unpaid month. An earlier miss
+                # therefore stays red until this month is itself past grace and its
+                # dollars enter the total — the safe (over-flagging) direction.
                 m, y = (1, y + 1) if m == 12 else (m + 1, y)
                 continue
             net = net_by_month.get((y, m), 0)
+            due_count += 1
+            paid_cents += net
             # A payment of any amount counts as paid; only a non-positive net is a
             # missed month — covering both no payment at all and a payment fully
             # reversed by a return.
             if net <= 0:
-                flags.append(
-                    {
-                        "kind": "missed_payment",
-                        "kind_label": "Missed",
-                        "severity": "red",
-                        "account_id": debt.account_id,
-                        "account_label": debt.label,
-                        "date": None,
-                        "month": f"{y:04d}-{m:02d}",
-                        "expected": None if expected is None else _dollars(expected),
-                        "actual": _dollars(net),
-                        "shortfall": None,
-                        "detail": (
-                            f"{y:04d}-{m:02d}: no payment left the funding "
-                            "account (none sent, or it was returned)."
-                            if src is not None
-                            else (
-                                f"{y:04d}-{m:02d}: no payment reached the loan "
-                                "(none posted, or it was returned)."
-                            )
-                        ),
-                    }
+                missed_flags.append(
+                    (
+                        (y, m),
+                        {
+                            "kind": "missed_payment",
+                            "kind_label": "Missed",
+                            "severity": "red",
+                            "made_good": False,
+                            "account_id": debt.account_id,
+                            "account_label": debt.label,
+                            "date": None,
+                            "month": f"{y:04d}-{m:02d}",
+                            "expected": None if expected is None else _dollars(expected),
+                            "actual": _dollars(net),
+                            "shortfall": None,
+                            "detail": (
+                                f"{y:04d}-{m:02d}: no payment left the funding "
+                                "account (none sent, or it was returned)."
+                                if src is not None
+                                else (
+                                    f"{y:04d}-{m:02d}: no payment reached the loan "
+                                    "(none posted, or it was returned)."
+                                )
+                            ),
+                        },
+                    )
                 )
             m, y = (1, y + 1) if m == 12 else (m + 1, y)
 
-    # Most recent first: sort by the flag's effective date (returned uses the
-    # exact date; month flags use the month's end), red before info.
-    def _sort_key(f: dict):
-        when = f.get("date") or (f.get("month") or "")
-        return (0 if f["severity"] == "red" else 1, when)
+        # Reconcile make-goods on cumulative dollars, not posting counts. Over the
+        # audited months the debt owed `due_count` payments of `expected` each; if
+        # the net dollars actually received (`paid_cents`, returns already netted
+        # out) meets or beats that, the debt has caught back up and earlier misses
+        # were made good by later or extra payments. Any residual shortfall, in
+        # whole missed payments, is how many of the misses remain genuinely unpaid;
+        # the newest that-many stay red and the older ones clear (a catch-up pays
+        # down the oldest arrears first). Summing dollars — rather than counting
+        # postings — means a split payment cannot inflate a surplus and a
+        # net-negative (missed) month lowers the total instead of funding its own
+        # clearing. This needs a known payment amount; without `expected` the audit
+        # cannot tell a make-up payment from ordinary activity, so it conservatively
+        # leaves misses flagged rather than risk hiding an unpaid month.
+        made_good_months: set[tuple[int, int]] = set()
+        if expected and expected > 0 and missed_flags:
+            shortfall_cents = max(0, due_count * expected - paid_cents)
+            # Ceiling division: any partial shortfall still counts as one unpaid
+            # payment, so a debt behind by even a fraction keeps a miss red.
+            still_unpaid = -(-shortfall_cents // expected)
+            n_made_good = max(0, len(missed_flags) - still_unpaid)
+            for mk, flag in missed_flags[:n_made_good]:  # oldest first (chronological)
+                flag["made_good"] = True
+                flag["severity"] = "cleared"
+                flag["detail"] += (
+                    " A later or extra payment covers this, so the debt is current."
+                )
+                made_good_months.add(mk)
 
-    flags.sort(key=_sort_key, reverse=True)
-    # reverse=True flips the severity tie-break too; restore red-before-info.
-    flags.sort(key=lambda f: 0 if f["severity"] == "red" else 1)
+        for mk, flag in returned_flags:
+            if net_by_month.get(mk, 0) > 0:
+                # A later posting in the same month brought the net back positive:
+                # the returned payment was re-made and the debt still received it.
+                flag["made_good"] = True
+                flag["severity"] = "cleared"
+                flag["detail"] += (
+                    " The payment was re-made the same month, so the debt "
+                    "received it."
+                )
+            elif mk in made_good_months:
+                # The return sank its month to a miss, but a later extra payment
+                # made that month good, so the debt received it after all.
+                flag["made_good"] = True
+                flag["severity"] = "cleared"
+                flag["detail"] += (
+                    " A later extra payment covers this, so the debt received it."
+                )
+
+        flags.extend(flag for _, flag in returned_flags)
+        flags.extend(flag for _, flag in missed_flags)
+
+    # Most recent first within each tier, then group: red, then made-good, then
+    # info. A stable sort keeps the recency order inside each severity group.
+    _rank = {"red": 0, "cleared": 1}
+    flags.sort(key=lambda f: f.get("date") or f.get("month") or "", reverse=True)
+    flags.sort(key=lambda f: _rank.get(f["severity"], 2))
 
     summary = {
         "returned": sum(1 for f in flags if f["kind"] == "returned_payment"),
         "missed": sum(1 for f in flags if f["kind"] == "missed_payment"),
         "unauditable": sum(1 for f in flags if f["kind"] == "unauditable"),
         "data_quality": sum(1 for f in flags if f["kind"] == "data_quality"),
+        "made_good": sum(1 for f in flags if f.get("made_good")),
         "red": sum(1 for f in flags if f["severity"] == "red"),
     }
     return {

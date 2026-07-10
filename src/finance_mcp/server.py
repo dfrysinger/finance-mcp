@@ -405,7 +405,9 @@ def red_flags_report(as_of: str | None = None) -> dict[str, Any]:
     transactions, so a payment is caught no matter which account funded it. A
     returned payment (posted then reversed) and a month whose payments net to
     zero or less (none posted, or fully reversed) each surface as a red flag; the
-    payment amount is never compared, so any positive net counts as paid. A debt
+    payment amount is never compared, so any positive net counts as paid. A
+    returned or missed payment that is later re-made or covered by an extra
+    payment is downgraded to ``made_good`` and drops out of the red count. A debt
     that syncs only a balance surfaces as an explicit ``unauditable`` note rather
     than a silent gap. With no ``debt_accounts`` configured the report is simply
     empty.
