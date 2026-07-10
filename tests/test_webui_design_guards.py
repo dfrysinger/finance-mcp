@@ -161,3 +161,134 @@ def test_date_helpers_compute_correct_bounds_and_year_wrap():
     )
     res = _run_node(harness)
     assert res.returncode == 0, res.stderr + res.stdout
+
+
+def test_spending_month_subtab_declares_year_navigator():
+    """INV-WEBUI-006 (structural): Spending's group_by subtabs opt into year
+    navigation for the ``month`` grouping."""
+    summary = _tab_block("summary")
+    assert 'subtabs:{k:"group_by"' in summary
+    assert 'yearNav:"month"' in summary
+
+
+@_needs_node
+def test_year_navigator_bounds_for_group_by_month():
+    """INV-WEBUI-006 (behavioral): yearBounds scopes to a whole calendar year."""
+    harness = (
+        _extract_function("yearBounds")
+        + "\n"
+        + textwrap.dedent(
+            """
+            const assert = (c, m) => { if (!c) { console.error("FAIL: " + m); process.exit(1); } };
+
+            const b = yearBounds(2026);
+            assert(b.start === "2026-01-01", "year start " + b.start);
+            assert(b.end === "2026-12-31", "year end " + b.end);
+            assert(b.label === "2026", "year label " + b.label);
+
+            console.log("OK");
+            """
+        )
+    )
+    res = _run_node(harness)
+    assert res.returncode == 0, res.stderr + res.stdout
+
+
+@_needs_node
+def test_year_navigator_wiring_resolves_year_bounds_for_month_subtab():
+    """INV-WEBUI-006 (behavioral, integration): drives the real
+    ``renderMonthNav`` against a DOM stub and asserts the hidden date params it
+    resolves *and* that its arrows step by year. When the active subtab is the
+    ``yearNav`` grouping (``month``) the window must be whole-calendar-year
+    bounds and the ‹/› controls must move the year; any other subtab keeps month
+    bounds. This fails if the ``yearMode`` gate/branch is removed OR if the
+    year arrows are reverted to month stepping — neither of which the
+    unit-level helper test can catch. State is pinned to a fixed mid-year month
+    so a month-stepping regression is caught deterministically (never masked by
+    a January/December year-crossing on the real calendar)."""
+    harness = (
+        _extract_function("isoDate")
+        + "\n"
+        + _extract_function("monthBounds")
+        + "\n"
+        + _extract_function("yearBounds")
+        + "\n"
+        + _extract_function("shiftMonth")
+        + "\n"
+        + _extract_function("navFor")
+        + "\n"
+        + _extract_function("subState")
+        + "\n"
+        + _extract_function("setHidden")
+        + "\n"
+        + _extract_function("renderMonthNav")
+        + "\n"
+        + textwrap.dedent(
+            """
+            const assert = (c, m) => { if (!c) { console.error("FAIL: " + m); process.exit(1); } };
+
+            // Minimal DOM/state stubs so the real renderMonthNav can run.
+            const NAVSTATE = {};
+            const SUBSTATE = {};
+            const localStorage = { getItem() { return null; }, setItem() {} };
+            const reg = {};
+            const created = [];
+            const $ = (id) => reg[id];
+            const makeEl = () => {
+              const e = { className:"", title:"", textContent:"", type:"", value:"", id:"",
+                innerHTML:"", onclick:null, onchange:null,
+                classList:{ add(){}, toggle(){} }, appendChild(){}, append(){} };
+              created.push(e); return e;
+            };
+            const document = { createElement: () => makeEl() };
+            const wrap = { appendChild(e){ if (e && e.id) reg[e.id] = e; }, append(){}, innerHTML:"" };
+            function load(){}
+            // Most-recently-created control bearing a given title (draw() rebuilds
+            // the arrows on every step, so always click the freshest one).
+            const latest = (title) => {
+              for (let i = created.length - 1; i >= 0; i--) if (created[i].title === title) return created[i];
+              return null;
+            };
+            const startEnd = () => [reg["f_start_date"].value, reg["f_end_date"].value];
+
+            const t = { id:"summary",
+                        range:{ start:"start_date", end:"end_date" },
+                        subtabs:{ k:"group_by",
+                                  opts:["category","account","envelope","org","month"],
+                                  yearNav:"month" } };
+
+            // Active subtab is the yearNav grouping -> whole-calendar-year window.
+            // Pin to a mid-year month so month-stepping never crosses a year.
+            NAVSTATE[t.id] = { mode:"month", y:2026, m:5, custom:{start:"",end:""} };
+            SUBSTATE[t.id] = { value:"month" };
+            renderMonthNav(t, wrap);
+            assert(startEnd().join("|") === "2026-01-01|2026-12-31", "year init " + startEnd());
+
+            // The arrows must step by YEAR, not month.
+            latest("Previous year").onclick();
+            assert(startEnd().join("|") === "2025-01-01|2025-12-31", "prev year " + startEnd());
+            latest("Next year").onclick();
+            assert(startEnd().join("|") === "2026-01-01|2026-12-31", "next year (back to 2026) " + startEnd());
+            latest("Next year").onclick();
+            assert(startEnd().join("|") === "2027-01-01|2027-12-31", "next year " + startEnd());
+            // A month-stepping regression keeps year arrows off entirely.
+            assert(latest("Previous month") === null && latest("Next month") === null,
+                   "year mode must not render month arrows");
+
+            // Any other subtab keeps month granularity (its month's bounds).
+            for (const k in reg) delete reg[k];
+            created.length = 0;
+            NAVSTATE[t.id] = { mode:"month", y:2026, m:5, custom:{start:"",end:""} };
+            SUBSTATE[t.id] = { value:"category" };
+            renderMonthNav(t, wrap);
+            const mb = monthBounds(2026, 5);
+            assert(startEnd().join("|") === mb.start + "|" + mb.end, "category month bounds " + startEnd());
+            assert(latest("Previous month") !== null && latest("Next month") !== null,
+                   "non-year subtab must render month arrows");
+
+            console.log("OK");
+            """
+        )
+    )
+    res = _run_node(harness)
+    assert res.returncode == 0, res.stderr + res.stdout
