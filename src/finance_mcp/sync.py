@@ -22,6 +22,48 @@ def _date_windows(start_ts: int, end_ts: int) -> list[tuple[int, int]]:
     return windows or [(start_ts, end_ts)]
 
 
+def _hashable(value):
+    """Coerce a SimpleFIN error field to a stable hashable value.
+
+    Error fields should be strings per the protocol, but a malformed bridge
+    response could send a list or dict. Coercing anything non-primitive to its
+    repr keeps deduplication keys hashable so one bad entry cannot crash the
+    whole sync before data is cached.
+    """
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _dedupe_errors(items: list) -> list:
+    """Drop duplicate SimpleFIN errors while preserving first-seen order.
+
+    A single persistent problem (e.g. a connection that needs re-auth) is
+    returned once per fetch window, so accumulating every window's errors would
+    report the same problem several times. Structured errors dedupe on their
+    stable identity (code + conn/account id + message); legacy string errors
+    dedupe on the string itself.
+    """
+    seen: set = set()
+    out: list = []
+    for item in items:
+        if isinstance(item, dict):
+            key = (
+                "dict",
+                _hashable(item.get("code")),
+                _hashable(item.get("conn_id")),
+                _hashable(item.get("account_id")),
+                _hashable(item.get("msg")),
+            )
+        else:
+            key = ("str", _hashable(item))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
 def sync(
     *,
     days: int = 120,
@@ -63,8 +105,8 @@ def sync(
 
     cache["accounts"] = list(all_accounts.values())
     cache["transactions"] = transactions
-    cache["errors"] = errors
-    cache["errlist"] = errlist
+    cache["errors"] = _dedupe_errors(errors)
+    cache["errlist"] = _dedupe_errors(errlist)
     store.save_cache(cache)
 
     # Fold this sync into the durable multi-year archive. The JSON cache already
@@ -86,6 +128,6 @@ def sync(
         "transaction_count": len(transactions),
         "archived_transactions": archive_stats["transactions_added"],
         "balance_snapshots_added": archive_stats["balance_snapshots_added"],
-        "errors": errors,
-        "errlist": errlist,
+        "errors": cache["errors"],
+        "errlist": cache["errlist"],
     }

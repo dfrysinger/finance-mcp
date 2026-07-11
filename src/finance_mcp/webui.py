@@ -568,6 +568,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
             background:rgba(210,153,34,.08); color:var(--warn); margin-bottom:14px; }
   .err { border-color:var(--bad); background:rgba(248,81,73,.08); color:var(--bad); }
   .notice.ok { border-color:var(--good); background:rgba(63,185,80,.08); color:var(--good); }
+  .connlist { margin:0 0 14px; padding-left:20px; font-size:13px; color:var(--warn); }
+  .connlist li { margin:2px 0; }
   .badge { display:inline-block; min-width:16px; padding:0 5px; margin-left:6px;
            border-radius:9px; background:var(--bad); color:#fff; font-size:11px;
            font-weight:700; line-height:16px; text-align:center; }
@@ -577,6 +579,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .flagbanner[hidden] { display:none; }
   .flagbanner button { background:#fff; color:var(--bad); border:none; border-radius:6px;
                        padding:4px 11px; font-size:12px; font-weight:700; cursor:pointer; }
+  .flagbanner.warn { background:var(--warn); color:#1a1400; }
+  .flagbanner.warn button { color:var(--warn); }
   .muted { color:var(--muted); }
   h2 { font-size:14px; margin:18px 0 8px; }
   details { margin-top:18px; }
@@ -618,6 +622,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </header>
 <nav id="tabs"></nav>
 <div id="redflagBanner" class="flagbanner" hidden></div>
+<div id="connBanner" class="flagbanner warn" hidden></div>
 <main>
   <div class="filters" id="filters"></div>
   <div id="content"><span class="muted">Loading&hellip;</span></div>
@@ -1066,7 +1071,34 @@ const RENDER = {
   accounts(d) {
     if (d.synced_at) $("syncedAt").textContent = "synced " + d.synced_at;
     const rows = (d.accounts||[]).slice().sort((a,b)=>(b.balance||0)-(a.balance||0));
-    return `<div class="cards">
+    const conn = connErrors(d);
+    const reconnect = conn.filter(e => connErrorKind(e.code) === "reconnect");
+    const reauth = conn.filter(e => connErrorKind(e.code) === "reauth");
+    const transient = conn.filter(e => connErrorKind(e.code) === "transient");
+    let out = "";
+    if (reconnect.length) {
+      out += `<div class="notice"><strong>${reconnect.length} connection${reconnect.length>1?'s':''} need attention.</strong>`
+        + ` These institutions stopped updating and must be reconnected in the`
+        + ` <a href="https://beta-bridge.simplefin.org/auth/login" target="_blank" rel="noopener">SimpleFIN&nbsp;Bridge</a>`
+        + ` (log in &rarr; the flagged connection &rarr; reconnect / re-upload statement).`
+        + ` finance-mcp only reads data, so it can&rsquo;t re-authorize a bank for you.</div>`;
+      out += `<ul class="connlist">` + reconnect.map(e=>`<li>&#9888; ${esc(e.msg)}</li>`).join("") + `</ul>`;
+    }
+    if (reauth.length) {
+      out += `<div class="notice"><strong>SimpleFIN access needs re-authorization.</strong>`
+        + ` finance-mcp&rsquo;s read-only access to SimpleFIN is no longer authorized.`
+        + ` Sign in to the`
+        + ` <a href="https://beta-bridge.simplefin.org/auth/login" target="_blank" rel="noopener">SimpleFIN&nbsp;Bridge</a>`
+        + ` and re-add finance-mcp (claim a new setup token). Individual banks do not`
+        + ` need reconnecting for this.</div>`;
+      out += `<ul class="connlist">` + reauth.map(e=>`<li>&#9888; ${esc(e.msg)}</li>`).join("") + `</ul>`;
+    }
+    if (transient.length) {
+      out += `<div class="notice"><strong>${transient.length} sync issue${transient.length>1?'s':''} reported by SimpleFIN.</strong>`
+        + ` These usually clear on the next sync &mdash; no reconnection needed.</div>`;
+      out += `<ul class="connlist">` + transient.map(e=>`<li>&#9888; ${esc(e.msg)}</li>`).join("") + `</ul>`;
+    }
+    return out + `<div class="cards">
         <div class="card"><div class="k">accounts</div><div class="v">${d.account_count||0}</div></div>
       </div>` + table(rows, [
       {k:"org",label:"Institution"},
@@ -1283,6 +1315,65 @@ async function load() {
     $("content").innerHTML = `<div class="notice err">Render error: ${esc(e)}</div>`;
   }
   if (activeId === "redflags") applyRedFlags(data);
+  if (activeId === "accounts") applyConnErrors(data);
+}
+
+// Normalize SimpleFIN connection problems into deduped {msg, code} entries.
+// The bridge reports problems as structured objects in `errlist` (v2, the
+// required form) and, during the deprecation window, the same problems as
+// strings in `errors` (v1). Prefer `errlist` when present so one failure is not
+// counted twice; fall back to the legacy strings only when errlist is empty.
+// A single persistent failure can also be returned once per 90-day sync window,
+// so dedupe on a stable key. The developer guide requires always showing these.
+function connErrors(d) {
+  const raw = (d && d.errlist && d.errlist.length) ? d.errlist : ((d && d.errors) || []);
+  const out = [];
+  const seen = new Set();
+  for (const e of raw) {
+    let msg, code, connId, acctId;
+    if (typeof e === "string") {
+      msg = e.trim(); code = ""; connId = ""; acctId = "";
+    } else if (e && typeof e === "object") {
+      // `msg` is SimpleFIN's required user-facing text; `code` is prefix.subcode.
+      msg = String(e.msg || e.description || e.message || e.detail || JSON.stringify(e)).trim();
+      code = String(e.code || "");
+      connId = String(e.conn_id || "");
+      acctId = String(e.account_id || "");
+    } else {
+      continue;
+    }
+    if (!msg) continue;
+    // Dedupe on the full identity (code + connection + account + message) so a
+    // single failure repeated across sync windows collapses, but two different
+    // banks reporting the same code/message stay separate. Mirrors the
+    // server-side sync._dedupe_errors key so both layers agree on the count.
+    const key = [code, connId, acctId, msg].join("\u0000");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ msg, code, conn_id: connId, account_id: acctId });
+  }
+  return out;
+}
+
+// Classify a SimpleFIN error into the remediation the user actually needs:
+//   "reconnect" — a specific bank stopped updating and must be reconnected in
+//     SimpleFIN Bridge (connection-level `con.*`, and legacy code-less strings
+//     which are historically per-connection warnings).
+//   "reauth" — a server-level authentication failure (`gen.auth`): finance-mcp's
+//     own SimpleFIN access URL is no longer authorized, so the app must be
+//     re-added / a new setup token claimed. This is NOT a per-bank reconnect.
+//   "transient" — account-level (`act.*`), developer (`gen.api`), and any other
+//     code that clears on its own from the user's perspective.
+// Per the spec, unknown subcodes fall back to their prefix, so classify by the
+// prefix (text before the first dot) rather than a suffix match — an unknown
+// `act.auth` stays account-level/transient, not a server re-authorization.
+function connErrorKind(code) {
+  if (code === "") return "reconnect";
+  const dot = code.indexOf(".");
+  const prefix = dot >= 0 ? code.slice(0, dot) : code;
+  if (prefix === "con") return "reconnect";
+  if (code === "gen.auth") return "reauth";
+  return "transient";
 }
 
 // Keep the always-visible banner and the nav-button badge in sync with the
@@ -1303,6 +1394,31 @@ function applyRedFlags(d) {
     banner.innerHTML = `<span>&#9888; ${red} debt-payment red flag${red>1?'s':''}: a loan payment was returned or missed.</span><button>Review</button>`;
     banner.hidden = false;
     banner.onclick = () => { const t = TABS.find(t => t.id === "redflags"); if (t) selectTab(t); };
+  } else {
+    banner.hidden = true;
+    banner.onclick = null;
+  }
+}
+
+// Keep an always-visible amber banner in sync with SimpleFIN connection
+// problems, so a bank that stopped updating (needs re-auth) is loud from any
+// tab and links straight to the Accounts view for the fix instructions.
+function applyConnErrors(d) {
+  const errs = connErrors(d);
+  const n = errs.length;
+  const btn = [...$("tabs").children].find(b => b.dataset.id === "accounts");
+  if (btn) {
+    let badge = btn.querySelector(".badge");
+    if (n > 0) {
+      if (!badge) { badge = document.createElement("span"); badge.className = "badge"; btn.appendChild(badge); }
+      badge.textContent = n;
+    } else if (badge) { badge.remove(); }
+  }
+  const banner = $("connBanner");
+  if (n > 0) {
+    banner.innerHTML = `<span>&#9888; ${n} SimpleFIN sync alert${n>1?'s':''} &mdash; see Accounts.</span><button>Review</button>`;
+    banner.hidden = false;
+    banner.onclick = () => { const t = TABS.find(t => t.id === "accounts"); if (t) selectTab(t); };
   } else {
     banner.hidden = true;
     banner.onclick = null;
@@ -1334,6 +1450,8 @@ function init() {
   selectTab(startTab);
   // Loud-from-anywhere red-flag banner + nav badge, refreshed on load.
   fetch("/api/redflags").then(r => r.json()).then(d => { if (d && d.ok !== false) applyRedFlags(d); }).catch(() => {});
+  // Loud-from-anywhere bank-connection banner + nav badge, refreshed on load.
+  fetch("/api/accounts").then(r => r.json()).then(d => { if (d && d.ok !== false) applyConnErrors(d); }).catch(() => {});
 }
 init();
 </script>
