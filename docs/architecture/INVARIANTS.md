@@ -25,6 +25,7 @@ See design: [`docs/design/webui-date-navigation.md`](../design/webui-date-naviga
 | INV-WEBUI-008 | The Subscriptions "missing expected charges" table reuses the tracked-row Mark control, resolving each missing row to its tracked bill by name | structural | `tests/test_webui_design_guards.py::test_missing_charges_reuse_tracked_mark_control` |
 | INV-WEBUI-009 | A `bool` filter renders as a checkbox that applies instantly on change (`onchange` = `load`); a tab whose only manual filter is a toggle renders no Load button | behavioral | `tests/test_webui_design_guards.py::test_bool_filters_are_instant_checkboxes` |
 | INV-WEBUI-010 | The Red-flags view groups resolved deficits under a "Made good" section keyed on the `cleared` severity, and keeps the red table filtered to `red` severity so the banner/red count excludes made-good items | structural | `tests/test_webui_design_guards.py::test_redflags_groups_made_good_separately_from_red` |
+| INV-WEBUI-011 | SimpleFIN connection problems (`errors`/`errlist`) are surfaced: `/api/accounts` is fetched on load and an always-visible banner + Accounts-tab badge reflect the combined error count, so a bank needing re-auth is loud from any tab | structural | `tests/test_webui_design_guards.py::test_connection_errors_surface_from_any_tab` |
 
 ## Queries (`src/finance_mcp/queries.py`)
 

@@ -411,3 +411,51 @@ def test_redflags_groups_made_good_separately_from_red():
     # The red table must exclude cleared rows (banner/red count integrity).
     assert 'f.severity === "red"' in block, \
         "redflags renderer must still filter the red group by severity 'red'"
+
+
+def test_connection_errors_surface_from_any_tab():
+    """INV-WEBUI-011: SimpleFIN connection problems (a bank that stopped updating
+    and needs re-auth) are surfaced to the user. The bootstrap fetches
+    ``/api/accounts`` on load and an always-visible banner reflects the combined
+    ``errors``/``errlist`` count, mirroring the red-flag banner so the warning is
+    loud from any tab, not only the Accounts view.
+
+    This pins the SimpleFIN developer-guide requirement to always show these
+    errors. It fails if the banner wiring, the combined-error normalizer, or the
+    load-time fetch is removed.
+    """
+    assert 'id="connBanner"' in HTML, "INDEX_HTML must define the connection banner element"
+    assert "function connErrors(d)" in SCRIPT, \
+        "SCRIPT must define connErrors() to normalize errors + errlist"
+    assert "d.errors" in SCRIPT and "d.errlist" in SCRIPT, \
+        "connErrors must reference both the errors and errlist arrays"
+    # Prefer the structured errlist over the deprecated string errors so a single
+    # problem returned in both is not counted twice.
+    assert "d.errlist && d.errlist.length" in SCRIPT, \
+        "connErrors must prefer errlist when present, not concatenate both arrays"
+    # SimpleFIN's user-facing text is the `msg` field on structured errors.
+    assert "e.msg" in SCRIPT, "connErrors must read the SimpleFIN `msg` field first"
+    # Dedupe repeats (same error across multiple 90-day sync windows) on the
+    # full identity, so a persistent failure collapses but two different banks
+    # with the same code/message stay separate. Must mirror the server-side key.
+    assert "new Set()" in SCRIPT and "seen.has(key)" in SCRIPT, \
+        "connErrors must dedupe errors on a stable key"
+    assert '[code, connId, acctId, msg].join("\\u0000")' in SCRIPT, \
+        "connErrors dedup key must include conn_id/account_id, not just code+msg"
+    # Reconnect guidance is reserved for connection-level (con.*) / legacy errors;
+    # server-level auth (gen.auth) gets its own re-authorization notice, not a
+    # per-bank reconnect; other codes (act.*, gen.api, unknown) are transient.
+    # Classification is by prefix so an unknown act.auth stays account-level.
+    assert "function connErrorKind(code)" in SCRIPT, \
+        "SCRIPT must classify errors into reconnect/reauth/transient via connErrorKind()"
+    assert 'prefix === "con"' in SCRIPT, \
+        "connErrorKind must treat the con.* prefix as reconnect-worthy"
+    assert 'code === "gen.auth"' in SCRIPT, \
+        "connErrorKind must route gen.auth (server-level auth failure) to reauth"
+    assert '=== "reconnect"' in SCRIPT and '=== "reauth"' in SCRIPT and '=== "transient"' in SCRIPT, \
+        "accounts view must render all three error kinds distinctly"
+    assert "function applyConnErrors(d)" in SCRIPT, \
+        "SCRIPT must define applyConnErrors() to drive the banner/badge"
+    # Bootstrapped on load so the warning shows from whatever tab is restored.
+    assert 'fetch("/api/accounts").then' in SCRIPT, \
+        "init must fetch /api/accounts on load to populate the connection banner"
