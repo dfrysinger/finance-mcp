@@ -32,3 +32,14 @@ See design: [`docs/design/webui-date-navigation.md`](../design/webui-date-naviga
 | ID | Invariant | Class | Enforcing check |
 |---|---|---|---|
 | INV-QUERIES-001 | A bare `YYYY-MM-DD` `end_date` is inclusive through the end of that day (a noon-stamped last-day transaction is returned) | behavioral | `tests/test_queries.py::test_bare_end_date_is_inclusive_through_end_of_day` |
+
+## Crew (`src/finance_mcp/crew.py`)
+
+See design: [read-only Crew pockets](../design/crew-pockets.md).
+
+| ID | Invariant | Class | Enforcing check |
+|---|---|---|---|
+| INV-CREW-001 | Provider query documents and hosts are not selected by caller data; authenticated redirects are refused | behavioral | `tests/test_crew.py::test_activity_uses_variables_and_preserves_signed_amount`, `tests/test_crew.py::test_redirect_does_not_forward_authorization` |
+| INV-CREW-002 | Noninteractive login sends no OTP and incomplete MFA publishes no session | behavioral | `tests/test_crew.py::test_noninteractive_login_sends_no_otp`, `tests/test_crew.py::test_interrupted_login_never_publishes_intermediate_token` |
+| INV-CREW-003 | Crew operations use fresh lock descriptors and never reuse a token after a failed rotation save | behavioral | `tests/test_crew.py::test_lock_contends_with_same_process_and_another_process`, `tests/test_crew.py::test_failed_rotation_save_prevents_next_request` |
+| INV-CREW-004 | Crew reads do not change aggregate account/spending reports or the existing archive/configuration | behavioral | `tests/test_crew.py::test_cli_and_mcp_share_reads_without_changing_archive` |
