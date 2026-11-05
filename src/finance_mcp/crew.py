@@ -7,6 +7,7 @@ import getpass
 import http.client
 import json
 import os
+import re
 import sys
 import tempfile
 import urllib.error
@@ -176,10 +177,13 @@ class _Client:
         self.token = token
         self.persist = persist
 
-    def _capture(self, headers, *, usable=True):
+    def _capture(self, headers, *, usable=True, required=False):
         token = (headers.get("Authorization", "") if headers else "").strip()
         if token.lower().startswith("bearer "):
             token = token[7:].strip()
+        if required and (token.lower() == "bearer" or
+                         re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token) is None):
+            raise CrewError("protocol_error")
         token = token or self.token
         if not token:
             return
@@ -204,10 +208,10 @@ class _Client:
             _save_session(self.token, usable=False)
         try:
             with _open(request, timeout=_TIMEOUT) as response:
-                self._capture(response.headers)
-                body = response.read()
-                data = ({} if operation == "auth_email_otp" and not body.strip()
-                        else json.loads(body))
+                self._capture(response.headers, required=operation == "auth_email_otp")
+                if operation == "auth_email_otp":
+                    return {}
+                data = json.loads(response.read())
         except urllib.error.HTTPError as error:
             try:
                 self._capture(error.headers, usable=error.code != 401)
@@ -401,13 +405,16 @@ def _hidden_input(prompt):
 
 def login() -> dict:
     if not sys.stdin.isatty() or not sys.stderr.isatty():
-        return CrewError("terminal_required").result()
+        return {**CrewError("terminal_required").result(), "login_stage": "terminal_check"}
+    stage = "session_lock"
     try:
         with _locked():
             connection = _Client()
+            stage = "send_sms_otp"
             phone_id = _text(connection.request("send_sms_otp", {
                 "phone": _hidden_input("Crew phone number (hidden): "),
             })["phone_id"], required=True)
+            stage = "auth_sms_otp"
             verified = connection.request("auth_sms_otp", {
                 "phone_id": phone_id, "otp": _hidden_input("SMS code (hidden): "),
             })
@@ -417,23 +424,27 @@ def login() -> dict:
             if not single:
                 if not connection.token:
                     raise CrewError("protocol_error")
+                stage = "send_email_otp"
                 email_id = _text(connection.request("send_email_otp", {
                     "email": _hidden_input("Crew email (hidden): "),
                 })["email_id"], required=True)
+                stage = "auth_email_otp"
                 connection.request("auth_email_otp", {
                     "email_id": email_id, "otp": _hidden_input("Email code (hidden): "),
                 })
             if not connection.token:
                 raise CrewError("protocol_error")
+            stage = "save_session"
             _save_session(connection.token)
         return {"ok": True, "configured": True,
                 "message": "Crew session saved. Read pockets to verify data access."}
     except CrewError as error:
-        return error.result()
+        result = error.result()
     except (EOFError, KeyboardInterrupt, getpass.GetPassWarning):
-        return CrewError("login_incomplete").result()
+        result = CrewError("login_incomplete").result()
     except (KeyError, TypeError, ValueError):
-        return CrewError("protocol_error").result()
+        result = CrewError("protocol_error").result()
+    return {**result, "login_stage": stage}
 
 
 def status() -> dict:

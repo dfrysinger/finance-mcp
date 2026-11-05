@@ -287,9 +287,11 @@ def test_status_is_metadata_only_and_disconnect_is_local(crew_home, monkeypatch)
     assert (crew_home / "crew.lock").exists()
 
 
-@pytest.mark.parametrize("single_factor", [False, True])
+@pytest.mark.parametrize("single_factor,final_body", [
+    (True, b""), (False, b""), (False, b"OK"), (False, b"null"),
+])
 def test_attended_login_publishes_only_complete_session(
-    tmp_path, monkeypatch, capsys, single_factor,
+    tmp_path, monkeypatch, capsys, single_factor, final_body,
 ):
     monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
     monkeypatch.setattr(crew.sys.stdin, "isatty", lambda: True)
@@ -310,6 +312,8 @@ def test_attended_login_publishes_only_complete_session(
             return _reply({"email_id": "fixture-email-id"}, "Bearer fixture-step-3")
         response = _reply({}, "Bearer fixture-complete")
         response.truncate(0)
+        response.write(final_body)
+        response.seek(0)
         return response
 
     monkeypatch.setattr(crew, "_open", request)
@@ -319,6 +323,91 @@ def test_attended_login_publishes_only_complete_session(
     assert len(steps) == (2 if single_factor else 4)
     assert capsys.readouterr() == ("", "")
     assert set(saved) == {"token", "usable"}
+
+
+def _email_login_setup(tmp_path, monkeypatch, responses):
+    monkeypatch.setenv("FINANCE_MCP_HOME", str(tmp_path))
+    monkeypatch.setattr(crew.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(crew.sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr(crew.getpass, "getpass", lambda prompt: "private-input-sentinel")
+
+    def request(req, **kwargs):
+        assert not (tmp_path / "crew_session.json").exists()
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(crew, "_open", request)
+
+
+def _email_login_responses():
+    return [
+        _reply({"phone_id": "fixture-phone-id"}),
+        _reply({"isSingleFactor": False}, "Bearer fixture-intermediate"),
+        _reply({"email_id": "fixture-email-id"}, "Bearer fixture-next"),
+        _reply({}, "Bearer fixture-complete"),
+    ]
+
+
+@pytest.mark.parametrize("token", [
+    None, " ", "Bearer", "Bearer ", "bad token",
+    "Bearer a,b", "Bearer abc=def", "Bearer caf\u00e9",
+])
+def test_email_login_requires_usable_token_from_final_response(tmp_path, monkeypatch, token):
+    responses = _email_login_responses()
+    responses[-1] = _reply({}, token)
+    _email_login_setup(tmp_path, monkeypatch, responses)
+    result = crew.login()
+    assert result["ok"] is False
+    assert result["error_code"] == "protocol_error"
+    assert result["login_stage"] == "auth_email_otp"
+    assert not (tmp_path / "crew_session.json").exists()
+    assert "private-input-sentinel" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("step,stage", [
+    (0, "send_sms_otp"), (1, "auth_sms_otp"), (2, "send_email_otp"),
+])
+def test_email_login_keeps_earlier_json_validation(tmp_path, monkeypatch, step, stage):
+    responses = _email_login_responses()
+    responses[step] = _reply(None)
+    _email_login_setup(tmp_path, monkeypatch, responses)
+    result = crew.login()
+    assert result["error_code"] == "protocol_error"
+    assert result["login_stage"] == stage
+    assert not (tmp_path / "crew_session.json").exists()
+
+
+@pytest.mark.parametrize("status,code", [
+    (401, "auth_required"), (302, "redirect_refused"), (500, "provider_error"),
+])
+def test_email_login_preserves_http_failures(tmp_path, monkeypatch, status, code):
+    responses = _email_login_responses()
+    responses[-1] = urllib.error.HTTPError(
+        "https://api.trycrew.com/willow/auth/auth_email_otp", status,
+        "private-provider-sentinel", {"Authorization": "Bearer fixture-error-token"},
+        io.BytesIO(b"private-provider-sentinel"),
+    )
+    _email_login_setup(tmp_path, monkeypatch, responses)
+    result = crew.login()
+    assert result["error_code"] == code
+    assert result["login_stage"] == "auth_email_otp"
+    assert not (tmp_path / "crew_session.json").exists()
+    assert "private-provider-sentinel" not in json.dumps(result)
+
+
+def test_email_login_identifies_final_storage_failure(tmp_path, monkeypatch):
+    _email_login_setup(tmp_path, monkeypatch, _email_login_responses())
+
+    def failed_save(*args, **kwargs):
+        raise crew.CrewError("storage_error")
+
+    monkeypatch.setattr(crew, "_save_session", failed_save)
+    result = crew.login()
+    assert result["error_code"] == "storage_error"
+    assert result["login_stage"] == "save_session"
+    assert not (tmp_path / "crew_session.json").exists()
 
 
 def test_interrupted_login_never_publishes_intermediate_token(tmp_path, monkeypatch):

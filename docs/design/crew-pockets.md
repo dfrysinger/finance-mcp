@@ -1,10 +1,58 @@
 # Read-only Crew pocket access
 
-Design status: `approved`. Design cycle: `1`. Revision: `crew-design-003`.
+Design status: `approved`. Design cycle: `1`. Revision: `crew-design-004`.
 Lane: `critical`, because this adds banking authentication and session storage.
-Reframe status: `CLEAR`. The independent challenge and design review permit
-the native fixed-read route; no observed revisit condition blocks
-implementation. Real-account acceptance A7 remains unproven.
+Reframe status: `CLEAR`. The focused independent challenge and both design
+review families permit the final auth-response amendment to the native
+fixed-read route. The precise failed live response and A7 remain unproven.
+
+### Login response amendment
+
+An attended attempt stopped with `protocol_error` after the email-code prompt.
+Its exact response was not retained. The official final-step example returns
+the authorization header without a JSON body contract, and the reference
+client deliberately skips final-body decoding. This supports correcting the
+connector's body assumption, not claiming the observed attempt authenticated.
+
+The blocked outcome is saving the user's fully verified session. The implicated
+constraint is the implementation's JSON-object requirement for final email
+verification; it came from an implementation default, not the documented final
+response. No banking or privacy invariant needs that body shape. The smallest
+alternative retains the same fixed endpoint and requires successful HTTP
+status plus a valid nonempty authorization header from that final response,
+without interpreting its body. No new trusted component is needed.
+
+Check delta: final email verification accepts empty, plain-text and
+JSON-scalar bodies only with the required response token and successful HTTP
+status. Missing or malformed final authorization and HTTP errors publish no
+new session. Earlier auth JSON shapes and all GraphQL validation stay strict.
+On failure, the CLI reports a fixed `login_stage` value with its existing
+redacted error. The attended session launcher retains only that sanitized
+stdout result, never hidden terminal input or provider response data.
+
+Stages are `terminal_check`, `session_lock`, the four fixed auth operation
+names, and `save_session`; they contain no provider or user text. Set the stage
+before its input/request/validation. Retention must preserve the CLI exit code
+and private file mode, including interruption and capture failure.
+
+Extend C4 with a synthetic real-PTY launcher run: inject an early auth failure,
+a final missing/malformed header, and user interruption. Assert the exact
+fixed failure stage, retained redacted JSON, matching CLI status, private 0600
+output, no saved partial session, and no input/token sentinel in output.
+Also make the output destination unwritable: record capture failure separately
+from the CLI status and fail the launcher rather than claiming retention.
+These checks fail if the diagnostic is lost, the phase is wrong, or a pipeline
+reports successful completion after capture fails.
+
+The focused fresh challenge permits this amendment; its independent minimum
+and exact-proposal reconciliation are persisted as
+`auth-response-challenge-pass-1.md` and `auth-response-challenge-pass-2.md` in
+the private implementation handoff. Both design-review families completed
+discovery and check-contract verification with no remaining material findings.
+It changes no user authority, endpoint,
+accounting operation, credential owner or real-input boundary. If the
+correction fails the documented protocol checks, revert this bounded delta;
+do not bypass verification or add endpoint retries. Live acceptance stays open.
 
 ## Objective
 
