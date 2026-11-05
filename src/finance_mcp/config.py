@@ -40,6 +40,14 @@ def budget_config_path() -> Path:
     return home_dir() / "budget.json"
 
 
+def crew_session_path() -> Path:
+    return home_dir() / "crew_session.json"
+
+
+def crew_lock_path() -> Path:
+    return home_dir() / "crew.lock"
+
+
 def load_access_url() -> str | None:
     """Return the saved access URL, or None if setup has not been run."""
     # Environment wins so the URL can be injected without touching disk.

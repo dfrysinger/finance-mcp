@@ -46,6 +46,39 @@ may live in a synced folder like Dropbox):
    uv run finance-mcp sync --days 120
    ```
 
+## Crew pockets (optional)
+
+The direct Crew connector adds live pocket balances, pocket activity, and
+transfer history that the combined SimpleFIN account does not contain.
+It does not move money or change the SimpleFIN archive, budgets, or scheduler.
+
+Run sign-in yourself in an interactive terminal:
+
+```bash
+uv run finance-mcp crew login
+uv run finance-mcp crew pockets
+uv run finance-mcp crew activity --account ACCOUNT_ID --pocket POCKET_ID
+uv run finance-mcp crew transfers
+```
+
+Phone/email and verification codes use hidden input. Do not send codes to
+Copilot. The private session is saved outside the checkout under
+`FINANCE_MCP_HOME` (default `~/.finance-mcp/crew_session.json`, mode 0600).
+Read-only describes this connector, not the authority of Crew's session token.
+
+Copilot uses `crew_pockets`, `crew_pocket_activity`, and `crew_transfers`.
+Activity and transfers return one page of 100 records; pass `end_cursor` as
+`after` when `has_next_page` is true. A page is not complete history.
+Amounts are integer cents, null amounts are unknown, and `retrieved_at` is
+retrieval time rather than the bank's balance timestamp. Requests time out
+after 30 seconds. There is no stale cache fallback.
+
+`crew status` checks local session presence without claiming authentication.
+`crew disconnect` removes only the local session; it does not revoke the
+upstream token. Expired sessions require attended sign-in again.
+The [documented consumer API](https://docs.trycrew.com/) may change; live
+pocket and internal-transfer coverage must be verified after sign-in.
+
 ## CLI
 
 ```bash
@@ -128,7 +161,7 @@ in the archive even after it ages out of SimpleFIN's rolling window. Each sync
 also records a **balance snapshot** per account, which is what powers
 `networth` / `net_worth_history` trends over time.
 
-All read commands and MCP tools serve from `archive.db` (falling back to
+SimpleFIN read commands and MCP tools serve from `archive.db` (falling back to
 `cache.json` only before the first sync on this version). You can also query it
 with any SQLite tool:
 
