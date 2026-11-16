@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import urllib.error
@@ -394,10 +395,38 @@ def _valid_ids(*values, after=None):
     )
 
 
-def _hidden_input(prompt):
+def _load_login_defaults():
+    try:
+        descriptor = os.open(config.crew_login_defaults_path(),
+                             os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            mode = os.fstat(handle.fileno()).st_mode
+            if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+                raise CrewError("storage_error")
+            defaults = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, RecursionError):
+        raise CrewError("storage_error") from None
+    if not isinstance(defaults, dict) or set(defaults) - {"phone", "email"}:
+        raise CrewError("storage_error")
+    for key, value in defaults.items():
+        if not isinstance(value, str):
+            raise CrewError("storage_error")
+        value = value.strip()
+        if value and not value.isprintable():
+            raise CrewError("storage_error")
+        defaults[key] = value
+    return defaults
+
+
+def _hidden_input(prompt, default=None):
+    if default:
+        prompt = (f"{prompt.removesuffix(' (hidden): ')} [{default}] "
+                  "(Enter to use, or type replacement): ")
     with warnings.catch_warnings():
         warnings.simplefilter("error", getpass.GetPassWarning)
-        value = getpass.getpass(prompt).strip()
+        value = getpass.getpass(prompt).strip() or default
     if not value:
         raise CrewError("login_incomplete")
     return value
@@ -410,9 +439,10 @@ def login() -> dict:
     try:
         with _locked():
             connection = _Client()
+            defaults = _load_login_defaults()
             stage = "send_sms_otp"
             phone_id = _text(connection.request("send_sms_otp", {
-                "phone": _hidden_input("Crew phone number (hidden): "),
+                "phone": _hidden_input("Crew phone number (hidden): ", defaults.get("phone")),
             })["phone_id"], required=True)
             stage = "auth_sms_otp"
             verified = connection.request("auth_sms_otp", {
@@ -426,7 +456,7 @@ def login() -> dict:
                     raise CrewError("protocol_error")
                 stage = "send_email_otp"
                 email_id = _text(connection.request("send_email_otp", {
-                    "email": _hidden_input("Crew email (hidden): "),
+                    "email": _hidden_input("Crew email (hidden): ", defaults.get("email")),
                 })["email_id"], required=True)
                 stage = "auth_email_otp"
                 connection.request("auth_email_otp", {

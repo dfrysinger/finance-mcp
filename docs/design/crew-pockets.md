@@ -1,10 +1,103 @@
 # Read-only Crew pocket access
 
-Design status: `approved`. Design cycle: `1`. Revision: `crew-design-004`.
-Lane: `critical`, because this adds banking authentication and session storage.
-Reframe status: `CLEAR`. The focused independent challenge and both design
-review families permit the final auth-response amendment to the native
-fixed-read route. The precise failed live response and A7 remain unproven.
+Design status: `approved`. Design cycle: `1`. Revision: `crew-design-005`.
+Lane: `critical`, because this handles authentication and private login data.
+Reframe status: `CLEAR`. The independent minimum preceded this proposal; its
+exact-proposal reconciliation and both design reviews permit the bounded
+identifier-defaults amendment. Their records are in the private handoff.
+Final real-account acceptance remains a separate gate.
+
+### Identifier-defaults amendment
+
+Let future attended Crew sign-in offer the owner's supplied phone and email
+without retyping them. The owner explicitly asked why those identifiers were
+not prefilled and supplied both values. They are personal information, not
+verification secrets. The exact policy quotes and existing capabilities are in
+the sealed `crew-login-defaults-evidence-001` packet. Actual values stay out of
+source, documentation, fixtures, global agent memory and review payloads.
+
+The blocked outcome is convenient future sign-in. The binding mechanism is
+hidden manual entry for every field without stored identifier defaults; that
+came from the implementation, not a requirement to treat identifiers as codes.
+Offering an approved identifier does not weaken manual verification or private
+credentials. The smallest alternative uses the existing native CLI and private
+configuration owner. It needs fewer components than a wrapper, service or
+authentication broker. No new login attempt is part of this amendment.
+
+Use optional `crew_login_defaults.json` under `FINANCE_MCP_HOME`, separate from
+the rotating `crew_session.json`. Its only keys are `phone` and `email`, with
+string values. Missing or blank entries mean manual entry. One owner-provisioning
+event is evidenced; no new writer coordination, lock, preference-management
+command or automatic profile updates are required. The owner may edit the
+defaults or deliberately provide corrected values for this local file.
+
+The owner-approved initial provisioning writes only the two supplied
+identifiers, with file mode 0600 established before content and the existing
+private directory mode 0700. It does not inspect credentials or terminal
+history. No financial configuration, archive, scheduler or bank record changes.
+The file must remain outside the repository and synced project folders.
+
+After the existing TTY check, load defaults inside the already-held login lock.
+Accept only a regular, non-symlink 0600 file and the stated object shape.
+Reject malformed JSON, unknown keys, non-string values and nonprinting
+characters with the fixed `storage_error` result before sending any OTP.
+Trim surrounding whitespace. A missing file preserves existing manual input.
+
+Extend the existing hidden-input helper with an optional default, passed only
+by the phone and email call sites. Show that identifier and the Enter-to-use
+choice in its attended stderr/TTY prompt. Enter selects the default; typed input
+overrides it for this attempt without rewriting the profile. Each authentication
+request still waits for its corresponding input. SMS and email-code calls pass no default, remain hidden,
+and reject blank input. Single-factor success still skips the email prompt.
+The captured JSON stdout must contain neither identifiers nor secrets.
+
+The loader and prompts are deterministic operations within the owner's explicit
+identifier grant. MCP inputs cannot select defaults, trigger login, obtain
+codes or change authentication operations. No external prohibition on this
+identifier grant is evidenced. The protected code/token boundary remains
+independently required; privacy requirements do not forbid the approved
+identifier action. Session publication and rotation are unchanged.
+
+| Constraint | Independent basis and protected result | Revisit condition |
+|---|---|---|
+| Persist only supplied identifiers locally | User's prefill request and parameter provision; avoids retyping without recovering other data | Owner requests another identifier source or caller |
+| Keep defaults separate from session replacement | Existing token writer replaces token/usability JSON; prevents lost defaults and credential coupling | An existing owner can retain them with a demonstrably smaller boundary |
+| Owner initiates sign-in and enters codes | Protected real-account verification boundary; prefill is not OTP automation | A separately approved attended facility changes the verification owner |
+| Private application-only file and prompts | Personal data must not enter repository, global memory or captured JSON | Owner requests another deliberately authorized destination |
+
+Extend C4 with synthetic two-factor and single-factor default acceptance,
+typed overrides, partial/missing defaults, and malformed or nonprivate files.
+Capture requests to prove the selected identifiers reach the unchanged fixed
+operations while codes remain separately entered. Invalid defaults and non-TTY
+login must send no request and leave an existing session unchanged. Capture
+JSON stdout separately from the attended terminal: identifiers may appear only
+in prompts, and code/token sentinels must appear in neither capture.
+
+Run the actual native CLI through the existing synthetic real-PTY route with
+private fixture defaults and Enter at identifier prompts. It must complete the
+normal code flow and produce only redacted JSON stdout. An interrupted default
+prompt must publish no new session. A subsequent session rotation and local
+disconnect must leave defaults unchanged. These checks exercise the consumer
+and the two files, not merely constants or mocked helper return values.
+
+Rollback removes only `crew_login_defaults.json` to restore manual identifiers;
+the saved session and accounting remain intact. Reverting the bounded reader
+and prompt delta must also preserve the existing session file. No fresh real
+MFA is needed to prove this identifier-only convenience. Reopen before adding
+another store, profile writer, generic settings UI or verification automation.
+
+#### Definition of Done: Attended Crew identifier defaults
+
+- The current two-pass challenge permits this exact action and both design
+  reviewers complete without material findings.
+- The native CLI accepts and overrides private identifier defaults while codes
+  stay manual; synthetic consumer proof and implementation review pass.
+- The supplied values stay in approved private application storage and task
+  provenance, never the excluded destinations. The local file's permissions
+  and loaded values are verified without exposing them, and the existing
+  real-account session remains intact.
+- Reviewed source and the installed CLI correspond; no real OTP was initiated
+  to validate this change, and no financial or global-agent configuration changed.
 
 ### Login response amendment
 
@@ -131,14 +224,15 @@ storage. This proposal removes that machinery while preserving the underlying
 properties: fresh source reads, no duplicate accounting, and explicit failures.
 It requires the challenger's current pass-2 comparison before normal review.
 
-New persistent state is only `crew_session.json` and a stable `crew.lock`
-inside the private finance home. The session contains the fully authenticated
-token and a usability marker, with no phone, email, OTP, response body, or financial cache. Locking
-protects the real CLI and MCP callers, not hypothetical replicas.
+Persistent state is `crew_session.json`, a stable `crew.lock`, and the optional
+`crew_login_defaults.json` inside the private finance home. The session contains
+only the fully authenticated token and a usability marker. Defaults contain
+only approved identifiers, never codes, tokens, response bodies or a financial
+cache. Locking protects the real CLI and MCP callers, not hypothetical replicas.
 
 ### Connection points and authority
 
-- `config.py`: private Crew session and lock paths.
+- `config.py`: private Crew session, lock and identifier-default paths.
 - `crew.py`: fixed HTTPS/auth requests, response validation, token persistence,
   serialization, and typed read functions. It owns no archive connection.
 - `cli.py`: `crew login`, `crew status`, `crew disconnect`, and matching
@@ -157,10 +251,12 @@ responsible for authorizing which account IDs the session may read.
 ## Authentication and session lifecycle
 
 `finance-mcp crew login` runs only in an attended terminal. Refuse non-TTY
-input before sending an OTP. Read phone/email when needed and OTPs through
-hidden terminal input, never flags, environment variables, MCP, or chat.
-Do not write those values or raw auth responses to logs. The agent does not
-run this command against the real account on the user's behalf.
+input before sending an OTP. Read verification codes through hidden terminal
+input, never flags, environment variables, MCP, or chat. Phone/email remain
+manual unless the owner supplies the local identifier defaults specified above.
+Do not log identifiers, codes, tokens or raw auth responses. Approved default
+identifiers may appear in the attended prompt, not captured JSON stdout.
+The agent does not run this command against the real account on the user's behalf.
 
 Use the four fixed `/willow/auth/...` paths shown in the official examples and
 reference client. The docs' `/willow/graphql/auth` headings disagree; do not
@@ -209,6 +305,13 @@ All three tools make live requests and report `source: crew_api` and
 `retrieved_at`. This timestamp means when the response was received, not when
 the bank settled or refreshed a balance. Return a provider balance timestamp
 separately where available. There is no stale-data fallback.
+
+Preserve source pocket names and types even when the app groups them
+differently. A similarly named source record alone does not establish an app
+aggregate such as Reserve. When comparing an app aggregate with allocation
+balances, record the selected components and arithmetic as derived evidence,
+not another provider balance or asset. An aggregate-only screenshot does not
+independently confirm each individual allocation.
 
 | Tool | Fixed query and returned data |
 |---|---|

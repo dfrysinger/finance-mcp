@@ -546,3 +546,166 @@ def test_cli_login_has_no_credential_flags(monkeypatch, capsys):
     with pytest.raises(SystemExit) as error:
         cli.build_parser().parse_args(["crew", "login", "--token", "fixture"])
     assert error.value.code == 2
+
+
+def _login_defaults(home, data):
+    path = home / "crew_login_defaults.json"
+    path.touch(mode=0o600)
+    path.write_text(json.dumps(data))
+    return path
+
+
+@pytest.mark.parametrize("single_factor", [True, False])
+@pytest.mark.parametrize("override", [False, True])
+def test_login_identifier_defaults_and_attempt_only_overrides(
+    crew_home, monkeypatch, single_factor, override,
+):
+    phone, email = "+15555550101", "crew-default@example.invalid"
+    path = _login_defaults(crew_home, {"phone": f" {phone} ", "email": f" {email} "})
+    original = path.read_bytes()
+    session_path = crew_home / "crew_session.json"
+    previous = session_path.read_bytes()
+    monkeypatch.setattr(crew.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(crew.sys.stderr, "isatty", lambda: True)
+    inputs = iter([
+        "fixture-override-phone" if override else "", "fixture-sms-code",
+        "fixture-override-email" if override else "", "fixture-email-code",
+    ])
+    prompts, requests = [], []
+
+    def entered(prompt):
+        prompts.append(prompt)
+        return next(inputs)
+
+    responses = _email_login_responses()
+    responses[1] = _reply({"isSingleFactor": single_factor}, "Bearer fixture-intermediate")
+
+    def request(req, **kwargs):
+        assert session_path.read_bytes() == previous
+        requests.append(json.loads(req.data))
+        return responses.pop(0)
+
+    monkeypatch.setattr(crew.getpass, "getpass", entered)
+    monkeypatch.setattr(crew, "_open", request)
+    assert crew.login()["ok"] is True
+    assert requests[0]["phone"] == ("fixture-override-phone" if override else phone)
+    assert phone in prompts[0] and "Enter to use" in prompts[0]
+    assert prompts[1] == "SMS code (hidden): "
+    assert requests[1]["otp"] == "fixture-sms-code"
+    assert len(prompts) == (2 if single_factor else 4)
+    if not single_factor:
+        assert requests[2]["email"] == ("fixture-override-email" if override else email)
+        assert email in prompts[2] and "Enter to use" in prompts[2]
+        assert prompts[3] == "Email code (hidden): "
+        assert requests[3]["otp"] == "fixture-email-code"
+    assert set(json.loads(session_path.read_text())) == {"token", "usable"}
+    monkeypatch.setattr(crew, "_open", lambda *a, **k:
+                        _reply(_pocket_response(), "Bearer fixture-rotated"))
+    assert crew.pockets()["ok"]
+    assert path.read_bytes() == original
+    assert crew.disconnect()["ok"]
+    assert not session_path.exists()
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("email_default", [None, "", "   "])
+def test_partial_or_blank_defaults_leave_identifier_manual(crew_home, monkeypatch, email_default):
+    profile = {"phone": "+15555550101"}
+    if email_default is not None:
+        profile["email"] = email_default
+    _login_defaults(crew_home, profile)
+    monkeypatch.setattr(crew.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(crew.sys.stderr, "isatty", lambda: True)
+    inputs = iter(["", "fixture-sms-code", "manual@example.invalid", "fixture-email-code"])
+    prompts, requests = [], []
+    responses = _email_login_responses()
+
+    def entered(prompt):
+        prompts.append(prompt)
+        return next(inputs)
+
+    def request(req, **kwargs):
+        requests.append(json.loads(req.data))
+        return responses.pop(0)
+
+    monkeypatch.setattr(crew.getpass, "getpass", entered)
+    monkeypatch.setattr(crew, "_open", request)
+    assert crew.login()["ok"]
+    assert prompts[2] == "Crew email (hidden): "
+    assert requests[2]["email"] == "manual@example.invalid"
+
+
+@pytest.mark.parametrize("raw,kind", [
+    ("{broken", "regular"),
+    pytest.param('{"phone":' + "[" * (sys.getrecursionlimit() * 10) + "0"
+                 + "]" * (sys.getrecursionlimit() * 10) + "}", "regular",
+                 id="deep-nesting"),
+    ("[]", "regular"),
+    ('{"phone": 12}', "regular"),
+    ('{"email": null}', "regular"),
+    ('{"phone": "bad\\u001bvalue"}', "regular"),
+    ('{"token": "fixture-private-value"}', "regular"),
+    ('{"phone": "fixture-phone"}', "loose"),
+    ('{"phone": "fixture-phone"}', "symlink"),
+    ('{"phone": "fixture-phone"}', "directory"),
+])
+def test_invalid_defaults_fail_before_input_or_request_preserving_session(
+    crew_home, monkeypatch, raw, kind,
+):
+    path = crew_home / "crew_login_defaults.json"
+    if kind == "symlink":
+        path.symlink_to(crew_home / "crew_session.json")
+    elif kind == "directory":
+        path.mkdir(mode=0o700)
+    else:
+        path.touch(mode=0o600)
+        path.write_text(raw)
+        if kind == "loose":
+            path.chmod(0o644)
+    previous = (crew_home / "crew_session.json").read_bytes()
+    monkeypatch.setattr(crew.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(crew.sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr(crew.getpass, "getpass", lambda *a: pytest.fail("input"))
+    monkeypatch.setattr(crew, "_open", lambda *a, **k: pytest.fail("network"))
+    result = crew.login()
+    assert result["error_code"] == "storage_error"
+    assert "fixture-private-value" not in json.dumps(result)
+    assert (crew_home / "crew_session.json").read_bytes() == previous
+
+
+@pytest.mark.parametrize("blank_at,request_count", [(1, 1), (3, 3)])
+def test_defaults_never_supply_blank_verification_codes(
+    crew_home, monkeypatch, blank_at, request_count,
+):
+    _login_defaults(crew_home, {"phone": "fixture-phone", "email": "fixture-email"})
+    previous = (crew_home / "crew_session.json").read_bytes()
+    monkeypatch.setattr(crew.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(crew.sys.stderr, "isatty", lambda: True)
+    values = ["", "fixture-sms-code", "", "fixture-email-code"]
+    values[blank_at] = ""
+    inputs = iter(values)
+    monkeypatch.setattr(crew.getpass, "getpass", lambda prompt: next(inputs))
+    responses = _email_login_responses()
+    requests = []
+
+    def request(req, **kwargs):
+        requests.append(req)
+        return responses.pop(0)
+
+    monkeypatch.setattr(crew, "_open", request)
+    assert crew.login()["error_code"] == "login_incomplete"
+    assert len(requests) == request_count
+    assert (crew_home / "crew_session.json").read_bytes() == previous
+
+
+def test_defaults_do_not_bypass_terminal_guard_or_couple_live_reads(crew_home, monkeypatch):
+    path = _login_defaults(crew_home, {"phone": "fixture-phone"})
+    path.chmod(0o644)
+    previous = (crew_home / "crew_session.json").read_bytes()
+    monkeypatch.setattr(crew.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(crew.getpass, "getpass", lambda *a: pytest.fail("input"))
+    monkeypatch.setattr(crew, "_open", lambda *a, **k: pytest.fail("network"))
+    assert crew.login()["error_code"] == "terminal_required"
+    assert (crew_home / "crew_session.json").read_bytes() == previous
+    monkeypatch.setattr(crew, "_open", lambda *a, **k: _reply(_pocket_response()))
+    assert crew.pockets()["ok"]
