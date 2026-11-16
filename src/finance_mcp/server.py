@@ -2,7 +2,8 @@
 
 Runs over stdio. Read tools (`list_accounts`, `get_transactions`,
 `account_balances`, `spending_summary`) serve from the local cache and never hit
-the network. Budgeting tools (`budget_burndown`, `budget_forecast`,
+the network. Crew tools make live read-only requests without changing the
+archive. Budgeting tools (`budget_burndown`, `budget_forecast`,
 `allocation_audit_report`, `subscription_audit_report`) and transfer tools
 (`reconcile_transfers`, `list_transfers`, `confirm_transfer`) read the durable
 archive. `sync_now` is the only tool that reaches out to SimpleFIN.
@@ -14,9 +15,44 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import archive, categories, client, config, queries, store, sync
+from . import archive, categories, client, config, crew, queries, store, sync
 
 mcp = FastMCP("finance-mcp")
+
+
+@mcp.tool()
+def crew_pockets() -> dict[str, Any]:
+    """Read live Crew pocket balances. Does not add assets to account totals.
+
+    Sign in yourself with `finance-mcp crew login` first. Returned amounts are
+    integer cents; null means unknown. retrieved_at is retrieval time, not
+    the bank's balance timestamp. No cached fallback is used.
+    """
+    return crew.pockets()
+
+
+@mcp.tool()
+def crew_pocket_activity(
+    account_id: str, pocket_id: str, after: str | None = None,
+) -> dict[str, Any]:
+    """Read one live page of activity for a Crew account/pocket pair.
+
+    Use IDs from crew_pockets. Follow end_cursor when has_next_page is true;
+    coverage is one source page, never a claim of complete history.
+    Amounts are signed integer cents; source status and nullable fields remain.
+    """
+    return crew.pocket_activity(account_id, pocket_id, after=after)
+
+
+@mcp.tool()
+def crew_transfers(after: str | None = None) -> dict[str, Any]:
+    """Read one live Crew transfer page, including pocket-to-pocket movements.
+
+    Follow end_cursor when has_next_page is true. Endpoints may be missing or
+    external; do not infer reimbursement or completion. Preserve source status.
+    This does not initiate transfers or change the SimpleFIN transaction ledger.
+    """
+    return crew.transfers(after=after)
 
 
 @mcp.tool()

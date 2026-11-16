@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from . import archive, categories, client, config, importer, queries, store, sync
+from . import archive, categories, client, config, crew, importer, queries, store, sync
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
@@ -37,6 +37,20 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     )
     _print_errors(summary["errors"], summary["errlist"])
     return 0
+
+
+def _cmd_crew(args: argparse.Namespace) -> int:
+    if args.crew_command == "activity":
+        result = crew.pocket_activity(args.account, args.pocket, after=args.after)
+    elif args.crew_command == "transfers":
+        result = crew.transfers(after=args.after)
+    else:
+        result = {
+            "login": crew.login, "status": crew.status,
+            "disconnect": crew.disconnect, "pockets": crew.pockets,
+        }[args.crew_command]()
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -755,6 +769,17 @@ def _print_errors(errors: list, errlist: list) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="finance-mcp", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_crew = sub.add_parser("crew", help="read Crew pockets and activity directly")
+    crew_sub = p_crew.add_subparsers(dest="crew_command", required=True)
+    for action in ("login", "status", "disconnect", "pockets", "activity", "transfers"):
+        command = crew_sub.add_parser(action)
+        command.set_defaults(func=_cmd_crew)
+        if action in ("activity", "transfers"):
+            command.add_argument("--after", help="continue from the previous page cursor")
+        if action == "activity":
+            command.add_argument("--account", required=True)
+            command.add_argument("--pocket", required=True)
 
     p_claim = sub.add_parser("claim", help="exchange a SimpleFIN setup token")
     p_claim.add_argument("token", nargs="?", help="setup token (else prompt)")
